@@ -33,16 +33,23 @@ gdf['poly_area'] = gdf.geometry.area
 # 2) read points from SQLite
 eng = create_engine(f"sqlite:///{SQLITE_PATH}")
 pts_df = pd.read_sql(f"""WITH  plots AS (
-    SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.LON, P.LAT, P.ECOSUBCD,
+    SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.LON, P.LAT, PG.EMAP_HEX, PG.ECOSUBCD,
     (CASE WHEN SRV.RSCD=26 and P.STATECD IN (60, 64, 66, 68, 69,70) THEN 'WGS84' ELSE 'NAD83' END) DATUM,
     ROW_NUMBER() OVER (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY P.INVYR DESC) r
-    FROM PLOTSNAP P
+    FROM PLOT P
+    LEFT OUTER JOIN PLOTGEOM PG ON  
+        PG.STATECD = P.STATECD AND
+        PG.UNITCD = P.UNITCD AND
+        PG.COUNTYCD = P.COUNTYCD AND
+        PG.PLOT = P.PLOT AND
+        PG.INVYR = P.INVYR
     JOIN SURVEY SRV ON SRV.ANN_INVENTORY = 'Y' AND 
     P.SRV_CN = SRV.CN AND (P.STATECD <= 56 and P.STATECD <> 2 and P.STATECD <> 15) 
     )
 
-SELECT STATECD, UNITCD, COUNTYCD, PLOT, LON, LAT, DATUM, ECOSUBCD
-FROM plots WHERE r = 1
+SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.LON, P.LAT, P.DATUM, P.EMAP_HEX, P.ECOSUBCD
+FROM plots P
+WHERE r = 1
 """, eng)
 # 3) build GeoDataFrames per CRS
 def make_gdf(df, epsg):
@@ -76,7 +83,7 @@ joined.to_file(f'{OUT_PREFIX_TMP}.gpkg')
 #out = joined[["id", POLY_ID_COL]].rename(columns={"id":"point_id", POLY_ID_COL:"polygon_id"})
 
 eng_out = create_engine(f"sqlite:///{OUT_PREFIX_TMP}.db")
-plots = joined[['STATECD','UNITCD','COUNTYCD','PLOT', 'LON','LAT','DATUM','ECOSUBCD', 'EPA_L1','EPA_L2','EPA_L3','EPA_L4']]
+plots = joined[['STATECD','UNITCD','COUNTYCD','PLOT', 'LON','LAT','DATUM','EMAP_HEX', 'ECOSUBCD', 'EPA_L1','EPA_L2','EPA_L3','EPA_L4']]
 plots.to_sql(OUT_TABLE, eng_out, if_exists='replace', index=False)
 
 
@@ -135,16 +142,16 @@ plots_mismatch_one = plots_mismatch_tiger.merge(only_one_polygon, how='inner',le
 plots_mismatch_one = plots_mismatch_one.rename(columns={'STATECD_x':'STATECD','COUNTYCD_x':'COUNTYCD'})
        
 plots_mismatch_one = plots_mismatch_one [['STATECD', 'UNITCD', 'COUNTYCD', 'PLOT', 'LON', 'LAT', 'DATUM',
-       'ECOSUBCD', 'EPA_L1','EPA_L2','EPA_L3', 'EPA_L4']]
+       'EMAP_HEX', 'ECOSUBCD', 'EPA_L1','EPA_L2','EPA_L3', 'EPA_L4']]
 
 more_than_one = intersection.groupby(['STATECD','COUNTYCD']).filter(lambda g: len(g) != 1)
 plots_mismatch_more = plots_mismatch_tiger.merge(more_than_one, how='inner',left_on=['STATECD_TIGER','COUNTYCD_TIGER'],right_on=['STATECD','COUNTYCD'])
 plots_mismatch_more['dist'] = plots_mismatch_more.apply(lambda row: row['geometry_x'].distance(row['geometry_y']), axis=1)
 plots_mismatch_more = plots_mismatch_more.rename(columns={'STATECD_x':'STATECD','COUNTYCD_x':'COUNTYCD'})
 plots_mismatch_more = plots_mismatch_more.sort_values(['STATECD', 'UNITCD', 'COUNTYCD', 'PLOT', 'LON', 'LAT', 'DATUM',
-       'ECOSUBCD', 'dist']).drop_duplicates(['STATECD', 'UNITCD', 'COUNTYCD', 'PLOT', 'LON', 'LAT', 'DATUM',
-       'ECOSUBCD'], keep='first')[['STATECD', 'UNITCD', 'COUNTYCD', 'PLOT', 'LON', 'LAT', 'DATUM',
-       'ECOSUBCD','EPA_L1','EPA_L2','EPA_L3', 'EPA_L4']]
+       'EMAP_HEX', 'ECOSUBCD', 'dist']).drop_duplicates(['STATECD', 'UNITCD', 'COUNTYCD', 'PLOT', 'LON', 'LAT', 'DATUM',
+       'EMAP_HEX', 'ECOSUBCD'], keep='first')[['STATECD', 'UNITCD', 'COUNTYCD', 'PLOT', 'LON', 'LAT', 'DATUM',
+       'EMAP_HEX', 'ECOSUBCD','EPA_L1','EPA_L2','EPA_L3', 'EPA_L4']]
 
 full_plots = pd.concat([plots_match, plots_mismatch_one, plots_mismatch_more]).sort_values(['STATECD','UNITCD','COUNTYCD','PLOT'])
 
