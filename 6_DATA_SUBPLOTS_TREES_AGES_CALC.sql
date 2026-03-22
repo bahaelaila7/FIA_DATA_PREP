@@ -8,7 +8,7 @@ DROP TABLE IF EXISTS DATA_SUBPLOTS_TREES_NO_DSRTRBS_AGES_CALC;
 CREATE TABLE DATA_SUBPLOTS_TREES_NO_DSRTRBS_AGES_CALC AS
 
 -- need to push the minimum to 1, 
-SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.TREE, T.num_meas,
+SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.first_dstrb_measdate, T.TREE, T.num_meas,
 T.TREE_CNS,PREV_TRE_CNS,PLT_CNS,INVYRs,CONDIDS,AGES,SPCDs,SPGRPCDs,TPA_UNADJs,dias,  stockings, TOTAGEs, DRYBIO_AGs, HTs,measdates,STATUSCDs,STANDING_DEAD_CDs,RECONCILECDs,
 T.SPCD, T.SPGRPCD, T.SPECIES_SYMBOL, T.sftwd_hrdwd, T.GENUS, ages_calc_uncorrected, ages_calc_with_totage, age_calc_correction,
 
@@ -16,7 +16,7 @@ array_agg((ac.a +age_calc_correction) ORDER BY ac.i) ages_calc
 
 FROM (
 
-SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.TREE, T.num_meas,
+SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.first_dstrb_measdate, T.TREE, T.num_meas,
 T.TREE_CNS,PREV_TRE_CNS,PLT_CNS,INVYRs,CONDIDS,AGES,SPCDs,SPGRPCDs,TPA_UNADJs,dias,  stockings, TOTAGEs, DRYBIO_AGs, HTs,measdates,STATUSCDs,STANDING_DEAD_CDs,RECONCILECDs,
 T.SPCD, T.SPGRPCD, T.SPECIES_SYMBOL, T.sftwd_hrdwd, T.GENUS,
 
@@ -71,9 +71,9 @@ DATA_SUBPLOTS_TREES DST
 JOIN REF_SPECIES SP ON TT.SPCD = SP.SPCD
 ) T
 CROSS JOIN LATERAL unnest(T.measdates, T.invyrs) vv(measdate, invyr)
-GROUP BY T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.TREE, T.num_meas,
+GROUP BY T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.first_dstrb_measdate, T.TREE, T.num_meas,
 T.TREE_CNS,PREV_TRE_CNS,PLT_CNS,INVYRs,CONDIDS,AGES,SPCDs,SPGRPCDs,TPA_UNADJs,dias,stockings,TOTAGEs,DRYBIO_AGs, HTs,measdates,STATUSCDs,STANDING_DEAD_CDs,RECONCILECDs,T.SPCD, T.SPGRPCD, T.SPECIES_SYMBOL, T.sftwd_hrdwd, T.GENUS
 ) AS T, unnest(T.ages_calc_uncorrected) WITH ORDINALITY ac(a,i)
-GROUP BY T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.TREE, T.num_meas,
+GROUP BY T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.first_dstrb_measdate, T.TREE, T.num_meas,
 T.TREE_CNS,PREV_TRE_CNS,PLT_CNS,INVYRs,CONDIDS,AGES,SPCDs,SPGRPCDs,TPA_UNADJs,dias,  stockings, TOTAGEs, DRYBIO_AGs, HTs,measdates,STATUSCDs,STANDING_DEAD_CDs,RECONCILECDs,
 T.SPCD, T.SPGRPCD, T.SPECIES_SYMBOL, T.sftwd_hrdwd, T.GENUS, ages_calc_uncorrected, ages_calc_with_totage, age_calc_correction;
