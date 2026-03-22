@@ -4,8 +4,8 @@
 --- is calculated to bring the lowest measurement to 1.0, and the correction is added to all of the tree age measurements.
 
 
-DROP TABLE IF EXISTS DATA_SUBPLOTS_TREES_NO_DSRTRBS_AGES_CALC;
-CREATE TABLE DATA_SUBPLOTS_TREES_NO_DSRTRBS_AGES_CALC AS
+DROP TABLE IF EXISTS DATA_SUBPLOTS_TREES_AGES_CALC;
+CREATE TABLE DATA_SUBPLOTS_TREES_AGES_CALC AS
 
 -- need to push the minimum to 1, 
 SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.subp_num_meas, T.subp_has_dstrb, T.first_dstrb_measdate, T.TREE, T.num_meas,
