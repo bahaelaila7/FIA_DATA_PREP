@@ -1,7 +1,7 @@
 -- Aggregating TREEs from SUBPLOTS
 DROP TABLE IF EXISTS DATA_SUBPLOTS_TREES;
 CREATE TABLE DATA_SUBPLOTS_TREES AS
-SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, DSD.subp_num_meas, DSD.subp_has_dstrb, T.TREE, count(*) num_meas,
+SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, DSD.subp_num_meas, DSD.subp_has_dstrb, DSD.first_dstrb_measdate, T.TREE, count(*) num_meas,
 array_agg(T.CN ORDER BY T.INVYR) TREE_CNS,
 array_agg(T.PREV_TRE_CN ORDER BY T.INVYR) PREV_TRE_CNS,
 array_agg(T.PLT_CN ORDER BY T.INVYR) PLT_CNS,
@@ -25,4 +25,4 @@ FROM DATA_SUBPLOTS_DSTRBS DSD
 CROSS JOIN LATERAL unnest(DSD.PLT_CNS , DSD.MEASDATES) sub(plt_cn ,measdate )
 JOIN TREE T ON T.PLT_CN = sub.plt_cn AND T.SUBP = DSD.SUBP
 LEFT OUTER JOIN DATA_TREEAGE TA ON T.CN = TA.CN
-GROUP BY T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT , T.SUBP, DSD.subp_num_meas, DSD.subp_has_dstrb, T.TREE;
+GROUP BY T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT , T.SUBP, DSD.subp_num_meas, DSD.subp_has_dstrb, DSD.first_dstrb_measdate, T.TREE;
