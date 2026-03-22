@@ -1,7 +1,7 @@
 --- Exclude SUBPLOTS that had harvest or disturbances after its first measurement including DSTRYR=9999 (continual distrb).
 DROP TABLE IF EXISTS DATA_SUBPLOTS_DSTRBS;
 CREATE TABLE DATA_SUBPLOTS_DSTRBS AS
-SELECT DSD.*, (TRUE = ANY(DSD.DSTRBS)) subp_has_dstrb 
+SELECT DSD.*, (TRUE = ANY(DSD.DSTRBS)) subp_has_dstrb, DSD.measdates[array_position(DSD.DSTRBS,TRUE)] first_dstrb_measdate
 FROM (
 SELECT DS.*, array_agg(
 		(Coalesce(cond.DSTRBCD1,0) != 0 AND coalesce(cond.DSTRBYR1,DATE_PART('year', DS.measdates[1])) >= DATE_PART('year', DS.measdates[1])) OR 
