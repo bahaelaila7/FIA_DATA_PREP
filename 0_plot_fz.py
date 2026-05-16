@@ -5,9 +5,9 @@ import geopandas as gpd
 from sqlalchemy import create_engine
 import sys
 # --- config ---
-PREFIX='/home/bma09868/data/perseus'
+PREFIX='/home/bahaa/Documents/projects'
 SQLITE_PATH = f"{PREFIX}/FIA/SQLite_FIADB_ENTIRE.db"
-COUNTIES_PATH=f"{PREFIX}/FIA/tl_2024_us_county/tl_2024_us_county.shp"
+COUNTIES_PATH=f"{PREFIX}/TIGER/tl_2024_us_county/tl_2024_us_county.shp"
 #POINTS_TABLE = ""            # columns: id, lon, lat, crs_flag ('WGS84' or 'NAD83')
 POLY_PATH = f"{PREFIX}/LANDFIRE/firezones/conus_mz_0k.shp"         # replace with your polygons
 #POLY_ID_COL = "id"                 # unique polygon id column

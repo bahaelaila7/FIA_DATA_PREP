@@ -5,11 +5,11 @@ import geopandas as gpd
 from sqlalchemy import create_engine
 import sys
 # --- config ---
-PREFIX='/home/bma09868/data/perseus'
+PREFIX='/home/bahaa/Documents/projects'
 SQLITE_PATH = f"{PREFIX}/FIA/SQLite_FIADB_ENTIRE.db"
-COUNTIES_PATH=f"{PREFIX}/FIA/tl_2024_us_county/tl_2024_us_county.shp"
+COUNTIES_PATH=f"{PREFIX}/TIGER/tl_2024_us_county/tl_2024_us_county.shp"
 #POINTS_TABLE = ""            # columns: id, lon, lat, crs_flag ('WGS84' or 'NAD83')
-POLY_PATH = f"{PREFIX}/EPA_ECOREGIONS/EPA_ECOREGIONS/us_eco_l4/us_eco_l4_no_st.shp"
+POLY_PATH = f"{PREFIX}/EPA_ECOREGIONS/us_eco_l4/us_eco_l4_no_st.shp"
 OUT_PREFIX = "./FIA_EPA"
 OUT_PREFIX_TMP = f"{OUT_PREFIX}_tmp"
 OUT_TABLE = "plot_epa"       # (point_id, polygon_id)
