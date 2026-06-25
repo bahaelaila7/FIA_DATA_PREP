@@ -2,17 +2,17 @@
 cohort_tracking.py
 Longitudinal cohort tracking for curated FIA subplot data.
 
-A cohort is defined by (subplot, SPCD, birth_year_bin) where
-  birth_year_bin = floor((MEASYEAR - estimated_age) / BIN_YEARS) * BIN_YEARS
+A cohort is defined by (subplot, SPCD, birth_date) where
+  birth_date = MEASDATE - duration(round(estimated_age) * 365 days)
 
 Since all age sources are linearly propagated from a single anchor, a tree's
 birth_year is stable across remeasurements — so the same cohort_id persists
 over time without any year-to-year matching heuristic.
 
-Output table: curated_cohorts  (one row per cohort × MEASYEAR)
-  cohort identity : cohort_id, subplot key, SPCD, birth_year_bin
-  per-year live   : n_trees_live, biomass_per_acre, estimated_age_mean/sd
-  introduction    : first_measyear, intro_type
+Output table: curated_cohorts  (one row per cohort × MEASDATE)
+  cohort identity : cohort_id, subplot key, SPCD, birth_date
+  per-visit live  : n_trees_live, biomass_per_acre, estimated_age_mean/sd
+  introduction    : first_measdate, intro_type
   per-interval    : n_harvested, n_disturbance_dead   (since last measurement)
   damage          : pct_biomass_damaged  (live biomass from DAMSEV > 40 trees)
   cumulative      : ever_harvested, ever_disturbed_dead
@@ -34,22 +34,20 @@ import polars as pl
 
 TREE_ID    = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE"]
 SUBPLOT_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP"]
-COHORT_KEY = SUBPLOT_ID + ["SPCD", "birth_year_bin"]
-
-BIN_YEARS = 5   # birth-year bin width; set wider if ages are imprecise
+COHORT_KEY = SUBPLOT_ID + ["SPCD", "birth_date"]
 
 
 # =============================================================================
-# Step 1: assign birth_year_bin and cohort_id to every tree-measurement
+# Step 1: assign birth_date and cohort_id to every tree-measurement
 # =============================================================================
 
 def assign_cohort_ids(df: pl.DataFrame) -> pl.DataFrame:
     """
-    For each tree, derive birth_year from estimated_age at its earliest
-    measurement with a valid age, bin it to BIN_YEARS, and assign an integer
-    cohort_id to each unique (subplot, SPCD, birth_year_bin) combination.
+    For each tree, derive birth_date from estimated_age at its earliest
+    measurement with a valid age, and assign an integer cohort_id to each
+    unique (subplot, SPCD, birth_date) combination.
 
-    Adds columns: birth_year_bin (Int32), cohort_id (UInt32).
+    Adds columns: birth_date (Date), cohort_id (UInt32).
     Trees without any estimated_age get null in both columns.
     """
     # Per-tree birth year: use earliest measurement with a valid estimated_age.
@@ -61,15 +59,14 @@ def assign_cohort_ids(df: pl.DataFrame) -> pl.DataFrame:
             pl.col("estimated_age").is_not_nan() &
             (pl.col("estimated_age") > 0)
         )
-        .sort(TREE_ID + ["MEASYEAR"])
+        .sort(TREE_ID + ["MEASDATE"])
         .unique(subset=TREE_ID, keep="first")
         .select(
             TREE_ID +
-            [(pl.col("MEASYEAR") - pl.col("estimated_age"))
-             .floordiv(BIN_YEARS)
-             .mul(BIN_YEARS)
-             .cast(pl.Int32)
-             .alias("birth_year_bin")]
+            [(pl.col("MEASDATE") -
+              pl.duration(days=pl.col("estimated_age").round(0).cast(pl.Int32) * 365))
+             .cast(pl.Date)
+             .alias("birth_date")]
         )
     )
 
@@ -77,7 +74,7 @@ def assign_cohort_ids(df: pl.DataFrame) -> pl.DataFrame:
 
     # Integer cohort_id for each unique COHORT_KEY
     cohort_ids = (
-        df.filter(pl.col("birth_year_bin").is_not_null())
+        df.filter(pl.col("birth_date").is_not_null())
         .select(COHORT_KEY)
         .unique()
         .sort(COHORT_KEY)
@@ -124,22 +121,22 @@ def _classify_intro_type(stdorgcd: pl.Expr,
 
 def build_cohort_intro(df: pl.DataFrame) -> pl.DataFrame:
     """
-    For each cohort: first_measyear and intro_type based on condition context
+    For each cohort: first_measdate and intro_type based on condition context
     at the first measurement where live trees of that cohort appear.
 
     Returns a DataFrame keyed by cohort_id with columns:
-      first_measyear, intro_type
+      first_measdate, intro_type
     """
     first_live = (
         df.filter(
             (pl.col("STATUSCD") == 1) &
             pl.col("cohort_id").is_not_null()
         )
-        .sort(["cohort_id", "MEASYEAR"])
+        .sort(["cohort_id", "MEASDATE"])
         .unique(subset=["cohort_id"], keep="first")
         .select([
             "cohort_id",
-            pl.col("MEASYEAR").alias("first_measyear"),
+            pl.col("MEASDATE").alias("first_measdate"),
             "cond_stdorgcd",
             "TRTCD1", "TRTCD2", "TRTCD3",
         ])
@@ -150,16 +147,16 @@ def build_cohort_intro(df: pl.DataFrame) -> pl.DataFrame:
             pl.col("cond_stdorgcd"),
             pl.col("TRTCD1"), pl.col("TRTCD2"), pl.col("TRTCD3"),
         ).alias("intro_type")
-    ).select(["cohort_id", "first_measyear", "intro_type"])
+    ).select(["cohort_id", "first_measdate", "intro_type"])
 
 
 # =============================================================================
-# Step 3: per-cohort × MEASYEAR summaries
+# Step 3: per-cohort × MEASDATE summaries
 # =============================================================================
 
 def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Aggregate tree-level records to one row per (cohort_id × MEASYEAR).
+    Aggregate tree-level records to one row per (cohort_id × MEASDATE).
 
     Live-tree summary:
       n_trees_live, biomass_per_acre, estimated_age_mean, estimated_age_sd
@@ -191,7 +188,7 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("DRYBIO_AG") * pl.col("TPA_UNADJ")).alias("_bio"),
             damaged.alias("_dmg"),
         ])
-        .group_by(["cohort_id", "MEASYEAR"])
+        .group_by(["cohort_id", "MEASDATE"])
         .agg([
             pl.len().alias("n_trees_live"),
             pl.col("_bio").sum().alias("biomass_per_acre"),
@@ -222,31 +219,31 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
 
     harvest_agg = (
         dead.filter(pl.col("tree_fate").str.starts_with("harvest"))
-        .group_by(["cohort_id", "MEASYEAR"])
+        .group_by(["cohort_id", "MEASDATE"])
         .agg(pl.len().alias("n_harvested"))
     )
 
     disturbance_death_agg = (
         dead.filter((pl.col("tree_fate") == "dead") & disturbed_cond)
-        .group_by(["cohort_id", "MEASYEAR"])
+        .group_by(["cohort_id", "MEASDATE"])
         .agg(pl.len().alias("n_disturbance_dead"))
     )
 
     # ---- Scaffold: all (cohort, year) pairs with any tree activity ----
     scaffold = (
         pl.concat([
-            live.select(["cohort_id", "MEASYEAR"]),
-            dead.select(["cohort_id", "MEASYEAR"]),
+            live.select(["cohort_id", "MEASDATE"]),
+            dead.select(["cohort_id", "MEASDATE"]),
         ])
         .unique()
-        .sort(["cohort_id", "MEASYEAR"])
+        .sort(["cohort_id", "MEASDATE"])
     )
 
     meas = (
         scaffold
-        .join(live_agg,              on=["cohort_id", "MEASYEAR"], how="left")
-        .join(harvest_agg,           on=["cohort_id", "MEASYEAR"], how="left")
-        .join(disturbance_death_agg, on=["cohort_id", "MEASYEAR"], how="left")
+        .join(live_agg,              on=["cohort_id", "MEASDATE"], how="left")
+        .join(harvest_agg,           on=["cohort_id", "MEASDATE"], how="left")
+        .join(disturbance_death_agg, on=["cohort_id", "MEASDATE"], how="left")
         .with_columns([
             pl.col("n_trees_live").fill_null(0),
             pl.col("biomass_per_acre").fill_null(0.0),
@@ -294,20 +291,19 @@ def check_tree_continuity(df: pl.DataFrame, age_tol: float = 0.5) -> int:
        that is handled by the backfill in cohorts_landis.py.
     """
     subp_prev = (
-        df.select(SUBPLOT_ID + ["MEASYEAR", "MEASDATE"])
+        df.select(SUBPLOT_ID + ["MEASDATE"])
         .unique()
-        .sort(SUBPLOT_ID + ["MEASYEAR"])
-        .with_columns([
+        .sort(SUBPLOT_ID + ["MEASDATE"])
+        .with_columns(
             pl.col("MEASDATE").shift(1).over(SUBPLOT_ID).alias("prev_measdate"),
-            pl.col("MEASYEAR").shift(1).over(SUBPLOT_ID).alias("prev_measyear"),
-        ])
+        )
     )
 
     live = (
         df.filter(pl.col("STATUSCD") == 1)
         .join(
-            subp_prev.select(SUBPLOT_ID + ["MEASYEAR", "prev_measdate", "prev_measyear"]),
-            on=SUBPLOT_ID + ["MEASYEAR"],
+            subp_prev.select(SUBPLOT_ID + ["MEASDATE", "prev_measdate"]),
+            on=SUBPLOT_ID + ["MEASDATE"],
             how="left",
         )
         .with_columns(
@@ -323,15 +319,15 @@ def check_tree_continuity(df: pl.DataFrame, age_tol: float = 0.5) -> int:
     # Previous alive visit per tree
     prev_alive = (
         df.filter(pl.col("STATUSCD") == 1)
-        .select(TREE_ID + ["MEASYEAR", pl.col("estimated_age").alias("prev_estimated_age")])
-        .rename({"MEASYEAR": "prev_measyear"})
+        .select(TREE_ID + ["MEASDATE", pl.col("estimated_age").alias("prev_estimated_age")])
+        .rename({"MEASDATE": "prev_measdate"})
     )
-    live = live.join(prev_alive, on=TREE_ID + ["prev_measyear"], how="left")
+    live = live.join(prev_alive, on=TREE_ID + ["prev_measdate"], how="left")
 
     # First-ever record per tree (any STATUSCD)
     tree_first = (
         df.group_by(TREE_ID)
-        .agg(pl.col("MEASYEAR").min().alias("first_measyear"))
+        .agg(pl.col("MEASDATE").min().alias("first_measdate"))
     )
     live = live.join(tree_first, on=TREE_ID, how="left")
 
@@ -349,7 +345,7 @@ def check_tree_continuity(df: pl.DataFrame, age_tol: float = 0.5) -> int:
     viol_b = live.filter(
         pl.col("prev_measdate").is_not_null() &
         pl.col("prev_estimated_age").is_null() &
-        (pl.col("MEASYEAR") != pl.col("first_measyear"))
+        (pl.col("MEASDATE") != pl.col("first_measdate"))
     )
 
     n_a, n_b, n_total = viol_a.height, viol_b.height, live.height
@@ -387,7 +383,7 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
     # Attach introduction context
     cohorts = meas.join(intro, on="cohort_id", how="left")
 
-    # Attach cohort key columns (subplot + SPCD + birth_year_bin) from the id map
+    # Attach cohort key columns (subplot + SPCD + birth_date) from the id map
     cohort_keys = (
         df.filter(pl.col("cohort_id").is_not_null())
         .select(COHORT_KEY + ["cohort_id"])
@@ -400,9 +396,9 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
         "cohort_id",
         *SUBPLOT_ID,
         "SPCD",
-        "birth_year_bin",
-        "MEASYEAR",
-        "first_measyear",
+        "birth_date",
+        "MEASDATE",
+        "first_measdate",
         "intro_type",
         "n_trees_live",
         "biomass_per_acre",
@@ -413,7 +409,7 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
         "pct_biomass_damaged",
         "ever_harvested",
         "ever_disturbed_dead",
-    ]).sort(["cohort_id", "MEASYEAR"])
+    ]).sort(["cohort_id", "MEASDATE"])
 
     # Diagnostics
     n_rows     = cohorts.height

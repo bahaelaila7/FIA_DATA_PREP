@@ -135,9 +135,16 @@ def fit_age_model(df: pl.DataFrame) -> tuple:
         pl.col("DIA").is_not_nan()
     )
 
+    # Remove upper age outliers (above p90) to avoid tail distortion.
+    # Lower tail is kept — young saplings are valid and important training signal.
+    _p90 = train["estimated_age"].quantile(0.90)
+    train_trimmed = train.filter(pl.col("estimated_age") <= _p90)
+
     n_alive = df.filter(pl.col("STATUSCD") == 1).height
-    print(f"[step2] training set: {train.height:,} / {n_alive:,} alive rows "
-          f"({100 * train.height / max(n_alive, 1):.1f}%) have age_source + DIA")
+    print(f"[step2] training set: {train_trimmed.height:,} / {n_alive:,} alive rows "
+          f"({100 * train_trimmed.height / max(n_alive, 1):.1f}%) after age_source+DIA filter "
+          f"and p90 upper trim (age ≤ {_p90:.0f} yr, dropped {train.height - train_trimmed.height:,})")
+    train = train_trimmed
 
     enc = OrdinalEncoder(
         handle_unknown="use_encoded_value",
@@ -223,37 +230,36 @@ def apply_age_model(df: pl.DataFrame,
         pl.Series("src_age", raw, dtype=pl.Float64)
     )
 
-    anchors = _select_best_anchor(candidates, tree_bounds)
+    anchors = _select_best_anchor(candidates, tree_bounds, apply_min_shift=False)
     df      = _propagate_from_anchor(df, anchors, "age_from_model")
 
-    n_shifted = anchors.filter(pl.col("min_shift") > 0).height
     n_maxviol = anchors.filter(pl.col("max_viol") > 0).height
     print(f"[step3] age_from_model: {anchors.height:,} trees anchored")
-    print(f"         min-age shifts: {n_shifted:,}  |  "
-          f"residual max-age violations: {n_maxviol:,}")
+    print(f"         residual max-age violations: {n_maxviol:,}")
 
-    # Merge: TOTAGE/STDAGE (already in estimated_age) > estage > model
-    # All sources are float — no quantization before this point.
+    # Final age_calc priority: TOTAGE > estage > model > STDAGE.
+    # STDAGE is a stand-level even-aged age (only weakly correlated with individual
+    # biomass — see corr/R² diagnostics), so it is the fallback of last resort,
+    # below the per-tree sources. Built directly from the raw source columns (not
+    # the v3-merged estimated_age, which pre-coalesces TOTAGE>STDAGE) so the order
+    # is explicit. All sources are float — no quantization before this point.
     has_estage = "age_from_estage" in df.columns
-    coalesce_cols = [pl.col("estimated_age")]
-    if has_estage:
-        coalesce_cols.append(pl.col("age_from_estage"))
-    coalesce_cols.append(pl.col("age_from_model"))
-
-    age_source_expr = pl.when(pl.col("age_source").is_not_null()).then(pl.col("age_source"))
-    if has_estage:
-        age_source_expr = age_source_expr.when(
-            pl.col("age_from_estage").is_not_null()
-        ).then(pl.lit("estage"))
-    age_source_expr = (
-        age_source_expr
-        .when(pl.col("age_from_model").is_not_null()).then(pl.lit("model"))
-        .otherwise(pl.lit(None))
-    )
+    estage_col = pl.col("age_from_estage") if has_estage else pl.lit(None, dtype=pl.Float64)
 
     df = df.with_columns([
-        pl.coalesce(coalesce_cols).alias("estimated_age"),
-        age_source_expr.alias("age_source"),
+        pl.coalesce([
+            pl.col("age_from_totage"),
+            estage_col,
+            pl.col("age_from_model"),
+            pl.col("age_from_stdage"),
+        ]).alias("estimated_age"),
+        pl.when(pl.col("age_from_totage").is_not_null()).then(pl.lit("TOTAGE"))
+        .when(estage_col.is_not_null()).then(pl.lit("estage"))
+        .when(pl.col("age_from_model").is_not_null()).then(pl.lit("model"))
+        .when(pl.col("age_from_stdage").is_not_null())
+            .then(pl.lit("STDAGE_") + pl.col("stdage_context").fill_null("unknown"))
+        .otherwise(pl.lit(None))
+        .alias("age_source"),
     ])
 
     n_estage_filled = df.filter(pl.col("age_source") == "estage").height if has_estage else 0
@@ -314,7 +320,7 @@ if __name__ == "__main__":
     print(f"       {df.height:,} rows, {len(df.columns)} columns")
 
     all_subplot_years = con.execute("""
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASYEAR, MEASDATE
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE
         FROM clean_subplot_years
     """).pl()
 

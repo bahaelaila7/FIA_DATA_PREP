@@ -1,6 +1,9 @@
 """
-fia_curation_v2.py
+fia_curation_v3.py
 FIA longitudinal subplot curation pipeline for Pan comparison.
+
+v3 changes from v2:
+- inclusion of plot Cycle
 
 v2 changes from v1:
 - Removed erroneous STDAGE < 998 filter (that's FLDAGE, not STDAGE)
@@ -56,7 +59,9 @@ def sql_base_measurements(con):
         C.CONDPROP_UNADJ,
         C_S.SUBPCOND_PROP, C_S.MICRCOND_PROP, C_S.MACRCOND_PROP,
         C.DSTRBCD1, C.DSTRBCD2, C.DSTRBCD3,
+        C.DSTRBYR1, C.DSTRBYR2, C.DSTRBYR3,
         C.TRTCD1, C.TRTCD2, C.TRTCD3,
+        C.TRTYR1, C.TRTYR2, C.TRTYR3,
         ((C.DSTRBCD1 IS NOT NULL AND C.DSTRBCD1 NOT IN (0, 60)) OR
          (C.DSTRBCD2 IS NOT NULL AND C.DSTRBCD2 NOT IN (0, 60)) OR
          (C.DSTRBCD3 IS NOT NULL AND C.DSTRBCD3 NOT IN (0, 60))) AS disturbed,
@@ -102,9 +107,9 @@ def sql_clean_subplot_years(con):
     con.execute("""
     DROP TABLE IF EXISTS clean_subplot_years;
     CREATE TABLE clean_subplot_years AS
-    SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE
+    SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE
     FROM base_subplot_cond
-    GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE
+    GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE
     HAVING SUM(CASE WHEN COND_STATUS_CD = 3 THEN 1 ELSE 0 END) = 0
     """)
     con.commit()
@@ -252,7 +257,7 @@ def load_trees(con) -> pl.DataFrame:
     SELECT
         T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, T.INVYR,
         T.CN,
-        CSY.MEASDATE,
+        CSY.MEASDATE, CSY.CYCLE,
         T.CONDID, T.STATUSCD, T.RECONCILECD, T.AGENTCD,
         T.SPCD, T.SPGRPCD, SP.STOCKING_SPGRPCD, SP.JENKINS_SPGRPCD,
         T.DIA, T.HT, T.ACTUALHT, T.CR, T.CCLCD,
@@ -282,7 +287,9 @@ def load_trees(con) -> pl.DataFrame:
         P.ELEV        AS cond_elev,
         P.MACRO_BREAKPOINT_DIA,
         C.TRTCD1, C.TRTCD2, C.TRTCD3,
-        C.DSTRBCD1, C.DSTRBCD2, C.DSTRBCD3
+        C.TRTYR1, C.TRTYR2, C.TRTYR3,
+        C.DSTRBCD1, C.DSTRBCD2, C.DSTRBCD3,
+        C.DSTRBYR1, C.DSTRBYR2, C.DSTRBYR3
     FROM TREE T
     JOIN REF_SPECIES SP ON SP.SPCD = T.SPCD
     JOIN clean_subplot_years CSY
@@ -683,6 +690,42 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
         .alias("tree_fate")
     )
 
+    # ------
+    tree_final = (
+        df
+        .sort(TREE_ID + ["MEASDATE"])
+        .group_by(TREE_ID)
+        .agg(
+            pl.col("MEASDATE").last().alias("_tree_last_measdate"),
+            pl.col("tree_fate").last().alias("_final_tree_fate_raw"),
+        )
+    )
+
+    last_subp_measdates = (
+        df
+        .group_by(SUBPLOT_ID)
+        .agg(
+            pl.col("MEASDATE").max().alias("last_subp_measdate")
+        )
+    )
+
+    out = (
+        df
+        .join(tree_final, on=TREE_ID, how="left")
+        .join(last_subp_measdates, on=SUBPLOT_ID, how="left")
+        .with_columns(
+            pl.when(
+                (pl.col("_final_tree_fate_raw") == "alive")
+                & (pl.col("last_subp_measdate") > pl.col("_tree_last_measdate"))
+            )
+            .then(pl.lit("harvest_inferred"))
+            .otherwise(pl.col("_final_tree_fate_raw"))
+            .alias("final_tree_fate")
+        )
+    )
+
+    # -----
+
     df = df.drop(["_fate_raw", "_cond_has_explicit"])
 
     # Print breakdown
@@ -915,13 +958,45 @@ def assign_stdage(df: pl.DataFrame,
         (pl.col("stdage_tree_first_measdate") >= pl.col("stdage_cond_first_reset_measdate"))
     )
 
-    df = df.with_columns(
-        (
-            (pl.col("cond_stdorgcd") == 1) |
-            post_reset_debut |
-            (pre_reset & ~survived_reset)
-        ).alias("stdage_eligible")
+    # FLDSZCD size gate.  STDAGE is, by FIA definition, the average age of the
+    # trees in the FIELD-recorded stand-size class (FLDSZCD) of the condition, so
+    # only trees that qualify within that class should inherit it. Sapling stands
+    # (FLDSZCD=1) keep all trees (the saplings ARE the cohort); in pole/timber and
+    # larger classes (FLDSZCD>=2, or nonstocked/unknown) only timber-sized trees
+    # (DIA >= 5") qualify, excluding sub-tally understory/ingrowth. A null DIA does
+    # NOT qualify: dead records routinely carry a null DIA, and allowing them would
+    # let a sub-5" understory tree qualify via its death record and propagate the
+    # stand age back onto its live sapling measurements.
+    # (A per-class rising floor — sawtimber stands requiring >=9"/11" — was tried and
+    # only nudged corr(ln biomass, STDAGE-age) 0.292 -> 0.301 while dropping ~7k
+    # legitimate pole-sized cohort trees, so the flat sapling/timber line is used.)
+    size_qualifies = (
+        (pl.col("cond_fldszcd") == 1) |
+        (pl.col("DIA") >= 5.0)
     )
+    base_eligible = (
+        (pl.col("cond_stdorgcd") == 1) |
+        post_reset_debut |
+        (pre_reset & ~survived_reset)
+    )
+    # Qualify/anchor on LIVE measurements only: STDAGE is the mean age of the
+    # *live* trees in the size class, and a tree must not qualify (or be anchored)
+    # via a dead record — e.g. a sub-5" sapling whose death record happens to read
+    # DIA>=5 would otherwise sneak in and propagate stand age onto its live rows.
+    alive = pl.col("STATUSCD") == 1
+    df = df.with_columns(
+        (base_eligible & size_qualifies & alive).alias("stdage_eligible")
+    )
+
+    # Diagnostic: trees that were otherwise STDAGE-eligible but lose it entirely
+    # to the size gate (no qualifying LIVE measurement with a valid stand age).
+    _basec = df.filter(base_eligible & alive & pl.col("cond_stdage").is_not_null() &
+                       (pl.col("cond_stdage") > 0))
+    _trees_base = _basec.select(TREE_ID).unique()
+    _trees_qual = _basec.filter(size_qualifies).select(TREE_ID).unique()
+    n_size_gated = _trees_base.join(_trees_qual, on=TREE_ID, how="anti").height
+    print(f"[step6b] FLDSZCD size gate: {n_size_gated:,} understory trees removed from "
+          f"STDAGE (sub-5in in FLDSZCD>=2 stands)")
 
     # Diagnostics
     n_carryforward_excl = (
