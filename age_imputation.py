@@ -38,8 +38,12 @@ from sklearn.preprocessing import OrdinalEncoder
 # curation-fix 2026-10-26: was `from fia_curation_v2 import ...` — v2's anchor selection is
 # the old youngest-candidate rule; v3 carries the median-anchor fix.
 from fia_curation_v3 import (
+    ESTAGE_MIN_AGE,
+    ESTAGE_MIN_DIA,
     FIX_COLUMNS,
     SUBPLOT_ID,
+    anchor_estage,
+    flag_age_discrepancies,
     _compute_tree_bounds,
     _select_best_anchor,
     _propagate_from_anchor,
@@ -91,6 +95,219 @@ def attach_modeling_context(con, df: pl.DataFrame) -> pl.DataFrame:
     print(f"[step1] context attached — "
           f"epa_l3: {n_eco:,}/{n:,}  |  major_spgrpcd: {n_grp:,}/{n:,}")
     return df
+
+
+# =============================================================================
+# Step 1b (I2): map the external TreeAge (estage) onto the FIELD-age scale
+# =============================================================================
+# The truth is the FIA field age: TOTAGE, or STDAGE where the tree qualifies (planted /
+# post-reset stands, FLDSZCD gate) — i.e. age_from_totage, else age_from_stdage. The external
+# Tree_Age (Zenodo 14775738) runs older, so every estage anchor candidate uses
+#   field_age = f_g(Tree_Age), monotone, fitted in log1p space per species group g.
+#   * calibration: LIVE records with DIA >= 5 in and Tree_Age > 1 that have a field age at the
+#     same measurement;
+#   * groups: spgrpcd_resolved -> major_spgrpcd -> global, falling back whenever a group has
+#     fewer than CAL_MIN_N overlap records; within a group, planted (STDORGCD=1) vs natural
+#     are separate curves only when BOTH strata have >= CAL_MIN_N records;
+#   * f = isotonic regression on log1p (sklearn IsotonicRegression) — monotone; inside the
+#     fitted range it interpolates its knots, outside it is clamped to the end knot and
+#     extended LINEARLY in log1p with the group's OLS log-log slope (clipped to
+#     [CAL_SLOPE_MIN, CAL_SLOPE_MAX]) — no wild extrapolation; a per-curve Duan smearing
+#     factor on (1 + age) removes the log back-transform bias (still monotone);
+#   * fitted once over the whole DB; plot-grouped 5-fold CV reports out-of-fold MAE / bias of
+#     mapped vs raw Tree_Age against the field age.
+CAL_MIN_N = 200
+CAL_SLOPE_MIN, CAL_SLOPE_MAX = 0.25, 1.5
+CAL_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "spgrpcd_resolved", "cond_stdorgcd",
+            "STATUSCD", "DIA", "estage_raw", "age_from_totage", "age_from_stdage"]
+
+
+def _calibration_set(con) -> pl.DataFrame:
+    cols = ", ".join(CAL_COLS)
+    df = con.execute(f"""
+        SELECT {cols} FROM curated_trees
+        WHERE STATUSCD = 1 AND DIA >= {ESTAGE_MIN_DIA} AND estage_raw > {ESTAGE_MIN_AGE}
+          AND COALESCE(age_from_totage, age_from_stdage) IS NOT NULL""").pl()
+    spgrp = con.execute("SELECT SPCD, MAJOR_SPGRPCD AS major_spgrpcd FROM REF_SPECIES").pl()
+    df = (df.join(spgrp.with_columns(pl.col("SPCD").cast(df.schema["SPCD"])), on="SPCD", how="left")
+            .with_columns([
+                pl.coalesce(["age_from_totage", "age_from_stdage"]).alias("field_age"),
+                (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("planted"),
+                pl.concat_str([pl.col(c).cast(pl.Utf8) for c in ("STATECD", "UNITCD", "COUNTYCD", "PLOT")],
+                              separator="_").alias("_plot"),
+            ])
+            .filter(pl.col("field_age") > 0))
+    return df
+
+
+def _fit_curve(x_raw: np.ndarray, y_field: np.ndarray) -> dict:
+    from sklearn.isotonic import IsotonicRegression
+    lx, ly = np.log1p(x_raw), np.log1p(y_field)
+    iso = IsotonicRegression(increasing=True, out_of_bounds="clip").fit(lx, ly)
+    kx, ky = np.asarray(iso.X_thresholds_), np.asarray(iso.y_thresholds_)
+    slope = float(np.polyfit(lx, ly, 1)[0]) if np.ptp(lx) > 0 else 1.0
+    c = {"kx": kx, "ky": ky, "slope": float(np.clip(slope, CAL_SLOPE_MIN, CAL_SLOPE_MAX)),
+         "n": int(lx.size), "smear": 1.0}
+    # Duan smearing: back-transforming a log1p fit is biased low by Jensen (-2.9 yr mean bias
+    # in AL CV); a constant multiplicative factor on (1 + age) removes it and keeps f monotone
+    c["smear"] = float(np.mean(np.exp(ly - _log_curve(c, lx))))
+    return c
+
+
+def _log_curve(c: dict, lx: np.ndarray) -> np.ndarray:
+    ly = np.interp(lx, c["kx"], c["ky"])                       # clamped to the end knots
+    lo, hi = c["kx"][0], c["kx"][-1]
+    ly = np.where(lx < lo, c["ky"][0] + c["slope"] * (lx - lo), ly)
+    return np.where(lx > hi, c["ky"][-1] + c["slope"] * (lx - hi), ly)
+
+
+def _apply_curve(c: dict, x_raw: np.ndarray) -> np.ndarray:
+    return (np.exp(_log_curve(c, np.log1p(x_raw))) * c["smear"] - 1.0).clip(1.0, None)
+
+
+def _group_keys(spgrp, major, planted):
+    """Candidate model keys in fallback order for one record."""
+    return [("spgrpcd", spgrp, planted), ("spgrpcd", spgrp, None),
+            ("major_spgrpcd", major, planted), ("major_spgrpcd", major, None),
+            ("global", None, None)]
+
+
+def fit_estage_mapping(cal: pl.DataFrame, stratify: bool = True) -> dict:
+    """{(level, value, planted|None): curve}. A group gets a curve when it has >= CAL_MIN_N
+    records; it is split planted/natural only when both strata reach CAL_MIN_N."""
+    models = {}
+    x_all, y_all = cal["estage_raw"].to_numpy().astype(float), cal["field_age"].to_numpy().astype(float)
+    models[("global", None, None)] = _fit_curve(x_all, y_all)
+    for level, col in (("spgrpcd", "spgrpcd_resolved"), ("major_spgrpcd", "major_spgrpcd")):
+        for (val,), g in cal.group_by([col], maintain_order=True):
+            if val is None or g.height < CAL_MIN_N:
+                continue
+            gp, gn = g.filter(pl.col("planted")), g.filter(~pl.col("planted"))
+            if stratify and gp.height >= CAL_MIN_N and gn.height >= CAL_MIN_N:
+                for flag, sub in ((True, gp), (False, gn)):
+                    models[(level, val, flag)] = _fit_curve(sub["estage_raw"].to_numpy().astype(float),
+                                                            sub["field_age"].to_numpy().astype(float))
+            else:
+                models[(level, val, None)] = _fit_curve(g["estage_raw"].to_numpy().astype(float),
+                                                        g["field_age"].to_numpy().astype(float))
+    return models
+
+
+def map_estage(models: dict, raw, spgrp, major, planted) -> tuple[np.ndarray, list]:
+    """Mapped field-scale age + the model key used, record by record (vectorised per key)."""
+    raw = np.asarray(raw, dtype=float)
+    out = np.full(raw.shape, np.nan)
+    used = [None] * raw.size
+    keys = {}
+    for i, (sg, mj, pt) in enumerate(zip(spgrp, major, planted)):
+        if not np.isfinite(raw[i]):
+            continue
+        for k in _group_keys(sg, mj, bool(pt)):
+            if k in models:
+                keys.setdefault(k, []).append(i)
+                used[i] = k
+                break
+    for k, idx in keys.items():
+        idx = np.asarray(idx)
+        out[idx] = _apply_curve(models[k], raw[idx])
+    return out, used
+
+
+def cv_estage_mapping(cal: pl.DataFrame, n_folds: int = 5, stratify: bool = True) -> dict:
+    """Plot-grouped K-fold CV: out-of-fold MAE / bias (yr) of mapped and raw vs field age."""
+    from sklearn.model_selection import GroupKFold
+    y = cal["field_age"].to_numpy().astype(float)
+    raw = cal["estage_raw"].to_numpy().astype(float)
+    pred = np.full(y.shape, np.nan)
+    for tr, te in GroupKFold(n_splits=n_folds).split(raw, y, groups=cal["_plot"].to_numpy()):
+        m = fit_estage_mapping(cal[tr], stratify)
+        sub = cal[te]
+        pred[te], _ = map_estage(m, sub["estage_raw"].to_numpy(), sub["spgrpcd_resolved"].to_list(),
+                                 sub["major_spgrpcd"].to_list(), sub["planted"].to_list())
+    return {"n": int(y.size), "mae_mapped": float(np.nanmean(np.abs(pred - y))),
+            "bias_mapped": float(np.nanmean(pred - y)), "mae_raw": float(np.mean(np.abs(raw - y))),
+            "bias_raw": float(np.mean(raw - y)), "pred": pred}
+
+
+def calibrate_estage(con):
+    """Fit the TreeAge -> field-age mapping over the whole DB, report CV, write the
+    estage_calibration table; returns the models (None when there is no overlap)."""
+    cal = _calibration_set(con)
+    print(f"[estage-cal] calibration set: {cal.height:,} live >= {ESTAGE_MIN_DIA:g} in records with "
+          f"Tree_Age > {ESTAGE_MIN_AGE} and a field age (TOTAGE {cal['age_from_totage'].is_not_null().sum():,}"
+          f" / STDAGE {cal.filter(pl.col('age_from_totage').is_null()).height:,})")
+    if cal.height < CAL_MIN_N:
+        print("[estage-cal] too little overlap — estage left on the raw scale")
+        return None
+    cv_s = cv_estage_mapping(cal, stratify=True)
+    cv_p = cv_estage_mapping(cal, stratify=False)
+    print(f"[estage-cal] plot-grouped 5-fold CV vs field age (n={cv_s['n']:,}):")
+    print(f"             raw Tree_Age        MAE {cv_s['mae_raw']:6.2f} yr  bias {cv_s['bias_raw']:+6.2f} yr")
+    print(f"             mapped (pooled)     MAE {cv_p['mae_mapped']:6.2f} yr  bias {cv_p['bias_mapped']:+6.2f} yr")
+    print(f"             mapped (+planted)   MAE {cv_s['mae_mapped']:6.2f} yr  bias {cv_s['bias_mapped']:+6.2f} yr")
+    stratify = cv_s["mae_mapped"] <= cv_p["mae_mapped"]
+    print(f"[estage-cal] planted/natural split {'KEPT' if stratify else 'DROPPED'} "
+          f"(CV MAE {cv_s['mae_mapped']:.2f} vs pooled {cv_p['mae_mapped']:.2f})")
+    best = cv_s if stratify else cv_p
+    models = fit_estage_mapping(cal, stratify)
+    # per-group out-of-fold diagnostics + knots table
+    _, used = map_estage(models, cal["estage_raw"].to_numpy(), cal["spgrpcd_resolved"].to_list(),
+                         cal["major_spgrpcd"].to_list(), cal["planted"].to_list())
+    y, raw = cal["field_age"].to_numpy().astype(float), cal["estage_raw"].to_numpy().astype(float)
+    rows = []
+    used_arr = np.array([str(u) for u in used])
+    for k, c in models.items():
+        m = used_arr == str(k)
+        rows.append({
+            "level": k[0], "group": None if k[1] is None else str(int(k[1])),
+            "stratum": "all" if k[2] is None else ("planted" if k[2] else "natural"),
+            "n_fit": c["n"], "n_applied_cal": int(m.sum()),
+            "oof_mae_mapped": float(np.nanmean(np.abs(best["pred"][m] - y[m]))) if m.any() else None,
+            "oof_bias_mapped": float(np.nanmean(best["pred"][m] - y[m])) if m.any() else None,
+            "mae_raw": float(np.mean(np.abs(raw[m] - y[m]))) if m.any() else None,
+            "bias_raw": float(np.mean(raw[m] - y[m])) if m.any() else None,
+            "ext_slope": c["slope"], "smearing_factor": c["smear"],
+            "knots_tree_age": [round(float(v), 3) for v in np.expm1(c["kx"])],
+            "knots_field_age": [round(float(v), 3) for v in np.exp(c["ky"]) * c["smear"] - 1.0],
+        })
+    tab = pl.DataFrame(rows, schema_overrides={"knots_tree_age": pl.List(pl.Float64),
+                                               "knots_field_age": pl.List(pl.Float64)})
+    tab = tab.with_columns([
+        pl.lit(best["mae_mapped"]).alias("cv_mae_mapped_overall"),
+        pl.lit(best["bias_mapped"]).alias("cv_bias_mapped_overall"),
+        pl.lit(best["mae_raw"]).alias("mae_raw_overall"),
+        pl.lit(best["bias_raw"]).alias("bias_raw_overall"),
+        pl.lit(stratify).alias("planted_split_used"),
+    ])
+    con.register("_cal", tab.to_arrow())
+    con.execute("CREATE OR REPLACE TABLE estage_calibration AS SELECT * FROM _cal")
+    con.unregister("_cal")
+    con.commit()
+    print(f"[estage-cal] {len(models)} curves → estage_calibration")
+    return models
+
+
+def remap_estage(df: pl.DataFrame, models, tree_bounds: pl.DataFrame) -> pl.DataFrame:
+    """Re-anchor estage on the field scale: estage_mapped = f_g(Tree_Age) on valid
+    candidates (DIA >= 5, Tree_Age > 1), then the usual median anchor + propagation, and the
+    age-discrepancy flags. Column order is preserved."""
+    if models is None:
+        return df
+    order = df.columns
+    valid = (pl.col("estage_raw").is_not_null() & (pl.col("DIA") >= ESTAGE_MIN_DIA).fill_null(False)
+             & (pl.col("estage_raw") > ESTAGE_MIN_AGE))
+    sub = df.select(pl.int_range(pl.len()).alias("_i"), valid.alias("_v"), "estage_raw",
+                    "spgrpcd_resolved", "major_spgrpcd",
+                    (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("_pl")).filter(pl.col("_v"))
+    mapped, _ = map_estage(models, sub["estage_raw"].to_numpy(), sub["spgrpcd_resolved"].to_list(),
+                           sub["major_spgrpcd"].to_list(), sub["_pl"].to_list())
+    full = np.full(df.height, np.nan)
+    full[sub["_i"].to_numpy()] = mapped
+    df = df.with_columns(pl.Series("estage_mapped", full).fill_nan(None))
+    cand = (df.filter(pl.col("estage_mapped").is_not_null())
+              .select(TREE_ID + ["MEASDATE", "INVYR", pl.col("estage_mapped").alias("src_age")]))
+    df = flag_age_discrepancies(anchor_estage(df, cand, tree_bounds))
+    return df.select(order)
 
 
 # =============================================================================
@@ -347,6 +564,7 @@ if __name__ == "__main__":
     train_df = attach_modeling_context(con, con.execute(f"SELECT {cols} FROM curated_trees").pl())
     model, enc = fit_age_model(train_df)
     del train_df
+    estage_models = calibrate_estage(con)        # I2: TreeAge -> field scale, once over the DB
     scaffold_all = build_subplot_year_scaffold(con)
     states = [r[0] for r in con.execute(
         "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]
@@ -360,6 +578,7 @@ if __name__ == "__main__":
         """).pl()
         df = attach_modeling_context(con, df)
         tree_bounds = _compute_tree_bounds(df, all_subplot_years)
+        df = remap_estage(df, estage_models, tree_bounds)
         df = _order_columns(apply_age_model(df, model, enc, tree_bounds))
 
         scaffold = scaffold_all.filter(pl.col("STATECD") == st)

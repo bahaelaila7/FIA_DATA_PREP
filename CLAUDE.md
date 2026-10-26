@@ -52,13 +52,13 @@ allow-list rather than `search_path`, which would expose them. Helpers: `table_e
 | TPA_UNADJ > 0 on every record | **live** records: TPA_UNADJ > 0 on their OWN condition with COND_STATUS_CD = 1. **Dead/cut** records: kept on COND_STATUS 1–4 (nonforest and water too; 193 AL records on 3/4) even with a NULL TPA. FIADB leaves TPA null on many mortality records of previously-live trees, and dropping them turned real deaths into inferred removals. A dead record's TPA is never used in a live total |
 | `SUBP_STATUS_CD <> 3` | **SUBP ≤ 4** (the national design; SUBP > 4 rows are auxiliary/regional points with NULL status), `SUBP_STATUS_CD IS DISTINCT FROM 3`, P2A records (`P2A_GRM_FLG='Y'`) excluded explicitly. The annual survey filter and the REF_SPECIES join are unchanged |
 | anchor = smallest "max-age violation" (picked the youngest candidate 78 % of the time, −2.7 yr) | anchor age = **median** of the candidates' implied ages at first measurement. Anchor date = the candidate closest to the median. The "crew was there and didn't see it" bound is not used for selection (it is wrong for every new-tree class). `max_viol` is kept as a diagnostic |
-| estage (Tree_Age) used at any size | an estage record is a candidate only if **DIA ≥ 5 in and Tree_Age > 1** (`ESTAGE_MIN_DIA`/`ESTAGE_MIN_AGE`). About 42 % of AL live 1–3 in saplings that have a Tree_Age carry Tree_Age ≤ 1 (≈45 % by the auditor's count), with a hard step at 5 in. Saplings get their age from a later ≥5 in record of the same tree (propagated back) or from the age model. `estage_raw` keeps the raw value |
+| estage (Tree_Age) used at any size | an estage record is a candidate only if **DIA ≥ 5 in and Tree_Age > 1** (`ESTAGE_MIN_DIA`/`ESTAGE_MIN_AGE`). About 42 % of AL live 1–3 in saplings that have a Tree_Age carry Tree_Age ≤ 1 (≈45 % by the auditor's count), with a hard step at 5 in. Saplings get their age from a later ≥5 in record of the same tree (propagated back) or from the age model. `estage_raw` keeps the raw value. **Field scale (I2, user decision)**: every age follows the FIA field scale (TOTAGE, or STDAGE where the tree qualifies), and every estage candidate uses `estage_mapped` = f_g(Tree_Age); see "Field-age scale" below |
 | `final_tree_fate` was computed and discarded | returned: last dead/cut fate · `censored_<last reason>` · `diverted_landuse` · `disappeared_inferred_removal` · `alive`. `diverted_landuse` = the subplot is revisited but the land left forest: a later live record on a nonforest/water condition (`tree_landuse_exits`), or the next visit is entirely nonforest. `dead_at_first_visit` flags a tree that was already dead at the subplot's first visit (no observed mortality) |
 | harvest_inferred for any STATUSCD 2 on a TRTCD=10 condition without explicit cut markers | only when **AGENTCD is NULL**. A recorded agent 10–70 is FIA's own mortality call: all 152 AL harvest_inferred vs GRM MORTALITY disagreements had one. GRM CUT→harvest / MORTALITY→dead agreement is now 1.0000 (AL, KY) |
 | snapshots by raw SPCD | `curated_snapshots` grouped by `spcd_resolved` / `spgrpcd_resolved` |
 | — | `spgrpcd_resolved`; area proportions for consumer-side normalisation (`cond_condprop_unadj`, `cond_subpprop_unadj`, `cond_micrprop_unadj`, `cond_macrprop_unadj`, `subp_subpcond_prop`, `subp_micrcond_prop`, `subp_macrcond_prop`, `subp_forest_*_prop`, `subp_has_cond_status3`, `cond_status_cd`) |
 
-The 24 new curated_trees columns are APPENDED after all old columns (`FIX_COLUMNS`), so the old
+The 25 new curated_trees columns (incl. `estage_mapped`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
 schema (names, types, order) is an exact prefix. The polars steps run one state at a time. Every
 rule is tree-, subplot- or condition-local, so this matches a single pass. Only the diagnostic
 `spcd_confusion_cluster` id is state-local. `age_imputation` fits its model once over all states
@@ -184,6 +184,69 @@ Sapling ages are now about 98 % model-based. Single-county subsets train the age
 ~1k rows: AL 89 shows 3–5 in saplings (median 36.6 yr) older than 5–7 in trees (31.3 yr).
 Check the sapling-age monotonicity on the full run.
 
+### Field-age scale for estage (I2, user decision 2026-10-26)
+The truth is the FIA field age: `age_from_totage`, else `age_from_stdage` (eligible STDAGE:
+planted / post-reset, FLDSZCD gate). The external TreeAge (Zenodo 14775738) is mapped onto that
+scale in `age_imputation.py` (step 2): `calibrate_estage` → `remap_estage`. v3's estage anchors
+are interim, on the raw scale.
+- **Calibration set**: LIVE records with DIA ≥ 5 in, Tree_Age > 1 and a field age at the same
+  measurement. AL: 218,707 records; KY: 55,757. All of them are STDAGE; AL and KY have no TOTAGE.
+- **Mapping f_g**:
+  - isotonic regression in log1p space, so it is monotone;
+  - clamped to the knots, then extended linearly in log1p with the group's OLS slope, clipped
+    to [0.25, 1.5];
+  - a per-curve Duan smearing factor on (1 + age) removes the log back-transform bias. Without
+    it the AL CV bias was −2.9 yr; it stays monotone.
+- **Groups**: `spgrpcd_resolved` → `major_spgrpcd` → global, with a fallback whenever a group
+  has fewer than 200 records. Within a group, planted vs natural are split only when both strata
+  have ≥ 200 records. The split is kept when it lowers CV MAE: AL 9.28 vs 9.90 pooled (it
+  matters); KY 13.41 vs 13.42 (it doesn't).
+- **Fit**: once over the whole DB, with plot-grouped 5-fold CV. Out-of-fold vs field age:
+
+  | State | Raw Tree_Age MAE / bias | Mapped MAE / bias |
+  |---|---|---|
+  | AL | 12.85 / +2.81 yr | 9.28 / +0.11 yr |
+  | KY | 20.97 / −13.94 yr | 13.41 / +0.26 yr |
+
+  Note that in KY the raw TreeAge runs YOUNGER than the field age.
+- **Outputs**: `estage_mapped` (field-scale value on valid candidates) is appended to
+  curated_trees. The `estage_calibration` table holds one row per curve: level, group,
+  stratum, n, OOF MAE/bias, raw MAE/bias, extension slope, smearing factor, and the knots on
+  both scales.
+- **Model**: stays trained on field ages only.
+
+Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monotone ages: 0/25 and 0/25):
+- **Planted loblolly (AL), median age by DIA class 1–3 / 3–5 / 5–7 / 7–9 / 9+ in**:
+
+  | Source | 1–3 | 3–5 | 5–7 | 7–9 | 9+ |
+  |---|---|---|---|---|---|
+  | Field STDAGE | 6.0 | 8.9 | 13.1 | 16.3 | 23.0 |
+  | Mapped estage | 7.3 | 8.8 | 13.8 | 18.1 | 23.8 |
+  | Raw Tree_Age (≥5 in only) | – | – | 18.0 | 24.0 | 39.0 |
+  | Final age | 6.9 | 9.5 | 13.9 | 17.8 | 23.7 |
+
+  Final minus field is +0.7 to +1.1 yr.
+- **Same condition-visit DIA-class steps** (median, yr): 3–5→5–7 in vs 5–7→7–9 in:
+
+  | Stand / species | Before | After |
+  |---|---|---|
+  | AL planted loblolly | 4.6 vs 2.1 | 1.4 vs 1.1 |
+  | AL natural loblolly | 4.4 vs 3.8 | 6.1 vs 2.8 |
+  | AL planted, all species | 4.9 vs 3.5 | 2.0 vs 1.2 |
+  | AL natural, all species | 6.1 vs 6.6 | **14.8 vs 3.1** |
+  | KY natural, all species | – | **19.8 vs 2.8** |
+
+- **Open issue (natural stands)**: model-aged saplings sit far below the mapped-estage timber
+  in the same stand (AL natural 5–7 in: model 23.6 vs mapped estage 33.9 yr). The field-age
+  truth for NATURAL stands comes only from post-reset (young) STDAGE-eligible trees, so both
+  the model and the mapping extrapolate into uneven-aged natural stands, and they disagree there.
+- **Age-source shares** (live records): AL ≥5 in: estage 92.4 %, model 7.6 %; saplings: model
+  95.0 %, estage 5.0 %. KY ≥5 in: estage 96.6 %, model 3.4 %; saplings: model 96.9 %,
+  estage 3.1 %. TOTAGE and STDAGE are 0 % as final sources: there is no TOTAGE, and STDAGE is
+  the last fallback.
+- **Resume**: a step-2 rerun (`FROM_STEP=2`) stays EXCEPT-identical, including
+  `estage_calibration`.
+
 ### Round-2 audit: whole-state checks (AL = 1, KY = 21; steps 1–11 + verify)
 | Check | AL | KY |
 |---|---|---|
@@ -194,9 +257,8 @@ Check the sapling-age monotonicity on the full run.
 | Censoring events (procedural / nonsampled / shrank / procedural_unrecorded / moved) | 23,059 / 2,642 / 100 / 95 / 56 | 2,863 / 4,338 / 81 / 1,203 / 49 |
 | Sim A phantoms | 25,735 → 33,232 (tree 33,170 + cohort 62) | 17,717 (tree 17,686 + cohort 31) |
 
-- Failed checks: AL 0. KY 1, check (d): 11/25 species have median age at 3–5 in (88 %
-  model-aged) above 5–7 in (92 % estage-aged). That is the two-age-scale issue (I2,
-  TreeAge older than field ages), **ON HOLD** pending the user's choice of scale.
+- Failed checks: AL 0. KY 1 before the field-scale mapping (check (d): 11/25 species
+  non-monotone); 0 after it.
 - The procedural_unrecorded censorings flow to `final_tree_fate` / `terminal_fate`
   `censored_procedural_unrecorded`.
 - The AL cohort pass went from 1,039 phantoms to 62. The tree pass grew because candidates now

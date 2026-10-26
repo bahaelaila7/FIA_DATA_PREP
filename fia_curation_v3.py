@@ -1677,12 +1677,26 @@ def process_estage(df: pl.DataFrame, estage_raw: pl.DataFrame,
                             pl.col("estage_raw").cast(pl.Float64).alias("src_age")])
     )
 
+    # NOTE (I2): these anchors are on the RAW TreeAge scale and are interim — age_imputation
+    # (step 2) re-anchors estage on the FIELD-age scale (estage_mapped) for every state.
+    df = df.with_columns(pl.lit(None).cast(pl.Float64).alias("estage_mapped"))
+    return anchor_estage(df, cand_est, tree_bounds)
+
+
+def anchor_estage(df: pl.DataFrame, cand_est: pl.DataFrame,
+                  tree_bounds: pl.DataFrame) -> pl.DataFrame:
+    """(Re)compute the estage anchor columns from candidate records (TREE_ID + MEASDATE +
+    INVYR + src_age): estage_anchor_value / _measdate / _invyr, age_from_estage (float) and
+    estage (int). Existing columns of those names are replaced."""
+    df = df.drop([c for c in ("estage_anchor_value", "estage_anchor_measdate", "estage_anchor_invyr",
+                              "age_from_estage", "estage") if c in df.columns])
     if cand_est.height == 0:
-        print("[step6d] no estage estimates — skipping propagation")
+        print("[estage] no estage candidates — skipping propagation")
         return df.with_columns([
-            pl.lit(None).cast(pl.Float64).alias("estage_anchor_value"),
             pl.lit(None).cast(pl.Date).alias("estage_anchor_measdate"),
-            pl.lit(None).cast(pl.Int32).alias("estage_anchor_invyr"),
+            pl.lit(None).cast(pl.Float64).alias("estage_anchor_value"),
+            pl.lit(None).cast(pl.Int64).alias("estage_anchor_invyr"),
+            pl.lit(None).cast(pl.Float64).alias("age_from_estage"),
             pl.lit(None).cast(pl.Int32).alias("estage"),
         ])
 
@@ -1729,11 +1743,8 @@ def process_estage(df: pl.DataFrame, estage_raw: pl.DataFrame,
     n_shifted = anchors_est.filter(pl.col("min_shift") > 0).height
     n_maxviol = anchors_est.filter(pl.col("max_viol") > 0).height
     n_prop    = df.filter(pl.col("estage").is_not_null()).height
-    print(f"[step6d] estage: {anchors_est.height:,} trees anchored, "
-          f"{n_prop:,} measurements propagated")
-    print(f"         min-age shifts: {n_shifted:,}  |  "
-          f"residual max-age violations: {n_maxviol:,}")
-
+    print(f"[estage] {anchors_est.height:,} trees anchored, {n_prop:,} measurements propagated")
+    print(f"         min-age shifts: {n_shifted:,}  |  residual max-age violations: {n_maxviol:,}")
     return df
 
 
@@ -2308,6 +2319,7 @@ def _polars_steps(con, df: pl.DataFrame, estage_raw, all_subplot_years,
             pl.lit(None).cast(pl.Int64).alias("estage_anchor_invyr"),
             pl.lit(None).cast(pl.Float64).alias("age_from_estage"),
             pl.lit(None).cast(pl.Int32).alias("estage"),
+            pl.lit(None).cast(pl.Float64).alias("estage_mapped"),
         ])
     return flag_age_discrepancies(df)
 
@@ -2321,7 +2333,7 @@ FIX_COLUMNS = [
     "n_clean_visits", "reconcile_new", "not_ingrowth", "censored", "censor_measdate",
     "censor_reconcilecd", "censor_reason", "spgrpcd_resolved", "final_tree_fate",
     "censor_last_measdate", "censor_last_reconcilecd", "censor_last_reason",
-    "dead_at_first_visit",
+    "dead_at_first_visit", "estage_mapped",
 ]
 
 
