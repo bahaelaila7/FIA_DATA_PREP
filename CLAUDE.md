@@ -58,7 +58,7 @@ allow-list rather than `search_path`, which would expose them. Helpers: `table_e
 | snapshots by raw SPCD | `curated_snapshots` grouped by `spcd_resolved` / `spgrpcd_resolved` |
 | — | `spgrpcd_resolved`; area proportions for consumer-side normalisation (`cond_condprop_unadj`, `cond_subpprop_unadj`, `cond_micrprop_unadj`, `cond_macrprop_unadj`, `subp_subpcond_prop`, `subp_micrcond_prop`, `subp_macrcond_prop`, `subp_forest_*_prop`, `subp_has_cond_status3`, `cond_status_cd`) |
 
-The 25 new curated_trees columns (incl. `estage_mapped`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
+The 26 new curated_trees columns (incl. `estage_mapped`, `age_domain`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
 schema (names, types, order) is an exact prefix. The polars steps run one state at a time. Every
 rule is tree-, subplot- or condition-local, so this matches a single pass. Only the diagnostic
 `spcd_confusion_cluster` id is state-local. `age_imputation` fits its model once over all states
@@ -213,7 +213,20 @@ are interim, on the raw scale.
   curated_trees. The `estage_calibration` table holds one row per curve: level, group,
   stratum, n, OOF MAE/bias, raw MAE/bias, extension slope, smearing factor, and the knots on
   both scales.
-- **Model**: stays trained on field ages only.
+- **Model** (r3): trained on the FIELD age where present (v3 estimated_age = TOTAGE /
+  eligible STDAGE), otherwise on `estage_mapped` of live ≥ 5 in records (Tree_Age > 1). Both
+  are on the field scale. The mapping is fitted first, the model second, both once over the DB.
+  - **Features**: adds condition-level stand structure (`cond_fldszcd`, `cond_stdszcd`,
+    `cond_stdorgcd`); `CCLCD` was already in.
+  - **Trim**: the p90 upper trim is applied PER SOURCE. The sources span different ranges, so
+    a pooled p90 would cut mostly the older mapped ages.
+  - **CV**: plot-grouped, with the SAME crc32 plot→fold assignment as the mapping CV
+    (`plot_fold`). For fold k the mapping is refitted without fold-k plots, the mapped training
+    targets are recomputed with it, and the held-out rows are scored against their field age
+    or their out-of-fold mapped age, so there is no leakage through the mapping.
+  - **`age_domain`** (appended; null for non-model ages): `out_of_support` when a model age's
+    record falls in a DIA 2-in class × stratum × FLDSZCD (1 vs other) cell with < 50 training
+    rows, else `in_support`.
 
 Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monotone ages: 0/25 and 0/25):
 - **Planted loblolly (AL), median age by DIA class 1–3 / 3–5 / 5–7 / 7–9 / 9+ in**:
@@ -236,7 +249,34 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
   | AL natural, all species | 6.1 vs 6.6 | **14.8 vs 3.1** |
   | KY natural, all species | – | **19.8 vs 2.8** |
 
-- **Open issue (natural stands)**: model-aged saplings sit far below the mapped-estage timber
+- **r3 (model trained on field + mapped ages)**:
+  - **Out-of-fold model MAE / bias**:
+
+    | State | Field rows | Mapped rows |
+    |---|---|---|
+    | AL | 5.12 / −0.12 yr (n 295,423) | 5.52 / −3.66 yr (n 111,869) |
+    | KY | 10.40 / −0.17 yr (n 65,532) | 3.99 / −1.48 yr (n 90,323) |
+
+  - **Pre-registered check (h)**, step(3–5→5–7 in) ≤ 2 × step(5–7→7–9 in) + 2 yr, per state
+    × stratum, all species:
+
+    | | Step (yr) | Limit (yr) | Result |
+    |---|---|---|---|
+    | AL planted | 1.6 | 4.4 | PASS |
+    | AL natural | 12.5 | 8.1 | **FAIL** |
+    | KY natural | 14.5 | 7.4 | **FAIL** |
+    | KY planted | 6.4 | 4.5 | **FAIL** (only 31 condition-visits) |
+
+  - In natural stands the model now matches mapped estage at 5–7 in (AL 30.7 vs 33.9 yr; KY
+    51.8 vs 53.3), but 3–5 in saplings stay well below. Even mapped estage alone steps about
+    9 yr from 3–5 to 5–7 in there (AL 24.6 → 33.9; KY 44.4 → 53.3).
+  - Per the pre-registration, nothing was tuned further. Check (d) passes in both states
+    (0/25 non-monotone).
+  - Planted loblolly: final age is field + 0.4 to 1.0 yr. Age shares are unchanged
+    (≥ 5 in: estage 92–97 %; saplings: model 95–97 %).
+  - `age_domain` out_of_support: AL 6, KY 172 model-aged records.
+  - The step-2 resume is still EXCEPT-identical.
+- **Open issue (natural stands; before r3)**: model-aged saplings sit far below the mapped-estage timber
   in the same stand (AL natural 5–7 in: model 23.6 vs mapped estage 33.9 yr). The field-age
   truth for NATURAL stands comes only from post-reset (young) STDAGE-eligible trees, so both
   the model and the mapping extrapolate into uneven-aged natural stands, and they disagree there.

@@ -341,6 +341,33 @@ SELECT age_source, count(*) FILTER (WHERE estimated_age < 0) neg, count(*) FILTE
        count(*) FILTER (WHERE ROUND(estimated_age) < 1) round_lt1, count(*) n
 FROM new.curated_trees WHERE STATUSCD=1 AND {scope()} GROUP BY 1 ORDER BY 1""")
 
+# ---- (h) pre-registered age-step acceptance (r3) ----------------------------------------------
+# Per state x stratum (planted = STDORGCD 1 / natural): the median within-condition-visit step
+# from 3-5 in to 5-7 in must be <= 2 x the 5-7 -> 7-9 in step + 2 yr (all species).
+def _step(lo, mid, hi):
+    return f"""
+    WITH t AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,CONDID,MEASDATE, (cond_stdorgcd = 1) AS planted,
+                 CASE WHEN DIA>={lo} AND DIA<{mid} THEN 's' WHEN DIA>={mid} AND DIA<{hi} THEN 'p' END k,
+                 estimated_age a
+               FROM new.curated_trees WHERE STATUSCD=1 AND estimated_age IS NOT NULL AND DIA>={lo} AND DIA<{hi}
+                 AND {scope()}),
+    g AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,CONDID,MEASDATE, COALESCE(any_value(planted), FALSE) planted,
+            median(a) FILTER (WHERE k='s') sm, median(a) FILTER (WHERE k='p') lg,
+            count(*) FILTER (WHERE k='s') ns, count(*) FILTER (WHERE k='p') np
+          FROM t GROUP BY STATECD,UNITCD,COUNTYCD,PLOT,CONDID,MEASDATE HAVING ns>=1 AND np>=1)
+    SELECT STATECD, planted, count(*) cv, median(lg-sm) step FROM g GROUP BY ALL"""
+st1 = {(r[0], r[1]): (r[2], r[3]) for r in con.execute(_step(3, 5, 7)).fetchall()}
+st2 = {(r[0], r[1]): (r[2], r[3]) for r in con.execute(_step(5, 7, 9)).fetchall()}
+print("\n=== (h) within-condition-visit median age steps: 3-5 -> 5-7 in vs 5-7 -> 7-9 in")
+for k in sorted(set(st1) & set(st2)):
+    (n1, s1), (n2, s2) = st1[k], st2[k]
+    lim = 2 * s2 + 2
+    check(f"(h) state {k[0]} {'planted' if k[1] else 'natural'}: step(3-5->5-7)={s1:.1f} <= 2*{s2:.1f}+2={lim:.1f}",
+          s1 <= lim, f"(cond-visits {n1:,} / {n2:,})")
+show("(h) age_domain of model ages (live records)", f"""
+SELECT age_domain, count(*) n FROM new.curated_trees WHERE STATUSCD=1 AND age_source='model' AND {scope()}
+GROUP BY 1 ORDER BY 2 DESC""")
+
 # ---- (e) determinism ---------------------------------------------------------------------------
 if a.determinism_db:
     con.execute(f"ATTACH '{a.determinism_db}' AS rep (READ_ONLY)")

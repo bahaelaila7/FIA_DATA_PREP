@@ -2333,7 +2333,7 @@ FIX_COLUMNS = [
     "n_clean_visits", "reconcile_new", "not_ingrowth", "censored", "censor_measdate",
     "censor_reconcilecd", "censor_reason", "spgrpcd_resolved", "final_tree_fate",
     "censor_last_measdate", "censor_last_reconcilecd", "censor_last_reason",
-    "dead_at_first_visit", "estage_mapped",
+    "dead_at_first_visit", "estage_mapped", "age_domain",
 ]
 
 
@@ -2384,7 +2384,8 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
             SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate
             FROM tree_landuse_exits WHERE STATECD = {int(st)}""").pl()
         df = _polars_steps(con, df, estage_raw, all_subplot_years, landuse_exits)
-        df = df.select([c for c in df.columns if c not in FIX_COLUMNS] + FIX_COLUMNS)
+        df = df.select([c for c in df.columns if c not in FIX_COLUMNS]
+                       + [c for c in FIX_COLUMNS if c in df.columns])   # age_domain: step 2
 
         scaffold = scaffold_all.filter(pl.col("STATECD") == st)
         ever_live = (df.filter((pl.col("STATUSCD") == 1) & pl.col("DRYBIO_AG").is_not_null())
