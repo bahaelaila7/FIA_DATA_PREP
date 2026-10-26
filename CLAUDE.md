@@ -153,6 +153,8 @@ copied into the curated DB, so the slim builder can use it as its `--fiadb`) →
     below the re-tally rule, and only truly unrecorded saplings are censored;
   - (c) GRM CUT→harvest / MORTALITY→dead agreement ≥ 99 %;
   - (d) median age monotone in DIA class (1–3/3–5/5–7/7–9 in) for the top-25 species;
+  - (h) pre-registered age step (3–5→5–7 in ≤ 2 × the 5–7→7–9 step + 2 yr), enforced for
+    planted strata with ≥ 50 condition-visits; INFO otherwise (see the decision above);
   - (e) determinism with `--determinism-db`;
   - (f) dead records of every raw-reference tree;
   - (g) phantom sources individually blocked, for the Sim A tables and trajectories.
@@ -224,9 +226,13 @@ are interim, on the raw scale.
     (`plot_fold`). For fold k the mapping is refitted without fold-k plots, the mapped training
     targets are recomputed with it, and the held-out rows are scored against their field age
     or their out-of-fold mapped age, so there is no leakage through the mapping.
-  - **`age_domain`** (appended; null for non-model ages): `out_of_support` when a model age's
-    record falls in a DIA 2-in class × stratum × FLDSZCD (1 vs other) cell with < 50 training
-    rows, else `in_support`.
+  - **`age_domain`** (appended; null for non-model ages):
+    - `natural_uncalibrated`: the model age is in a natural condition (STDORGCD ≠ 1 or
+      unknown);
+    - `out_of_support`: planted, and the record falls in a DIA 2-in class × stratum ×
+      FLDSZCD (1 vs other) cell with < 50 training rows;
+    - `in_support`: otherwise.
+    The column flows into the slim DB, because the slim builder copies `curated_trees.*`.
 
 Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monotone ages: 0/25 and 0/25):
 - **Planted loblolly (AL), median age by DIA class 1–3 / 3–5 / 5–7 / 7–9 / 9+ in**:
@@ -276,6 +282,27 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
     (≥ 5 in: estage 92–97 %; saplings: model 95–97 %).
   - `age_domain` out_of_support: AL 6, KY 172 model-aged records.
   - The step-2 resume is still EXCEPT-identical.
+- **Decision (user, ACCEPT + FLAG): natural-stand ages are kept as of `1d6397b`.** The step
+  test assumes saplings and 5–7 in trees form ONE growth sequence. That holds in even-aged
+  planted stands but not in uneven-aged natural stands, where understory saplings are not the
+  younger stage of the 5–7 in trees. The step exists even among TreeAge-consistent saplings
+  there: about 9 yr with mapped estage alone (AL 24.6 → 33.9; KY 44.4 → 53.3).
+  - **Numbers**: the remaining natural-stand step (3–5→5–7 vs 5–7→7–9 in) is **AL 12.5 vs
+    3.0 yr** and **KY 14.5 vs 2.7 yr**.
+  - **Check (h) handling**: it is ENFORCED only for planted strata with ≥ 50 condition-visits
+    in both steps (`H_MIN_VISITS`). Natural strata, and planted strata below 50 (KY planted:
+    31), are reported as INFO.
+  - **Flag**: natural model ages carry `age_domain = 'natural_uncalibrated'`. Natural stands
+    have no field-age truth outside post-reset STDAGE stands.
+  - **Verifier**: all checks PASS in AL (14 PASS, 1 INFO) and KY (13 PASS, 2 INFO).
+  - **`age_domain` counts, live model ages**:
+
+    | | natural_uncalibrated | in_support | out_of_support |
+    |---|---|---|---|
+    | AL | 112,434 | 49,737 | 5 |
+    | KY | 53,535 | 235 | 170 |
+
+    Slim counts are identical.
 - **Open issue (natural stands; before r3)**: model-aged saplings sit far below the mapped-estage timber
   in the same stand (AL natural 5–7 in: model 23.6 vs mapped estage 33.9 yr). The field-age
   truth for NATURAL stands comes only from post-reset (young) STDAGE-eligible trees, so both

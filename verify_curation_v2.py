@@ -40,6 +40,10 @@ def check(name, ok, detail=""):
     if not ok:
         FAILS.append(name)
 
+
+def info(name, detail=""):
+    print(f"  [INFO] {name} {detail}")
+
 con = duckdb.connect(":memory:")
 con.execute(f"SET threads={os.environ.get('FIA_DUCKDB_THREADS', '3')}; "
             f"SET memory_limit='{os.environ.get('FIA_DUCKDB_MEMORY', '5GB')}'; SET enable_progress_bar=false")
@@ -358,12 +362,24 @@ def _step(lo, mid, hi):
     SELECT STATECD, planted, count(*) cv, median(lg-sm) step FROM g GROUP BY ALL"""
 st1 = {(r[0], r[1]): (r[2], r[3]) for r in con.execute(_step(3, 5, 7)).fetchall()}
 st2 = {(r[0], r[1]): (r[2], r[3]) for r in con.execute(_step(5, 7, 9)).fetchall()}
+# User decision (ACCEPT + FLAG): the step test assumes saplings and 5-7 in trees form ONE growth
+# sequence, which holds in even-aged PLANTED stands but not in uneven-aged natural stands (the
+# step exists even among TreeAge-consistent saplings there: mapped-estage-only ~9 yr). So it is
+# ENFORCED only for planted strata with >= H_MIN_VISITS condition-visits in both steps, and
+# reported as INFO for natural strata or thinner planted strata. Natural model ages carry
+# age_domain = 'natural_uncalibrated'.
+H_MIN_VISITS = 50
 print("\n=== (h) within-condition-visit median age steps: 3-5 -> 5-7 in vs 5-7 -> 7-9 in")
 for k in sorted(set(st1) & set(st2)):
     (n1, s1), (n2, s2) = st1[k], st2[k]
     lim = 2 * s2 + 2
-    check(f"(h) state {k[0]} {'planted' if k[1] else 'natural'}: step(3-5->5-7)={s1:.1f} <= 2*{s2:.1f}+2={lim:.1f}",
-          s1 <= lim, f"(cond-visits {n1:,} / {n2:,})")
+    name = f"(h) state {k[0]} {'planted' if k[1] else 'natural'}: step(3-5->5-7)={s1:.1f} <= 2*{s2:.1f}+2={lim:.1f}"
+    detail = f"(cond-visits {n1:,} / {n2:,}; {'holds' if s1 <= lim else 'exceeds'})"
+    if k[1] and min(n1, n2) >= H_MIN_VISITS:
+        check(name, s1 <= lim, detail)
+    else:
+        info(name, detail + (" — natural stand: not enforced" if not k[1]
+                             else f" — < {H_MIN_VISITS} condition-visits: not enforced"))
 show("(h) age_domain of model ages (live records)", f"""
 SELECT age_domain, count(*) n FROM new.curated_trees WHERE STATUSCD=1 AND age_source='model' AND {scope()}
 GROUP BY 1 ORDER BY 2 DESC""")

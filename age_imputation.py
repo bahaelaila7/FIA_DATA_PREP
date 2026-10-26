@@ -525,14 +525,23 @@ def apply_age_model(df: pl.DataFrame,
         .alias("age_source"),
     ])
 
-    # r3 age_domain: model ages whose record falls in a DIA-class x stratum x stand-size cell
-    # with fewer than SUPPORT_MIN training rows are 'out_of_support' (null for other sources)
+    # age_domain (model ages only; null for other sources):
+    #   natural_uncalibrated  condition STDORGCD != 1 (or unknown): natural stands have no
+    #                         field-age truth outside post-reset STDAGE stands (user decision:
+    #                         accept + flag the uneven-aged sapling/timber age step)
+    #   out_of_support        planted, DIA-class x stratum x stand-size cell with fewer than
+    #                         SUPPORT_MIN training rows
+    #   in_support            otherwise
     if support is not None:
         df = (df.with_columns(_support_cell(df).alias("_cell"))
                 .join(support, on="_cell", how="left")
                 .with_columns(
                     pl.when(pl.col("age_source") == "model")
-                    .then(pl.when(pl.col("_n_train").fill_null(0) >= SUPPORT_MIN)
+                    .then(pl.when(pl.col("cond_stdorgcd") != 1)   # natural, or STDORGCD unknown
+                          .then(pl.lit("natural_uncalibrated"))
+                          .when(pl.col("cond_stdorgcd").is_null())
+                          .then(pl.lit("natural_uncalibrated"))
+                          .when(pl.col("_n_train").fill_null(0) >= SUPPORT_MIN)
                           .then(pl.lit("in_support")).otherwise(pl.lit("out_of_support")))
                     .otherwise(pl.lit(None, dtype=pl.Utf8)).alias("age_domain"))
                 .drop(["_cell", "_n_train"]))
