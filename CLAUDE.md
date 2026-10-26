@@ -228,8 +228,9 @@ are interim, on the raw scale.
     targets are recomputed with it, and the held-out rows are scored against their field age
     or their out-of-fold mapped age, so there is no leakage through the mapping.
   - **`age_domain`** (appended; null for non-model ages):
-    - `natural_uncalibrated`: the model age is in a natural condition (STDORGCD ≠ 1 or
-      unknown);
+    - `natural_treeage_scale` (r4; was `natural_uncalibrated` before r4): the model age is in
+      a natural condition (STDORGCD ≠ 1 or unknown). Since r4 it is on the raw TreeAge scale,
+      see "Round-4" below;
     - `out_of_support`: planted, and the record falls in a DIA 2-in class × stratum ×
       FLDSZCD (1 vs other) cell with < 50 training rows;
     - `in_support`: otherwise.
@@ -416,7 +417,8 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
     field-age truth available for natural stands (post-reset STDAGE) does not represent
     uneven-aged stands. This is INFO under the ACCEPT + FLAG decision, and these are the
     records marked `natural_uncalibrated`.
-- **I4**: `n_trees_natural_uncalibrated`, `share_natural_uncalibrated` (AGB-weighted) and
+- **I4**: `n_trees_natural_treeage_scale`, `share_natural_treeage_scale` (AGB-weighted; named
+  `*_natural_uncalibrated` before r4) and
   `age_source_major` (dominant source by AGB) are appended to curated_cohorts_landis, _stdorg
   and _simB, before `procedural_break`. Phantom rows inherit them from their source tree. The
   slim builder carries them; old columns are unchanged.
@@ -454,6 +456,94 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
 - **Verifier totals**: AL 36 PASS / 7 INFO / 0 FAIL; GA 0 FAIL; TN 0 FAIL; KY and FL 1 FAIL
   each (pre-registered (j)). Determinism (steps 4–7 rerun) is EXCEPT-identical in all five
   states.
+
+### Round-4 (2026-10-26; user decision SPLIT BY STRATUM; whole-state AL, KY, GA, TN, FL)
+- **Planted (STDORGCD = 1)**: unchanged. TreeAge is mapped onto the field-age scale
+  (`calibrate_estage`), and the model trains on field ages plus planted `estage_mapped`.
+- **Natural (STDORGCD ≠ 1 or null)**: estage = RAW TreeAge (Tree_Age > 1, DIA ≥ 5 in), with no
+  mapping. `estage_mapped` equals the raw value on these rows. `estage_calibration` has an
+  `applied_to` column ("planted rows only") and a `stratum_rule` row ("natural rows: identity").
+  - Model targets for natural rows are raw TreeAge (source `treeage`). Natural STDAGE is no
+    longer a target; TOTAGE stays a target in both strata.
+  - Same plot-grouped CV with the shared crc32 folds. SITETREE is never used for fitting.
+- **Rename**: `age_domain` `natural_uncalibrated` → `natural_treeage_scale`; cohort columns
+  `n_trees_natural_treeage_scale` / `share_natural_treeage_scale` (I4). Older column rules are
+  unchanged. Text above that still says `natural_uncalibrated` describes r2/r3.
+- **Recalibration (regression to the mean)**: a post-hoc isotonic map from the model's
+  OUT-OF-FOLD prediction to the target, per stratum (P/N) × DIA class (< 5, 5–10, 10–15, 15+ in).
+  Cells need ≥ 50 rows (`RECAL_MIN_N`).
+  - The CV is nested: the map scored on fold k is fitted on inner OOF predictions of the other
+    folds only. Production uses the outer OOF predictions. It is applied in `apply_age_model`
+    before the anchor.
+  - `age_model_cv` has `model` (raw / recalibrated) and `stratum_pn` columns.
+- **Rounding fix (found by r4 M1)**: isotonic plateaus are means of integer targets, so many ages
+  are exactly x.5. polars `round(0)` rounds half to even, while DuckDB `ROUND` (Sim A / Sim B)
+  rounds half away from zero, so 26 / 6 / 39 / 2 Sim B rows (AL / GA / TN / FL) fell off the
+  trajectory axis.
+  - The fix: `build_tree_trajectories` (age_calc, alternate age axes) and cohort_tracking's
+    birth date now use `mode="half_away_from_zero"`. M1 is now 0 everywhere.
+- **CV, out-of-fold, raw → recalibrated, MAE / bias (yr)**:
+
+  | State | field | treeage (natural) | all |
+  |---|---|---|---|
+  | AL | 3.42/−0.71 → 3.45/−0.22 | 3.61/−0.43 → 3.64/−0.08 | 3.53/−0.55 → 3.56/−0.14 |
+  | KY | 7.04/−0.65 → 7.78/+0.16 (n 1,337) | 4.66/−0.56 → 4.66/−0.13 | 4.68/−0.56 → 4.68/−0.13 |
+  | GA | 3.20/−0.58 → 3.22/−0.15 | 3.14/−0.36 → 3.11/−0.06 | 3.17/−0.47 → 3.17/−0.11 |
+  | TN | 5.67/−1.71 → 5.75/−1.09 | 5.14/−0.60 → 5.15/−0.11 | 5.19/−0.70 → 5.20/−0.20 |
+  | FL | 5.11/−1.20 → 5.19/−0.38 | 3.50/−0.39 → 3.53/−0.09 | 4.16/−0.72 → 4.22/−0.21 |
+
+  - Planted `mapped` targets are only 1–21 rows per state, because nearly all planted rows have
+    a field age.
+  - The low treeage MAE reflects that TreeAge is itself a model of FIA tree attributes.
+- **Oldest-decile young bias is NOT removed.** For example, field planted d10 is AL −38.4 →
+  −38.0, GA −28.7 → −28.4, FL −27.9 → −27.5, and treeage natural d10 is KY −8.1 → −7.6.
+  - Bias conditioned on the TRUE age is regression to the mean. A monotone map from prediction
+    to target fixes E[target | prediction] (the per-DIA-class bias), not E[prediction | target].
+  - It shrinks the DIA-class biases instead, e.g. FL planted 15+ −4.4 → −2.7, TN 15+ −2.7 → −0.4.
+- **Checks**:
+  - (j) is unchanged (±3 yr, ≥ 200 trees). KY planted 5–10 in: −3.2 → **−2.2 PASS**. FL planted
+    15+ in: −5.1 → **−3.5 FAIL** (357 trees). Reported, NOT tuned.
+  - (d) natural re-enforcement FAILED in GA (1/25 species non-monotone) and FL (5/23), so per the
+    rule it stays INFO for natural. Planted is enforced and passes everywhere (KY 0/0, AL 0/16,
+    GA 0/14, TN 0/4, FL 0/7). Natural: AL / KY / TN 0/25.
+  - (k) SITETREE: planted AND natural are now enforced at |median bias| ≤ 5 yr for strata with
+    ≥ 100 linked site trees.
+- **SITETREE, final age vs AGEDIA + 2/5, MAE / median bias (yr), r3 → r4** (raw TreeAge in
+  brackets):
+
+  | State | Planted | Natural |
+  |---|---|---|
+  | AL | 4.9/−0.9 → 5.0/−0.5 (n 1,253) | 18.6/−15.5 → 9.9/+2.0 (raw 9.2/+2.0; n 3,648) |
+  | KY | 3.8/+1.5 → 3.6/+0.7 (n 17, INFO) | 15.0/−5.8 → 10.7/**−5.7 FAIL** (raw 9.5/−5.0; n 2,284) |
+  | GA | 4.4/+1.9 → 4.5/+2.1 (n 1,647) | 14.9/−6.7 → 10.3/+2.6 (raw 9.8/+4.0; n 2,374) |
+  | TN | 5.8/−0.3 → 6.3/+1.2 (n 284) | 13.6/−7.0 → 10.3/−0.6 (raw 10.1/−1.0; n 5,542) |
+  | FL | 5.7/+0.8 → 5.8/+0.8 (n 531) | 12.1/−3.3 → 11.0/−0.5 (raw 10.0/0.0; n 793) |
+
+  The KY natural failure comes from TreeAge itself: raw TreeAge is already −5.0 yr against bored
+  ages in KY.
+- **Age shares** (live records) are unchanged from r3. ≥ 5 in: estage 82–97 % (GA 82.3 %).
+  Saplings: model 95–97 %.
+- **`age_domain` live model ages** (natural_treeage_scale / in_support / out_of_support):
+
+  | State | natural_treeage_scale | in_support | out_of_support |
+  |---|---|---|---|
+  | AL | 112,437 | 49,737 | 5 |
+  | KY | 53,535 | 235 | 170 |
+  | GA | 200,815 | 93,086 | 9 |
+  | TN | 85,731 | 6,674 | 7 |
+  | FL | 46,445 | 17,506 | 3 |
+
+- **Verifier totals (r4, after the rounding fix)**:
+
+  | State | PASS | INFO | FAIL |
+  |---|---|---|---|
+  | AL | 37 | 6 | 0 |
+  | GA | 37 | 6 | 0 |
+  | TN | 37 | 6 | 0 |
+  | KY | 32 | 10 | 1 ((k) natural) |
+  | FL | 36 | 6 | 1 ((j) planted 15+) |
+
+  Determinism (steps 4–7 rerun) is EXCEPT-identical in all five states.
 
 ---
 

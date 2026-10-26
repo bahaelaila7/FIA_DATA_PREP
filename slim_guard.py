@@ -53,7 +53,7 @@ if a.mode == "pre":
             return {r[0].lower() for r in c.execute(
                 "SELECT column_name FROM duckdb_columns() WHERE database_name=current_database() "
                 "AND lower(table_name)=lower(?)", [tab]).fetchall()}
-        meta = ["n_trees_natural_uncalibrated", "share_natural_uncalibrated", "age_source_major"]
+        meta = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major"]
         need_cols = {"curated_trees": [x.lower() for x in FIX_COLUMNS],
                      "curated_cohorts_landis_stdorg": ["procedural_break"] + meta,
                      "curated_cohorts_landis_simB": ["procedural_break", "disturbance_drop_pct"] + meta}

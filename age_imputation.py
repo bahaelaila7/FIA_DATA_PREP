@@ -296,7 +296,12 @@ def calibrate_estage(con):
         pl.lit(best["mae_raw"]).alias("mae_raw_overall"),
         pl.lit(best["bias_raw"]).alias("bias_raw_overall"),
         pl.lit(stratify).alias("planted_split_used"),
+        pl.lit("planted rows only").alias("applied_to"),
     ])
+    # r4: the stratum rule — natural rows use the identity (raw Tree_Age)
+    tab = pl.concat([tab, pl.DataFrame({"level": ["stratum_rule"], "group": [None], "stratum": ["natural"],
+                                        "applied_to": ["natural rows: identity (estage_mapped = raw Tree_Age)"]})],
+                    how="diagonal_relaxed")
     con.register("_cal", tab.to_arrow())
     con.execute("CREATE OR REPLACE TABLE estage_calibration AS SELECT * FROM _cal")
     con.unregister("_cal")
@@ -306,9 +311,10 @@ def calibrate_estage(con):
 
 
 def remap_estage(df: pl.DataFrame, models, tree_bounds: pl.DataFrame) -> pl.DataFrame:
-    """Re-anchor estage on the field scale: estage_mapped = f_g(Tree_Age) on valid
-    candidates (DIA >= 5, Tree_Age > 1), then the usual median anchor + propagation, and the
-    age-discrepancy flags. Column order is preserved."""
+    """Re-anchor estage: estage_mapped = f_g(Tree_Age) (field scale) on valid PLANTED
+    candidates and = raw Tree_Age on valid NATURAL candidates (DIA >= 5, Tree_Age > 1), then
+    the usual median anchor + propagation, and the age-discrepancy flags. Column order is
+    preserved."""
     if models is None:
         return df
     models = models["models"] if isinstance(models, dict) and "models" in models else models
@@ -320,6 +326,9 @@ def remap_estage(df: pl.DataFrame, models, tree_bounds: pl.DataFrame) -> pl.Data
                     (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("_pl")).filter(pl.col("_v"))
     mapped, _ = map_estage(models, sub["estage_raw"].to_numpy(), sub["spgrpcd_resolved"].to_list(),
                            sub["major_spgrpcd"].to_list(), sub["_pl"].to_list())
+    # r4 (user decision: SPLIT BY STRATUM): the field-scale mapping applies to PLANTED rows only;
+    # natural rows (STDORGCD != 1 or null) keep the RAW Tree_Age (estage_mapped = raw)
+    mapped = np.where(sub["_pl"].to_numpy(), mapped, sub["estage_raw"].to_numpy().astype(float))
     full = np.full(df.height, np.nan)
     full[sub["_i"].to_numpy()] = mapped
     df = df.with_columns(pl.Series("estage_mapped", full).fill_nan(None))
@@ -374,41 +383,48 @@ def _support_cell(df: pl.DataFrame) -> pl.Expr:
 
 
 def build_training_set(con, est) -> pl.DataFrame:
-    """r3 training target: the FIELD age (TOTAGE / eligible STDAGE; v3's estimated_age) where
-    present, otherwise estage_mapped (the field-scale mapped Tree_Age of that record) for live
-    >= 5 in records with Tree_Age > 1. The p90 upper trim is applied PER SOURCE (the two
-    sources have different age ranges; a pooled p90 would cut mostly the older mapped ages)."""
+    """r4 (user decision: SPLIT BY STRATUM) training targets:
+      planted (STDORGCD = 1): the FIELD age (TOTAGE / eligible STDAGE) where present
+                              ('field'), else the field-scale MAPPED Tree_Age of live
+                              >= 5 in records with Tree_Age > 1 ('mapped');
+      natural (STDORGCD != 1 or null): TOTAGE where present ('field'), else the RAW
+                              Tree_Age of live >= 5 in records with Tree_Age > 1
+                              ('treeage'). Natural STDAGE is no longer a target.
+    SITETREE bored ages are never used for fitting (they are the independent check).
+    Robust outlier rule per source (r3 I3a); outliers are scored but not trained on."""
     cols = ", ".join(TRAIN_COLS + ["estage_raw", "spgrpcd_resolved", "cond_fldszcd", "cond_stdszcd",
-                                   "cond_stdorgcd"])
+                                   "cond_stdorgcd", "age_from_totage"])
     df = attach_modeling_context(con, con.execute(f"SELECT {cols} FROM curated_trees").pl())
     df = df.filter((pl.col("STATUSCD") == 1) & pl.col("DIA").is_not_null() & pl.col("DIA").is_not_nan())
     df = df.with_columns(
         pl.concat_str([pl.col(c).cast(pl.Utf8) for c in ("STATECD", "UNITCD", "COUNTYCD", "PLOT")],
-                      separator="_").alias("_plot"))
-    field = (df.filter(pl.col("age_source").is_not_null() & pl.col("estimated_age").is_not_null()
-                       & pl.col("estimated_age").is_not_nan())
-               .with_columns(pl.col("estimated_age").alias("target"), pl.lit("field").alias("source")))
+                      separator="_").alias("_plot"),
+        (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("_planted"))
+    has_tot = pl.col("age_from_totage").is_not_null()
+    valid_te = (pl.col("DIA") >= ESTAGE_MIN_DIA) & (pl.col("estage_raw") > ESTAGE_MIN_AGE)
+    field_ok = (pl.col("age_source").is_not_null() & pl.col("estimated_age").is_not_null()
+                & pl.col("estimated_age").is_not_nan() & (pl.col("_planted") | has_tot))
+    field = df.filter(field_ok).with_columns(pl.col("estimated_age").alias("target"), pl.lit("field").alias("source"))
     parts = [field]
     if est is not None:
-        cand = df.filter(pl.col("age_source").is_null() & (pl.col("DIA") >= ESTAGE_MIN_DIA)
-                         & (pl.col("estage_raw") > ESTAGE_MIN_AGE))
+        cand = df.filter(~field_ok & pl.col("_planted") & valid_te)
         m, _ = map_estage(est["models"], cand["estage_raw"].to_numpy(), cand["spgrpcd_resolved"].to_list(),
-                          cand["major_spgrpcd"].to_list(), (cand["cond_stdorgcd"] == 1).fill_null(False).to_list())
+                          cand["major_spgrpcd"].to_list(), [True] * cand.height)
         parts.append(cand.with_columns(pl.Series("target", m), pl.lit("mapped").alias("source")))
+    nat = df.filter(~field_ok & ~pl.col("_planted") & valid_te)
+    parts.append(nat.with_columns(pl.col("estage_raw").cast(pl.Float64).alias("target"),
+                                  pl.lit("treeage").alias("source")))
     train = pl.concat(parts, how="diagonal_relaxed")
-    # r3 I3a: robust outlier rule instead of the per-source p90 trim (which cut the old trees
-    # and biased the model young): a row is an outlier when its target exceeds the source's
-    # p99.5, or 3x the source's median within its DIA 2-in class. Outliers are not trained on
-    # but ARE scored in the CV (`_kept` flag).
     train = train.with_columns((pl.col("DIA") / 2).floor().clip(0, 15).cast(pl.Int32).alias("_dcls"))
     train = train.with_columns(
         ((pl.col("target") <= pl.col("target").quantile(OUTLIER_Q).over("source")) &
          (pl.col("target") <= OUTLIER_MEDIAN_X * pl.col("target").median().over(["source", "_dcls"])))
         .alias("_kept"))
-    for src in ("field", "mapped"):
+    for src in ("field", "mapped", "treeage"):
         sub = train.filter(pl.col("source") == src)
         if sub.height:
-            print(f"[step2] training source {src:6s}: {sub.height:,} rows, "
+            print(f"[step2] training source {src:7s}: {sub.height:,} rows "
+                  f"(planted {sub.filter(pl.col('_planted')).height:,}), "
                   f"{sub.filter(~pl.col('_kept')).height:,} outliers (> p{OUTLIER_Q*100:g} or "
                   f"> {OUTLIER_MEDIAN_X:g}x DIA-class median) not trained on")
     return train.with_columns(pl.Series("_fold", plot_fold(train["_plot"].to_list())))
@@ -430,14 +446,51 @@ def _remap_targets(train: pl.DataFrame, est, models) -> np.ndarray:
     return y
 
 
+RECAL_MIN_N = 50
+
+
+def recal_cell(planted, dia) -> np.ndarray:
+    """Recalibration cell: stratum (P/N) x DIA class (<5, 5-10, 10-15, 15+)."""
+    d = np.asarray(dia, dtype=float)
+    k = np.where(d < 5, "a", np.where(d < 10, "b", np.where(d < 15, "c", "d")))
+    return np.char.add(np.where(np.asarray(planted, dtype=bool), "P", "N"), k)
+
+
+def _recal_fit(pred, y, cells) -> dict:
+    """r4: monotone (isotonic) map OUT-OF-FOLD prediction -> target per cell; it undoes the
+    model's regression to the mean (old trees predicted young, young trees old)."""
+    from sklearn.isotonic import IsotonicRegression
+    maps = {}
+    ok = np.isfinite(pred) & np.isfinite(y)
+    for c in np.unique(cells[ok]):
+        m = ok & (cells == c)
+        if m.sum() >= RECAL_MIN_N:
+            maps[c] = IsotonicRegression(increasing=True, out_of_bounds="clip").fit(pred[m], y[m])
+    return maps
+
+
+def _recal_apply(maps: dict, pred, cells) -> np.ndarray:
+    out = np.asarray(pred, dtype=float).copy()
+    for c, iso in maps.items():
+        m = (cells == c) & np.isfinite(out)
+        if m.any():
+            out[m] = iso.predict(out[m])
+    return out
+
+
 def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
     """
-    Train HistGradientBoostingRegressor on log1p(target) (field ages + field-scale mapped
-    TreeAge, see build_training_set). Plot-grouped CV with the SAME fold assignment as the
-    estage-mapping CV; for fold k the mapping is refitted without fold-k plots, the mapped
-    training targets are recomputed with it, and the held-out rows are scored against their
-    field age / their out-of-fold mapped age — so the reported numbers stay out-of-fold.
-    Returns (model, enc, support) where support = training rows per _support_cell.
+    Train HistGradientBoostingRegressor on log1p(target) (build_training_set: field ages,
+    planted mapped TreeAge, natural raw TreeAge), then a post-hoc monotone recalibration.
+
+    CV: plot-grouped, the SAME crc32 fold assignment as the estage-mapping CV. For outer fold
+    k: the mapping is refitted without fold-k plots (mapped targets recomputed with it); the
+    model is fitted on the other folds; the RECALIBRATION map for fold k is fitted on INNER
+    out-of-fold predictions of the other folds only (a nested CV: for each inner fold j != k,
+    a model fitted on folds not in {k, j} predicts fold j), then applied to fold k's
+    predictions. So the scored numbers are out-of-fold for both the model and the
+    recalibration. Production: model on all kept rows, recalibration on the outer OOF
+    predictions. Returns (model, enc, support, recal_maps).
     """
     enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan,
                          encoded_missing_value=np.nan)
@@ -445,12 +498,16 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
     kept = train["_kept"].to_numpy() if "_kept" in train.columns else np.ones(train.height, dtype=bool)
     folds = train["_fold"].to_numpy()
     src = train["source"].to_numpy()
+    cells = recal_cell(train["_planted"].to_numpy() if "_planted" in train.columns
+                       else (train["cond_stdorgcd"] == 1).fill_null(False).to_numpy(), train["DIA"].to_numpy())
     y_full = train["target"].to_numpy().astype(float)
+    raw_oof = np.full(y_full.shape, np.nan)
     oof = np.full(y_full.shape, np.nan)
     y_oof_target = y_full.copy()
-    for k in range(N_FOLDS):
+    present = [k for k in range(N_FOLDS) if (folds == k).any()]
+    for k in present:
         tr, te = folds != k, folds == k
-        if not te.any() or not tr.any():
+        if not tr.any():
             continue
         fold_models = None
         if est is not None:
@@ -458,38 +515,54 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
                 pl.Series(plot_fold(est["cal"]["_plot"].to_list())) != k), est["stratify"])
         y_k = _remap_targets(train, est, fold_models) if fold_models is not None else y_full
         m = _new_model().fit(X[tr & kept], np.log1p(y_k[tr & kept]))
-        oof[te] = np.expm1(m.predict(X[te]))          # scored on ALL held-out rows
-        y_oof_target[te] = y_k[te]          # held-out targets: field age / OOF-mapped age
-    print(f"[step2] plot-grouped {N_FOLDS}-fold CV (same folds as the estage mapping), out-of-fold:")
-    for s_ in ("field", "mapped", "all"):
+        raw_oof[te] = np.expm1(m.predict(X[te]))          # scored on ALL held-out rows
+        y_oof_target[te] = y_k[te]
+        # nested: inner OOF predictions on the training folds -> recalibration map for fold k
+        inner = np.full(y_full.shape, np.nan)
+        for j in present:
+            if j == k:
+                continue
+            itr, ite = (folds != k) & (folds != j), folds == j
+            if not itr.any():
+                continue
+            mj = _new_model().fit(X[itr & kept], np.log1p(y_k[itr & kept]))
+            inner[ite] = np.expm1(mj.predict(X[ite]))
+        maps_k = _recal_fit(inner[tr & kept], y_k[tr & kept], cells[tr & kept])
+        oof[te] = _recal_apply(maps_k, raw_oof[te], cells[te])
+    print(f"[step2] plot-grouped {N_FOLDS}-fold CV (same folds as the estage mapping), out-of-fold, "
+          f"raw model vs recalibrated (nested):")
+    for s_ in ("field", "mapped", "treeage", "all"):
         msk = (src == s_) if s_ != "all" else np.ones_like(src, dtype=bool)
         if msk.any():
-            e = oof[msk] - y_oof_target[msk]
-            print(f"         {s_:6s} n={msk.sum():>9,}  MAE {np.nanmean(np.abs(e)):6.2f} yr  "
-                  f"bias {np.nanmean(e):+6.2f} yr")
-    # r3 I3a: out-of-fold error by age decile and by DIA class (all rows, outliers included)
-    rep = pl.DataFrame({"source": src, "y": y_oof_target, "e": oof - y_oof_target,
-                        "dia": train["DIA"].to_numpy()}).filter(pl.col("e").is_not_nan())
-    rep = rep.with_columns(pl.col("y").qcut(10, labels=[f"d{i:02d}" for i in range(1, 11)], allow_duplicates=True)
-                           .cast(pl.Utf8).alias("age_decile"),
-                           pl.when(pl.col("dia") < 5).then(pl.lit("<5")).when(pl.col("dia") < 10).then(pl.lit("5-10"))
-                           .when(pl.col("dia") < 15).then(pl.lit("10-15")).otherwise(pl.lit("15+")).alias("dia_cls"))
+            e0, e1 = raw_oof[msk] - y_oof_target[msk], oof[msk] - y_oof_target[msk]
+            print(f"         {s_:7s} n={msk.sum():>9,}  raw MAE {np.nanmean(np.abs(e0)):6.2f} bias {np.nanmean(e0):+6.2f}"
+                  f"  | recal MAE {np.nanmean(np.abs(e1)):6.2f} bias {np.nanmean(e1):+6.2f} yr")
+    dia = train["DIA"].to_numpy()
+    planted = np.char.startswith(cells, "P")
+    reps = []
+    for lab, pred in (("raw", raw_oof), ("recalibrated", oof)):
+        rep = pl.DataFrame({"source": src, "y": y_oof_target, "e": pred - y_oof_target, "dia": dia,
+                            "stratum_pn": np.where(planted, "planted", "natural")}).filter(pl.col("e").is_not_nan())
+        rep = rep.with_columns(
+            pl.col("y").qcut(10, labels=[f"d{i:02d}" for i in range(1, 11)], allow_duplicates=True).cast(pl.Utf8).alias("age_decile"),
+            pl.when(pl.col("dia") < 5).then(pl.lit("<5")).when(pl.col("dia") < 10).then(pl.lit("5-10"))
+            .when(pl.col("dia") < 15).then(pl.lit("10-15")).otherwise(pl.lit("15+")).alias("dia_cls"))
+        for by, col in (("age_decile", "age_decile"), ("dia_class", "dia_cls")):
+            reps.append(rep.group_by(["source", "stratum_pn", col])
+                        .agg(pl.len().alias("n"), pl.col("y").median().alias("median_target"),
+                             pl.col("e").abs().mean().alias("mae"), pl.col("e").mean().alias("bias"))
+                        .rename({col: "stratum"}).with_columns(pl.lit(by).alias("by"), pl.lit(lab).alias("model")))
     global CV_REPORT
-    CV_REPORT = pl.concat([
-        rep.group_by(["source", "age_decile"]).agg(pl.len().alias("n"), pl.col("y").median().alias("median_target"),
-                                                   pl.col("e").abs().mean().alias("mae"), pl.col("e").mean().alias("bias"))
-           .rename({"age_decile": "stratum"}).with_columns(pl.lit("age_decile").alias("by")),
-        rep.group_by(["source", "dia_cls"]).agg(pl.len().alias("n"), pl.col("y").median().alias("median_target"),
-                                                pl.col("e").abs().mean().alias("mae"), pl.col("e").mean().alias("bias"))
-           .rename({"dia_cls": "stratum"}).with_columns(pl.lit("dia_class").alias("by")),
-    ]).with_columns(pl.col("stratum").cast(pl.Utf8)).sort(["by", "source", "stratum"])
-    with pl.Config(tbl_rows=60):
-        print(CV_REPORT)
+    CV_REPORT = (pl.concat(reps).with_columns(pl.col("stratum").cast(pl.Utf8))
+                 .sort(["model", "by", "source", "stratum_pn", "stratum"]))
+    with pl.Config(tbl_rows=200):
+        print(CV_REPORT.filter((pl.col("by") == "dia_class")))
     model = _new_model().fit(X[kept], np.log1p(y_full[kept]))
+    recal = _recal_fit(raw_oof[kept], y_oof_target[kept], cells[kept])
     support = (train.filter(pl.col("_kept") if "_kept" in train.columns else pl.lit(True))
                .with_columns(_support_cell(train).alias("_cell"))
                .group_by("_cell").len().rename({"len": "_n_train"}))
-    return model, enc, support
+    return model, enc, support, recal
 
 
 # =============================================================================
@@ -500,7 +573,8 @@ def apply_age_model(df: pl.DataFrame,
                     model: HistGradientBoostingRegressor,
                     enc: OrdinalEncoder,
                     tree_bounds: pl.DataFrame,
-                    support: pl.DataFrame | None = None) -> pl.DataFrame:
+                    support: pl.DataFrame | None = None,
+                    recal: dict | None = None) -> pl.DataFrame:
     """
     Predict a raw age for every alive row with DIA, then use _select_best_anchor
     to choose one representative measurement per tree (minimising max-age
@@ -515,7 +589,11 @@ def apply_age_model(df: pl.DataFrame,
         (pl.col("STATUSCD") == 1) & pl.col("DIA").is_not_null()
     )
     X_cand = _build_X(alive_w_dia, enc, fit_enc=False)
-    raw    = np.expm1(model.predict(X_cand)).clip(1.0, 999.0)
+    raw    = np.expm1(model.predict(X_cand))
+    if recal:   # r4: monotone post-hoc recalibration per stratum x DIA class
+        raw = _recal_apply(recal, raw, recal_cell((alive_w_dia["cond_stdorgcd"] == 1).fill_null(False).to_numpy(),
+                                                  alive_w_dia["DIA"].to_numpy()))
+    raw    = np.asarray(raw).clip(1.0, 999.0)
 
     # Build candidates: TREE_ID + MEASDATE + src_age (raw prediction)
     candidates = alive_w_dia.select(TREE_ID + ["MEASDATE"]).with_columns(
@@ -557,9 +635,8 @@ def apply_age_model(df: pl.DataFrame,
     ])
 
     # age_domain (model ages only; null for other sources):
-    #   natural_uncalibrated  condition STDORGCD != 1 (or unknown): natural stands have no
-    #                         field-age truth outside post-reset STDAGE stands (user decision:
-    #                         accept + flag the uneven-aged sapling/timber age step)
+    #   natural_treeage_scale condition STDORGCD != 1 (or unknown): natural-stand ages are on
+    #                         the RAW TreeAge scale (r4 user decision: split by stratum)
     #   out_of_support        planted, DIA-class x stratum x stand-size cell with fewer than
     #                         SUPPORT_MIN training rows
     #   in_support            otherwise
@@ -569,9 +646,9 @@ def apply_age_model(df: pl.DataFrame,
                 .with_columns(
                     pl.when(pl.col("age_source") == "model")
                     .then(pl.when(pl.col("cond_stdorgcd") != 1)   # natural, or STDORGCD unknown
-                          .then(pl.lit("natural_uncalibrated"))
+                          .then(pl.lit("natural_treeage_scale"))
                           .when(pl.col("cond_stdorgcd").is_null())
-                          .then(pl.lit("natural_uncalibrated"))
+                          .then(pl.lit("natural_treeage_scale"))
                           .when(pl.col("_n_train").fill_null(0) >= SUPPORT_MIN)
                           .then(pl.lit("in_support")).otherwise(pl.lit("out_of_support")))
                     .otherwise(pl.lit(None, dtype=pl.Utf8)).alias("age_domain"))
@@ -596,7 +673,7 @@ def run_age_imputation(con, df: pl.DataFrame,
     """Attach context → compute tree bounds → fit model → apply."""
     df            = attach_modeling_context(con, df)
     tree_bounds   = _compute_tree_bounds(df, all_subplot_years)
-    model, enc, _ = fit_age_model(df.filter(pl.col("age_source").is_not_null()).with_columns(
+    model, enc, _, _ = fit_age_model(df.filter(pl.col("age_source").is_not_null()).with_columns(
         pl.col("estimated_age").alias("target"), pl.lit("field").alias("source"), pl.lit(0).alias("_fold")))
     df            = apply_age_model(df, model, enc, tree_bounds)
     return df
@@ -653,7 +730,7 @@ if __name__ == "__main__":
     # + mapped ages, both once over the whole DB
     estage_models = calibrate_estage(con)
     train_df = build_training_set(con, estage_models)
-    model, enc, support = fit_age_model(train_df, estage_models)
+    model, enc, support, recal = fit_age_model(train_df, estage_models)
     del train_df
     if CV_REPORT is not None:
         con.register("_cvr", CV_REPORT.to_arrow())
@@ -673,7 +750,7 @@ if __name__ == "__main__":
         df = attach_modeling_context(con, df)
         tree_bounds = _compute_tree_bounds(df, all_subplot_years)
         df = remap_estage(df, estage_models, tree_bounds)
-        df = _order_columns(apply_age_model(df, model, enc, tree_bounds, support))
+        df = _order_columns(apply_age_model(df, model, enc, tree_bounds, support, recal))
 
         scaffold = scaffold_all.filter(pl.col("STATECD") == st)
         ever_live = (df.filter((pl.col("STATUSCD") == 1) & pl.col("DRYBIO_AG").is_not_null())

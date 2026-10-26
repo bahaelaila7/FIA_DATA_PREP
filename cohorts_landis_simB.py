@@ -72,20 +72,20 @@ def build(con) -> pl.DataFrame:
         OUT_COLS + ["_age_source", "_age_domain"])
 
     # Aggregate into cohorts: sum agb over trees sharing (subplot, species, age, visit).
-    # r3 I4: + n_trees_natural_uncalibrated, AGB-weighted share_natural_uncalibrated and the
+    # r3 I4: + n_trees_natural_treeage_scale, AGB-weighted share_natural_treeage_scale and the
     # AGB-dominant age source of the member trees.
     n_pre = df.height
     grp = [c for c in OUT_COLS if c != "agb"]
-    nu = (pl.col("_age_domain") == "natural_uncalibrated").fill_null(False)
+    nu = (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False)
     src = (df.group_by(grp + ["_age_source"]).agg(pl.col("agb").sum().alias("_a"))
              .sort(grp + ["_a", "_age_source"], descending=[False] * len(grp) + [True, False], nulls_last=True)
              .unique(subset=grp, keep="first")
              .select(grp + [pl.col("_age_source").alias("age_source_major")]))
     df = (df.group_by(grp, maintain_order=True)
             .agg(pl.col("agb").sum().alias("agb"),
-                 nu.cast(pl.Int64).sum().alias("n_trees_natural_uncalibrated"),
+                 nu.cast(pl.Int64).sum().alias("n_trees_natural_treeage_scale"),
                  ((pl.col("agb") * nu.cast(pl.Float64)).sum() / pl.col("agb").sum())
-                 .alias("share_natural_uncalibrated"))
+                 .alias("share_natural_treeage_scale"))
             .join(src, on=grp, how="left", nulls_equal=True)
             .select(OUT_COLS + c1.AGE_META_COLS)
             .sort(["statecd", "unitcd", "countycd", "plot", "subp", "species_symbol", "measdate", "age_calc"]))
@@ -120,9 +120,9 @@ if __name__ == "__main__":
         SELECT STATECD AS statecd, UNITCD AS unitcd, COUNTYCD AS countycd, PLOT AS plot,
                MEASDATE AS measdate, MAX(CYCLE) AS cycle
         FROM base_subplot_cond GROUP BY 1,2,3,4,5)
-    SELECT c.* EXCLUDE (n_trees_natural_uncalibrated, share_natural_uncalibrated, age_source_major),
+    SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major),
            s.lu AS land_use, cy.cycle,
-           c.n_trees_natural_uncalibrated, c.share_natural_uncalibrated, c.age_source_major
+           c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major
     FROM {TABLE}_base c
     LEFT JOIN stdorg s USING (statecd, unitcd, countycd, plot)
     LEFT JOIN plot_cycle cy USING (statecd, unitcd, countycd, plot, measdate)

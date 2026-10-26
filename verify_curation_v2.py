@@ -410,10 +410,10 @@ SELECT g.comp, c.final_fate, count(*) n FROM curdead c JOIN grm g ON g.cn = c.fi
 WHERE g.comp IN ('CUT','MORTALITY','DIVERSION') GROUP BY ALL ORDER BY 1, 3 DESC""")
 
 # ---- (d) median age monotone in DIA class for the top-25 species ------------------------------
-# Evaluated per stratum. ENFORCED for planted stands; INFO for natural stands, by the same
-# user decision (ACCEPT + FLAG) as check (h): in uneven-aged natural stands a larger DIA class is
-# not a later stage of the same cohort, and their model ages carry age_domain =
-# 'natural_uncalibrated'. The pooled result is printed as INFO.
+# Evaluated per stratum. ENFORCED for planted stands. r4: re-enforcement for natural stands (now
+# on one per-tree scale, raw TreeAge) was tried per the user's rule "keep INFO only if it fails";
+# it FAILED in the r4 whole-state runs (GA 1/25, FL 5/23 species non-monotone), so natural stays
+# INFO. The pooled result is printed as INFO.
 def _mono(where):
     d = con.execute(f"""
     WITH l AS (SELECT spcd_resolved sp, estimated_age a,
@@ -470,7 +470,7 @@ st2 = {(r[0], r[1]): (r[2], r[3]) for r in con.execute(_step(5, 7, 9)).fetchall(
 # step exists even among TreeAge-consistent saplings there: mapped-estage-only ~9 yr). So it is
 # ENFORCED only for planted strata with >= H_MIN_VISITS condition-visits in both steps, and
 # reported as INFO for natural strata or thinner planted strata. Natural model ages carry
-# age_domain = 'natural_uncalibrated'.
+# age_domain = 'natural_treeage_scale'.
 H_MIN_VISITS = 50
 print("\n=== (h) within-condition-visit median age steps: 3-5 -> 5-7 in vs 5-7 -> 7-9 in")
 for k in sorted(set(st1) & set(st2)):
@@ -507,7 +507,7 @@ SELECT CASE WHEN INVYR <= 1998 THEN 'a <=1998' WHEN INVYR <= 2009 THEN 'b 1999-2
 FROM new.curated_trees WHERE STATUSCD=1 AND DIA>=5 AND age_from_model IS NOT NULL AND age_from_estage IS NOT NULL
   AND {scope()} GROUP BY ALL ORDER BY 1,2""")
 show("(i) age model out-of-fold MAE / bias by age decile and DIA class (all rows, outliers included)",
-     "SELECT \"by\", source, stratum, n, round(median_target,1) median_target, round(mae,2) mae, round(bias,2) bias FROM new.age_model_cv ORDER BY 1, 2, 3")
+     "SELECT model, \"by\", source, stratum_pn, stratum, n, round(median_target,1) median_target, round(mae,2) mae, round(bias,2) bias FROM new.age_model_cv ORDER BY 1, 2, 3, 4, 5")
 
 # ---- (j) I3c pre-registered: median model - mapped-estage gap within +-3 yr ------------------------
 rows = con.execute(f"""
@@ -565,11 +565,13 @@ SELECT STATECD, planted, count(*) n,
   round(avg(abs(age_from_model-truth)),1) mae_model, round(median(age_from_model-truth),1) bias_model
 FROM stc GROUP BY ALL ORDER BY ALL""")
 for st_, pl_, n, b in con.execute("SELECT STATECD, planted, count(*), median(estimated_age-truth) FROM stc GROUP BY ALL ORDER BY ALL").fetchall():
+    # r4: ENFORCED for planted AND natural strata with >= 100 linked site trees (the natural
+    # target is the pre-registered basis of the user's split-by-stratum decision)
     name = f"(k) state {st_} {'planted' if pl_ else 'natural'}: |median bias of final age vs SITETREE| = {abs(b):.1f} <= 5"
-    if pl_ and n >= 100:
+    if n >= 100:
         check(name, abs(b) <= 5, f"(n {n:,})")
     else:
-        info(name, f"(n {n:,}; {'natural' if not pl_ else '< 100'}: not enforced)")
+        info(name, f"(n {n:,} < 100: not enforced)")
 
 # ---- (l) M1 / M2 / M3 / I4 --------------------------------------------------------------------------
 if a.simb_db:
@@ -601,12 +603,12 @@ SELECT STATECD, count(DISTINCT (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE)) trees, 
 FROM new.curated_trees WHERE tree_key_split AND {scope()} GROUP BY 1""")
 for t, db in (("curated_cohorts_landis_stdorg", "new"),) + ((("curated_cohorts_landis_simB", "newsimb"),) if a.simb_db else ()):
     cols = dbcols = {r[0] for r in con.execute(f"SELECT column_name FROM duckdb_columns() WHERE database_name='{db}' AND table_name='{t}'").fetchall()}
-    need = {"n_trees_natural_uncalibrated", "share_natural_uncalibrated", "age_source_major", "procedural_break"}
+    need = {"n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major", "procedural_break"}
     check(f"(l) I4: {t} carries the age metadata columns", need <= cols, f"(missing {sorted(need - cols)})")
     r = con.execute(f"""SELECT count(*), count(*) FILTER (WHERE age_source_major IS NULL),
-                        round(sum(agb*share_natural_uncalibrated)/sum(agb),3)
+                        round(sum(agb*share_natural_treeage_scale)/sum(agb),3)
                         FROM {db}.{t} WHERE {scope('', 'statecd', 'countycd')}""").fetchone()
-    info(f"(l) I4: {t}", f"(rows {r[0]:,}; age_source_major null {r[1]:,}; AGB share natural_uncalibrated {r[2]})")
+    info(f"(l) I4: {t}", f"(rows {r[0]:,}; age_source_major null {r[1]:,}; AGB share natural_treeage_scale {r[2]})")
 n_ph_null = con.execute(f"""SELECT count(*) FROM new.curated_cohorts_landis WHERE intro_type='phantom_backfill'
                            AND age_source_major IS NULL AND {scope('', 'statecd', 'countycd')}""").fetchone()[0]
 check("(l) I4: phantom rows inherit age metadata from their source tree", n_ph_null == 0, f"({n_ph_null} null)")

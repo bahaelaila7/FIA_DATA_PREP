@@ -72,12 +72,12 @@ def _has_table(con, table: str) -> bool:
 
 # r3 I4: age-source metadata carried onto the cohort tables (Sim A rows are one tree each;
 # phantom rows inherit their source tree's values; Sim B aggregates them AGB-weighted)
-AGE_META_COLS = ["n_trees_natural_uncalibrated", "share_natural_uncalibrated", "age_source_major"]
+AGE_META_COLS = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major"]
 AGE_META_EXPRS = [
-    (pl.col("_age_domain") == "natural_uncalibrated").fill_null(False).cast(pl.Int64)
-      .alias("n_trees_natural_uncalibrated"),
-    (pl.col("_age_domain") == "natural_uncalibrated").fill_null(False).cast(pl.Float64)
-      .alias("share_natural_uncalibrated"),
+    (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False).cast(pl.Int64)
+      .alias("n_trees_natural_treeage_scale"),
+    (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False).cast(pl.Float64)
+      .alias("share_natural_treeage_scale"),
     pl.col("_age_source").alias("age_source_major"),
 ]
 

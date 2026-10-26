@@ -272,9 +272,9 @@ def build_live_body(df: pl.DataFrame, visits: pl.DataFrame, ctx=None) -> pl.Data
             (pl.col("STATUSCD") == 1) &
             pl.col("estimated_age").is_not_null() &
             pl.col("drybio_ag").is_not_null() &
-            (pl.col("estimated_age").round(0) >= 1)
+            (pl.col("estimated_age").round(0, mode="half_away_from_zero") >= 1)
         )
-        .with_columns(pl.col("estimated_age").round(0).cast(pl.Int32).alias("age_calc"))
+        .with_columns(pl.col("estimated_age").round(0, mode="half_away_from_zero").cast(pl.Int32).alias("age_calc"))
     )
     print(f"[body] {live.height:,} live aged records")
 
@@ -435,7 +435,7 @@ def add_alt_age_axes(body: pl.DataFrame) -> pl.DataFrame:
         .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
         .select(TREE_ID +
                 [pl.col("sim_year").alias("_dsy0")] +
-                [pl.col(src).round(0).alias(f"_d_{out}") for src, out in ALT_AGE_SOURCES])
+                [pl.col(src).round(0, mode="half_away_from_zero").alias(f"_d_{out}") for src, out in ALT_AGE_SOURCES])
     )
     body = body.join(debut, on=TREE_ID, how="left")
     body = body.with_columns([

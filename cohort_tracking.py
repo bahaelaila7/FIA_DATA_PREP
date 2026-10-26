@@ -66,7 +66,7 @@ def assign_cohort_ids(df: pl.DataFrame) -> pl.DataFrame:
         .select(
             TREE_ID +
             [(pl.col("MEASDATE") -
-              pl.duration(days=pl.col("estimated_age").round(0).cast(pl.Int32) * 365))
+              pl.duration(days=pl.col("estimated_age").round(0, mode="half_away_from_zero").cast(pl.Int32) * 365))
              .cast(pl.Date)
              .alias("birth_date")]
         )
