@@ -26,6 +26,8 @@ Usage:
     .venv/bin/python build_tree_trajectories.py <db> 37        # smoke test: STATECD=37 only
 """
 
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import sys
 
 import duckdb
@@ -37,6 +39,9 @@ from cohorts_landis import (
     compute_sim_year_ages,
     estimate_sapling_growth_rates,
     _has_column,
+    add_backfill_flags,          # curation-fix 2026-10-26: shared phantom-backfill blocks
+    apply_backfill_blocks,
+    load_backfill_context,
 )
 
 # Forester's constant: basal area (ft²) = 0.005454 * DIA(in)² ; * TPA → ft²/acre
@@ -97,6 +102,8 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
             t.INVYR, t.CONDID, t.MEASDATE,
             {cycle_col},
             t.STATUSCD, t.tree_fate, t.AGENTCD, t.RECONCILECD,
+            t.reconcile_new::INTEGER AS reconcile_new,          -- curation-fix 2026-10-26
+            t.censor_measdate, t.censor_reason,
             t.DIA::DOUBLE  AS dia,
             t.HT::DOUBLE   AS ht,
             t.CR::DOUBLE   AS cr,
@@ -114,7 +121,7 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
             e.epa_l3, {epa_l4_expr}, {ecosubcd_col},
             rr.SPECIES_SYMBOL::VARCHAR AS species_symbol,      -- resolved species
             ro.SPECIES_SYMBOL::VARCHAR AS species_symbol_obs,  -- observed species
-            t.SPGRPCD::INTEGER         AS spgrpcd,
+            COALESCE(t.spgrpcd_resolved, t.SPGRPCD)::INTEGER AS spgrpcd,  -- resolved group
             rr.MAJOR_SPGRPCD::INTEGER  AS major_spgrpcd,
             rr.SFTWD_HRDWD::VARCHAR    AS sftwd_hrdwd,
             c.OWNGRPCD AS owngrpcd, c.FORTYPCD AS fortypcd,
@@ -167,7 +174,7 @@ def subplot_visit_scaffold(con, states: list[int] | None = None) -> pl.DataFrame
 # Step 2: trajectory body (live records) + sim_year + phantom backfill
 # =============================================================================
 
-def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFrame:
+def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) -> pl.DataFrame:
     """
     Backward phantom backfill (intro_type='phantom_backfill') using the FULL
     subplot-visit scaffold (clean_subplot_years), not just visits where a live
@@ -197,6 +204,9 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFr
             .cast(pl.Int32).alias("prior_age"))
         .filter(pl.col("prior_age") >= 1)
     )
+    # curation-fix 2026-10-26: no backfill for RC6/8/9 entries, across a procedural/area
+    # break, or for >=5in subplot ingrowth where the microplot represents the sapling class
+    prior = apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"])
     existing = (
         live.select(TREE_ID + ["MEASDATE"]).unique()
         .rename({"MEASDATE": "prior_measdate"}).with_columns(pl.lit(True).alias("_e"))
@@ -243,7 +253,7 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFr
     return pl.concat([live, synthetic.select(live.columns)], how="vertical")
 
 
-def build_live_body(df: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFrame:
+def build_live_body(df: pl.DataFrame, visits: pl.DataFrame, ctx=None) -> pl.DataFrame:
     """Live, aged, biomassed records → the plottable trajectory body, with
     integer sim_year/age_calc and full-scaffold backward phantom backfill."""
     live = (
@@ -258,8 +268,9 @@ def build_live_body(df: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFrame:
     print(f"[body] {live.height:,} live aged records")
 
     live = compute_sim_year_ages(live)             # integer sim_year + exact age_calc
-    live = backfill_phantom_full(live, visits)     # full-scaffold backward backfill
-    return live
+    live = add_backfill_flags(live)
+    live = backfill_phantom_full(live, visits, ctx)  # full-scaffold backward backfill
+    return live.drop(["_bf_none", "_bf_ge5_ingrowth"])
 
 
 # =============================================================================
@@ -319,6 +330,18 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFrame:
                                          "cr": "next_cr", "agb": "next_agb",
                                          "ba": "next_ba"}),
         on="MEASDATE", by=TREE_ID, strategy="forward")
+
+    # curation-fix 2026-10-26: never interpolate across a censoring (STATUSCD=0 with
+    # RECONCILECD 5/6/8/9 between the bracketing records): the tree was out of the sample.
+    n_g0 = g.height
+    g = g.filter(~(pl.col("censor_measdate").is_not_null() &
+                   (pl.col("censor_measdate") > pl.col("prev_measdate")) &
+                   (pl.col("censor_measdate") <= pl.col("next_measdate"))).fill_null(False))
+    if n_g0 != g.height:
+        print(f"[interp] {n_g0 - g.height:,} gap slots NOT filled (span a censoring interval)")
+    n_gaps = g.height
+    if n_gaps == 0:
+        return live.with_columns(pl.lit(False).alias("was_missed_reintroduced"))
 
     # linear weight and interpolated values
     g = g.with_columns(
@@ -408,7 +431,7 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame) -> pl.DataF
     last = (
         full.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
         .select(TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "AGENTCD",
-                           "row_disturbed"])
+                           "row_disturbed", "censor_measdate", "censor_reason"])
         .rename({"MEASDATE": "terminal_measdate"})
     )
     # was the subplot visited strictly after the tree's last record?
@@ -429,6 +452,11 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame) -> pl.DataF
             .then(pl.lit("dead_disturbance"))
         .when(pl.col("STATUSCD") == 2)
             .then(pl.lit("dead_natural"))
+        # curation-fix 2026-10-26: STATUSCD=0 + RECONCILECD 5/6/8/9 after the last live
+        # record = CENSORING (shrank / moved / procedural / nonsampled), not a removal
+        .when((pl.col("STATUSCD") == 1) & pl.col("censor_measdate").is_not_null() &
+              (pl.col("censor_measdate") > pl.col("terminal_measdate")))
+            .then(pl.lit("censored_") + pl.col("censor_reason"))
         .when((pl.col("STATUSCD") == 1) & pl.col("_later_visit"))
             .then(pl.lit("disappeared_inferred_removal"))
         .when(pl.col("STATUSCD") == 1)
@@ -615,7 +643,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     lu     = derive_land_use(full, events)
 
     # trajectory body (live + phantom + interpolated)
-    body = build_live_body(full, visits)
+    body = build_live_body(full, visits, load_backfill_context(con))
     body = interpolate_gaps(body, visits)
     body = body.with_columns(pl.col("intro_type").fill_null("real"))
 
@@ -702,6 +730,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
         "land_use", "is_planted", "has_clearcut", "has_commercial_thin",
         "has_precommercial_thin", "is_pure", "dominant_species_frac",
         "subp_has_dstrb", "plot_meas_num", "subp_meas_num",
+        "reconcile_new", "censor_reason",                  # curation-fix 2026-10-26
     ]).sort(["statecd", "unitcd", "countycd", "plot", "subp", "tree", "measdate"])
 
     # summary
@@ -716,11 +745,15 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
 
 
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "../FIASQLITE2PGSQL/FIADB.duckdb"
-    states  = [int(s) for s in sys.argv[2:]] if len(sys.argv) > 2 else None
-
-    print(f"DB: {db_path}" + (f"  states={states}" if states else ""))
-    con = duckdb.connect(db_path)
+    # curation-fix 2026-10-26: explicit --out-db/--fiadb (dbconn); optional --states.
+    import argparse
+    import dbconn
+    a = dbconn.add_db_args(argparse.ArgumentParser(description="tree_trajectories")).parse_args()
+    dbconn.check_args(a)
+    states = dbconn.parse_states(a.states)
+    print(f"DB: {a.out_db}" + (f"  states={states}" if states else ""))
+    con = dbconn.connect(a.out_db, a.fiadb)
+    dbconn.require_tables(con, "curated_trees", "clean_subplot_years", "data_plot_eco")
     traj = build_tree_trajectories(con, states)
 
     con.register("_traj_view", traj)

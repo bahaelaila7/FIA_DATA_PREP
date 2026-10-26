@@ -12,28 +12,26 @@ Then aggregate to one row per cohort (subplot × species × age × visit), summi
 Reuses cohorts_landis (v1) helpers so sim_year/age_calc/disturbance/meas-count logic
 is byte-for-byte the vetted pipeline; only the two filters + aggregation differ.
 
-Reads FIADB READ-ONLY (attached); writes the new table into a SEPARATE duckdb file so
-FIADB is never locked/mutated. Point a Pan config's cohorts_db_path at that file.
+Reads the curated DB and FIADB READ-ONLY (attached); writes the new table into a
+SEPARATE duckdb file. Point a Pan config's cohorts_db_path at that file.
 
-Run:  .venv/bin/python cohorts_landis_simB.py [OUT_DB]  [FIADB]
-  OUT_DB default: /workspace/FIA/FIASQLITE2PGSQL/cohorts_simB.duckdb
-  FIADB  default: /workspace/FIA/FIASQLITE2PGSQL/FIADB.duckdb
+curation-fix 2026-10-26: explicit paths (dbconn) — the curated tables come from
+--curated-db (the new curated DB), raw tables from --fiadb; no default paths.
+Run:  python cohorts_landis_simB.py --out-db <simB.duckdb> --curated-db <curated.duckdb> --fiadb <FIADB>
 """
-import sys
-import duckdb
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import argparse
+
 import polars as pl
+
+import dbconn
 
 import cohorts_landis as c1  # v1: has dia in load_base_data + sim_year/subp_meas_num in output
 
-OUT_DB = sys.argv[1] if len(sys.argv) > 1 else "/workspace/FIA/FIASQLITE2PGSQL/cohorts_simB.duckdb"
-FIADB  = sys.argv[2] if len(sys.argv) > 2 else "/workspace/FIA/FIASQLITE2PGSQL/FIADB.duckdb"
 TABLE  = "curated_cohorts_landis_simB"
 SAP    = c1.SAPLING_DIA_MAX  # 5.0 in — FIA sapling/timber boundary
 
-# Views (in the writable OUT_DB catalog) over the read-only FIADB, so the reused v1
-# helpers that query these unqualified names resolve to FIADB.
-FIA_VIEWS = ["curated_trees", "curated_cohorts", "data_plot_eco", "PLOT",
-             "REF_SPECIES", "COND", "base_subplot_cond"]
 
 
 def build(con) -> pl.DataFrame:
@@ -81,11 +79,12 @@ def build(con) -> pl.DataFrame:
 
 
 if __name__ == "__main__":
-    print(f"OUT: {OUT_DB}\nFIA: {FIADB} (read-only)")
-    con = duckdb.connect(OUT_DB)
-    con.execute(f"ATTACH '{FIADB}' AS fia (READ_ONLY)")
-    for t in FIA_VIEWS:
-        con.execute(f'CREATE OR REPLACE VIEW "{t}" AS SELECT * FROM fia."{t}"')
+    a = dbconn.add_db_args(argparse.ArgumentParser(description="sim B cohorts"), curated=True).parse_args()
+    dbconn.check_args(a, curated=True)
+    print(f"OUT: {a.out_db}\nCURATED: {a.curated_db} (read-only)\nFIA: {a.fiadb} (read-only)")
+    # temp views: raw tables -> FIADB, curated tables -> the curated DB (never FIADB's old ones)
+    con = dbconn.connect(a.out_db, a.fiadb, curated_db=a.curated_db)
+    dbconn.require_tables(con, "curated_trees", "curated_cohorts", "base_subplot_cond")
 
     cohorts = build(con)
 
@@ -116,8 +115,7 @@ if __name__ == "__main__":
                     f"count(DISTINCT (statecd,unitcd,countycd,plot)) FROM {TABLE}").fetchone()
     print(f"\n[save] {TABLE} → {r[0]:,} rows · land_use {r[1]:,} · cycle {r[2]:,} · {r[3]:,} plots")
     split = con.execute(
-        f"SELECT land_use, count(DISTINCT (statecd,unitcd,countycd,plot)) FROM {TABLE} "
-        f"WHERE epa_l4 IN ('8.3.5.65o','8.5.3.75g','8.5.3.75e','8.5.3.75f') GROUP BY 1").fetchall()
-    print("study-area land_use split:", split)
+        f"SELECT land_use, count(DISTINCT (statecd,unitcd,countycd,plot)) FROM {TABLE} GROUP BY 1").fetchall()
+    print("land_use split (plots):", split)
     con.close()
     print("[done]")

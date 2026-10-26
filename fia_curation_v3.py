@@ -21,6 +21,8 @@ Usage:
     df, snapshots, confusion_edges = run_pipeline(con, estage_dir='../TreeAge/14775738')
 """
 
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import glob
 import os
 
@@ -37,9 +39,28 @@ COND_KEY = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "INVYR", "CONDID"]
 # Steps 1-3: SQL (bulk filtering and joins)
 # =============================================================================
 
-def sql_base_measurements(con):
-    """Step 1: subplot-cond measurements, annual CONUS, non-skipped."""
-    con.execute("""
+def scope_sql(states=None, counties=None, alias="P") -> str:
+    """Optional geographic scope (subset runs): STATECD list and/or (STATECD, COUNTYCD) pairs."""
+    parts = []
+    if states:
+        parts.append(f"{alias}.STATECD IN ({','.join(map(str, states))})")
+    if counties:
+        parts.append("(" + " OR ".join(
+            f"({alias}.STATECD={s} AND {alias}.COUNTYCD={c})" for s, c in counties) + ")")
+    return (" AND " + " AND ".join(parts)) if parts else ""
+
+
+def sql_base_measurements(con, scope: str = ""):
+    """Step 1: subplot-cond measurements, annual CONUS, non-skipped.
+
+    curation-fix 2026-10-26:
+      * SUBP_STATUS_CD IS DISTINCT FROM 3 — the old `<> 3` silently dropped NULL subplot
+        status (P2A/periodic records); NULL is now kept here and P2A / null-TPA tree records
+        are excluded explicitly in load_trees.
+      * condition/subplot area proportions are carried (CONDPROP/SUBPPROP/MICRPROP/MACRPROP
+        of the condition; SUBPCOND/MICRCOND/MACRCOND_PROP of the subplot x condition).
+    """
+    con.execute(f"""
     DROP TABLE IF EXISTS base_subplot_cond;
     CREATE TABLE base_subplot_cond AS
     SELECT
@@ -49,6 +70,7 @@ def sql_base_measurements(con):
                   COALESCE(CAST(P.MEASMON AS INTEGER), 6),
                   COALESCE(P.MEASDAY, 15)) AS MEASDATE,
         P.DESIGNCD, P.CYCLE,
+        SUBP.SUBP_STATUS_CD,
         C.COND_STATUS_CD,
         C.STDAGE, C.FLDAGE, C.STDORGCD, C.STDORGSP,
         C.FLDSZCD, C.STDSZCD,
@@ -56,7 +78,7 @@ def sql_base_measurements(con):
         C.FORTYPCD, C.SITECLCD,
         C.BALIVE, C.ALSTK, C.ALSTKCD, C.GSSTK, C.GSSTKCD,
         C.PRESNFCD, C.SLOPE, C.ASPECT, P.ELEV, C.OWNGRPCD,
-        C.CONDPROP_UNADJ,
+        C.CONDPROP_UNADJ, C.SUBPPROP_UNADJ, C.MICRPROP_UNADJ, C.MACRPROP_UNADJ,
         C_S.SUBPCOND_PROP, C_S.MICRCOND_PROP, C_S.MACRCOND_PROP,
         C.DSTRBCD1, C.DSTRBCD2, C.DSTRBCD3,
         C.DSTRBYR1, C.DSTRBYR2, C.DSTRBYR3,
@@ -81,7 +103,7 @@ def sql_base_measurements(con):
         AND SUBP.PLOT     = P.PLOT
         AND SUBP.INVYR    = P.INVYR
         AND P.PLOT_STATUS_CD < 3
-        AND SUBP.SUBP_STATUS_CD <> 3
+        AND SUBP.SUBP_STATUS_CD IS DISTINCT FROM 3     -- explicit: NULL status is kept
     JOIN SUBP_COND C_S
         ON  C_S.STATECD  = P.STATECD
         AND C_S.UNITCD   = P.UNITCD
@@ -96,6 +118,7 @@ def sql_base_measurements(con):
         AND C.PLOT      = P.PLOT
         AND C.INVYR     = P.INVYR
         AND C_S.CONDID  = C.CONDID
+    WHERE TRUE {scope}
     """)
     con.commit()
     n = con.execute("SELECT COUNT(*) FROM base_subplot_cond").fetchone()[0]
@@ -103,22 +126,38 @@ def sql_base_measurements(con):
 
 
 def sql_clean_subplot_years(con):
-    """Step 2: drop subplot-years where any cond has COND_STATUS_CD=3."""
+    """Step 2: the subplot-visit scaffold.
+
+    curation-fix 2026-10-26: the old rule dropped a whole subplot-visit when ANY of its
+    conditions had COND_STATUS_CD=3. Per FIADB v9.4 COND_STATUS_CD 3 is noncensus WATER,
+    not nonforest, so the subplot is kept; trees are filtered by their OWN condition in
+    load_trees. The table name is kept for the downstream stages; it now also carries
+    has_cond_status3 and the forest (COND_STATUS_CD=1) subplot / microplot proportions.
+    """
     con.execute("""
     DROP TABLE IF EXISTS clean_subplot_years;
     CREATE TABLE clean_subplot_years AS
-    SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE
+    SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE,
+           BOOL_OR(COND_STATUS_CD = 3)                                   AS has_cond_status3,
+           SUM(CASE WHEN COND_STATUS_CD = 1 THEN SUBPCOND_PROP ELSE 0 END) AS forest_subpcond_prop,
+           SUM(CASE WHEN COND_STATUS_CD = 1 THEN MICRCOND_PROP ELSE 0 END) AS forest_micrcond_prop
     FROM base_subplot_cond
     GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE
-    HAVING SUM(CASE WHEN COND_STATUS_CD = 3 THEN 1 ELSE 0 END) = 0
     """)
     con.commit()
     n = con.execute("SELECT COUNT(*) FROM clean_subplot_years").fetchone()[0]
-    print(f"[step2] clean_subplot_years: {n:,}")
+    n3 = con.execute("SELECT COUNT(*) FROM clean_subplot_years WHERE has_cond_status3").fetchone()[0]
+    print(f"[step2] clean_subplot_years: {n:,} subplot-visits ({n3:,} with a COND_STATUS_CD=3 "
+          f"condition — kept, previously dropped)")
 
 
 def sql_longitudinal_subplots(con):
-    """Step 3: subplots with >=2 clean measurement years."""
+    """Step 3: visit count per subplot.
+
+    curation-fix 2026-10-26: the old `HAVING COUNT(*) >= 2` (>= 2 clean visits) is removed
+    from curation. Every subplot is kept; n_measurements is exported to curated_trees as
+    n_clean_visits so downstream consumers filter themselves.
+    """
     con.execute("""
     DROP TABLE IF EXISTS longitudinal_subplots;
     CREATE TABLE longitudinal_subplots AS
@@ -128,11 +167,10 @@ def sql_longitudinal_subplots(con):
            MAX(MEASDATE) AS last_measdate,
     FROM clean_subplot_years
     GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP
-    HAVING COUNT(*) >= 2
     """)
     con.commit()
     n = con.execute("SELECT COUNT(*) FROM longitudinal_subplots").fetchone()[0]
-    print(f"[step3] longitudinal_subplots: {n:,}")
+    print(f"[step3] subplots (no >=2-visit filter): {n:,}")
     dist = con.execute("""
         SELECT n_measurements, COUNT(*) FROM longitudinal_subplots
         GROUP BY n_measurements ORDER BY n_measurements
@@ -141,119 +179,105 @@ def sql_longitudinal_subplots(con):
         print(f"        {nm} meas: {cnt:,}")
 
 
-def sql_excluded_trees(con):
+# RECONCILECD meanings (FIADB v9.4 §3.1.82). The OLD labels in sql_excluded_trees were wrong
+# (3 'not_found', 6 'state_change', 7 'prev_missed', 8 'macroplot_removal', 9 'other').
+RECONCILE_LABELS = {
+    1: "ingrowth", 2: "through_growth", 3: "missed_live", 4: "missed_dead", 5: "shrank",
+    6: "physical_movement", 7: "cruiser_error", 8: "procedural_change", 9: "nonsampled_area",
+}
+# New-tree codes that are NOT growth into the tally (tree present but untallied, moved in,
+# or in a previously nonsampled area) -> reconcile_new / not_ingrowth flag.
+RECONCILE_NEW_CODES = (3, 4, 6, 7, 8, 9)
+# STATUSCD=0 + these codes = the tree leaves observation for a non-mortality reason.
+CENSOR_REASON = {5: "shrank", 6: "moved", 8: "procedural", 9: "nonsampled"}
+
+
+def sql_excluded_trees(con, scope: str = ""):
     """
-    Identify trees to exclude from the analysis (RECONCILECD anomalies or
-    STATUSCD=0), storing the reason(s) and a meaningful/trivial flag per tree.
+    Step 3b — per-tree reconcile events (curation-fix 2026-10-26).
 
-    NOTE: RECONCILECD=5 (diameter shrank below threshold — tree still alive)
-    is intentionally NOT excluded here; it is handled separately in
-    handle_reconcile5() which keeps it as STATUSCD=1 with imputed DIA.
+    OLD behaviour (removed): every record of a tree that EVER had RECONCILECD in
+    (3,4,6,7,8,9) or STATUSCD=0 was excluded. Several states re-tallied their microplot
+    saplings as new trees (RC3/RC8) at the first annual remeasurement, so that rule dropped
+    ~half of the live saplings in AL/GA/NC/SC/TN.
 
-    is_meaningful = TRUE if the tree ever had at least one legitimate alive
-    measurement (STATUSCD=1, RECONCILECD in {NULL, 1, 2}) in the annual CONUS
-    survey. That means we are genuinely discarding real observed data.
-    is_meaningful = FALSE when the tree never had a valid measurement, i.e. it
-    was counted-in by mistake and we are simply correcting that error — no
-    real information is lost.
-
-    The distinction matters for the subplot exclusion flag in the scaffold: only
-    meaningful exclusions warrant flagging a subplot as having dropped trees.
-
-    Exclusion reason codes stored in exclusion_reasons (comma-separated):
-      statuscd_invalid   STATUSCD = 0  (erroneous record, never a real tree)
-      not_found          RECONCILECD = 3
-      boundary_error     RECONCILECD = 4
-      state_change       RECONCILECD = 6
-      prev_missed        RECONCILECD = 7
-      macroplot_removal  RECONCILECD = 8
-      other              RECONCILECD = 9
+    NEW behaviour, per FIADB v9.4 STATUSCD/RECONCILECD definitions:
+      * the STATUSCD=0 record itself is dropped (load_trees);
+      * STATUSCD=0 + RECONCILECD=7 ("cruiser error: erroneously tallied at the previous
+        inventory") -> the tree's EARLIER records are dropped (it never existed).
+        These trees are listed in `excluded_tree_ids` (exclusion_reasons
+        'cruiser_error_prev_tally'), the only remaining tree-level exclusion;
+      * STATUSCD=0 + RECONCILECD in (5,6,8,9) (or null/other) -> CENSORING: the tree leaves
+        observation for a non-mortality reason (shrank / moved / procedural / nonsampled).
+        Stored as censor_measdate / censor_reconcilecd in `tree_reconcile_events`;
+      * new trees with RECONCILECD 3/4/6/7/8/9 are kept (flagged reconcile_new downstream).
     """
+    con.execute(f"""
+    DROP TABLE IF EXISTS tree_reconcile_events;
+    CREATE TABLE tree_reconcile_events AS
+    WITH s0 AS (
+        SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE,
+               MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER), 6),
+                         COALESCE(P.MEASDAY, 15)) AS MEASDATE,
+               CAST(T.RECONCILECD AS INTEGER) AS RC
+        FROM TREE T
+        JOIN PLOT P ON P.CN = T.PLT_CN
+        JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
+        WHERE T.STATUSCD = 0
+          AND P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope}
+    )
+    SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE,
+           MIN(MEASDATE) FILTER (WHERE RC = 7)                            AS rc7_erroneous_measdate,
+           MIN(MEASDATE) FILTER (WHERE RC IS DISTINCT FROM 7)             AS censor_measdate,
+           ARG_MIN(RC, MEASDATE) FILTER (WHERE RC IS DISTINCT FROM 7)     AS censor_reconcilecd,
+           COUNT(*)                                                       AS n_status0_records
+    FROM s0
+    GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
+    """)
+    # Backward-compatible table name: the trees whose earlier records are discarded.
     con.execute("""
     DROP TABLE IF EXISTS excluded_tree_ids;
     CREATE TABLE excluded_tree_ids AS
-    WITH annual_conus AS (
-        -- Restrict to the same annual CONUS survey scope used everywhere else
-        SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR
-        FROM PLOT P
-        JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
-        WHERE P.STATECD <= 56 AND P.STATECD NOT IN (2, 15)
-    ),
-    valid_meas AS (
-        -- Trees that ever had a legitimate alive measurement in scope
-        SELECT DISTINCT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE
-        FROM TREE T
-        JOIN annual_conus AC
-            ON  AC.STATECD = T.STATECD AND AC.UNITCD = T.UNITCD
-            AND AC.COUNTYCD = T.COUNTYCD AND AC.PLOT = T.PLOT AND AC.INVYR = T.INVYR
-        WHERE T.STATUSCD = 1
-          AND (T.RECONCILECD IS NULL OR T.RECONCILECD IN (1, 2))
-    ),
-    raw_excl AS (
-        SELECT
-            T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE,
-            CASE
-                WHEN T.STATUSCD    = 0 THEN 'statuscd_invalid'
-                WHEN T.RECONCILECD = 3 THEN 'not_found'
-                WHEN T.RECONCILECD = 4 THEN 'boundary_error'
-                WHEN T.RECONCILECD = 6 THEN 'state_change'
-                WHEN T.RECONCILECD = 7 THEN 'prev_missed'
-                WHEN T.RECONCILECD = 8 THEN 'macroplot_removal'
-                WHEN T.RECONCILECD = 9 THEN 'other'
-            END AS reason
-        FROM TREE T
-        JOIN annual_conus AC
-            ON  AC.STATECD = T.STATECD AND AC.UNITCD = T.UNITCD
-            AND AC.COUNTYCD = T.COUNTYCD AND AC.PLOT = T.PLOT AND AC.INVYR = T.INVYR
-        WHERE T.RECONCILECD IN (3, 4, 6, 7, 8, 9)
-           OR T.STATUSCD = 0
-    ),
-    deduped AS (
-        SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, reason
-        FROM raw_excl
-    )
-    SELECT
-        d.STATECD, d.UNITCD, d.COUNTYCD, d.PLOT, d.SUBP, d.TREE,
-        STRING_AGG(d.reason, ', ' ORDER BY d.reason) AS exclusion_reasons,
-        BOOL_OR(vm.TREE IS NOT NULL)                 AS is_meaningful
-    FROM deduped d
-    LEFT JOIN valid_meas vm
-        ON  vm.STATECD  = d.STATECD AND vm.UNITCD  = d.UNITCD
-        AND vm.COUNTYCD = d.COUNTYCD AND vm.PLOT   = d.PLOT
-        AND vm.SUBP     = d.SUBP    AND vm.TREE    = d.TREE
-    GROUP BY d.STATECD, d.UNITCD, d.COUNTYCD, d.PLOT, d.SUBP, d.TREE
+    SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, rc7_erroneous_measdate,
+           'cruiser_error_prev_tally' AS exclusion_reasons,
+           FALSE AS is_meaningful        -- erroneous tallies carry no real observation
+    FROM tree_reconcile_events
+    WHERE rc7_erroneous_measdate IS NOT NULL
     """)
     con.commit()
-
-    n      = con.execute("SELECT COUNT(*) FROM excluded_tree_ids").fetchone()[0]
-    n_mean = con.execute(
-        "SELECT COUNT(*) FROM excluded_tree_ids WHERE is_meaningful"
-    ).fetchone()[0]
-    print(f"[step3b] excluded_tree_ids: {n:,} trees "
-          f"({n_mean:,} meaningful, {n - n_mean:,} trivial)")
-
-    reason_counts = con.execute("""
-        SELECT reason, COUNT(*) AS n
-        FROM (
-            SELECT UNNEST(STRING_SPLIT(exclusion_reasons, ', ')) AS reason
-            FROM excluded_tree_ids
-        )
-        GROUP BY reason ORDER BY n DESC
-    """).fetchall()
-    for reason, cnt in reason_counts:
-        print(f"        {reason:25s}: {cnt:>8,}")
+    n = con.execute("SELECT COUNT(*) FROM tree_reconcile_events").fetchone()[0]
+    n7 = con.execute("SELECT COUNT(*) FROM excluded_tree_ids").fetchone()[0]
+    print(f"[step3b] tree_reconcile_events: {n:,} trees with STATUSCD=0 records; "
+          f"{n7:,} RC7 erroneous-prior-tally trees (earlier records dropped)")
+    for rc, cnt in con.execute("""
+        SELECT censor_reconcilecd, COUNT(*) FROM tree_reconcile_events
+        WHERE censor_measdate IS NOT NULL GROUP BY 1 ORDER BY 2 DESC""").fetchall():
+        print(f"        censoring RC={rc} ({CENSOR_REASON.get(rc, 'not_in_sample')}): {cnt:,}")
 
 
 # =============================================================================
 # Step 4: Load into polars
 # =============================================================================
 
-def load_trees(con) -> pl.DataFrame:
+def load_trees(con, state: int | None = None) -> pl.DataFrame:
     """
-    Load tree records from clean longitudinal subplots into polars,
-    with condition context attached. Excludes anomalous trees.
+    Load tree records of the scaffold subplot-visits into polars, with condition context.
+
+    curation-fix 2026-10-26 record rules (FIADB v9.4):
+      * live trees (STATUSCD=1) must be on their OWN condition with COND_STATUS_CD=1
+        (accessible forest). Dead/cut records (STATUSCD 2/3) are kept on COND_STATUS_CD 1
+        or 2: a tree removed by land clearing sits on the now-nonforest condition, and
+        dropping that record would mislabel the removal as an unexplained disappearance;
+      * the STATUSCD=0 record itself is dropped (its information is carried as censoring /
+        RC7 columns via tree_reconcile_events);
+      * records BEFORE a STATUSCD=0 + RECONCILECD=7 event are dropped (erroneous tally);
+      * explicit exclusion of P2A (periodic-to-annual GRM-only, P2A_GRM_FLG='Y') and
+        null/zero-TPA rows: they are not part of the annual sample (TPA_UNADJ > 0 kept);
+      * annual survey only + REF_SPECIES join (unchanged);
+      * NO tree-level RECONCILECD exclusion, NO >= 2-visit rule, NO subplot COND_STATUS 3 drop.
     """
-    df = con.execute("""
+    where_state = f"AND T.STATECD = {int(state)}" if state is not None else ""
+    df = con.execute(f"""
     SELECT
         T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, T.INVYR,
         T.CN,
@@ -289,7 +313,21 @@ def load_trees(con) -> pl.DataFrame:
         C.TRTCD1, C.TRTCD2, C.TRTCD3,
         C.TRTYR1, C.TRTYR2, C.TRTYR3,
         C.DSTRBCD1, C.DSTRBCD2, C.DSTRBCD3,
-        C.DSTRBYR1, C.DSTRBYR2, C.DSTRBYR3
+        C.DSTRBYR1, C.DSTRBYR2, C.DSTRBYR3,
+        -- curation-fix 2026-10-26: area proportions for consumer-side normalisation
+        C.COND_STATUS_CD          AS cond_status_cd,
+        C.CONDPROP_UNADJ          AS cond_condprop_unadj,
+        C.SUBPPROP_UNADJ          AS cond_subpprop_unadj,
+        C.MICRPROP_UNADJ          AS cond_micrprop_unadj,
+        C.MACRPROP_UNADJ::DOUBLE  AS cond_macrprop_unadj,
+        SC.SUBPCOND_PROP          AS subp_subpcond_prop,
+        SC.MICRCOND_PROP          AS subp_micrcond_prop,
+        SC.MACRCOND_PROP          AS subp_macrcond_prop,
+        CSY.forest_subpcond_prop  AS subp_forest_subpcond_prop,
+        CSY.forest_micrcond_prop  AS subp_forest_micrcond_prop,
+        CSY.has_cond_status3      AS subp_has_cond_status3,
+        LS.n_measurements         AS n_clean_visits,
+        E.censor_measdate, E.censor_reconcilecd
     FROM TREE T
     JOIN REF_SPECIES SP ON SP.SPCD = T.SPCD
     JOIN clean_subplot_years CSY
@@ -308,17 +346,62 @@ def load_trees(con) -> pl.DataFrame:
         ON  P.STATECD  = T.STATECD AND P.UNITCD = T.UNITCD
         AND P.COUNTYCD = T.COUNTYCD AND P.PLOT = T.PLOT
         AND P.INVYR    = T.INVYR
-    WHERE T.TPA_UNADJ > 0
-      AND NOT EXISTS (
-          SELECT 1 FROM excluded_tree_ids E
-          WHERE E.STATECD = T.STATECD AND E.UNITCD = T.UNITCD
-            AND E.COUNTYCD = T.COUNTYCD AND E.PLOT = T.PLOT
-            AND E.SUBP = T.SUBP AND E.TREE = T.TREE
-      )
+    LEFT JOIN SUBP_COND SC
+        ON  SC.STATECD = T.STATECD AND SC.UNITCD = T.UNITCD
+        AND SC.COUNTYCD = T.COUNTYCD AND SC.PLOT = T.PLOT
+        AND SC.INVYR = T.INVYR AND SC.SUBP = T.SUBP AND SC.CONDID = T.CONDID
+    LEFT JOIN tree_reconcile_events E
+        ON  E.STATECD = T.STATECD AND E.UNITCD = T.UNITCD
+        AND E.COUNTYCD = T.COUNTYCD AND E.PLOT = T.PLOT
+        AND E.SUBP = T.SUBP AND E.TREE = T.TREE
+    WHERE T.TPA_UNADJ > 0                                   -- null/zero-TPA rows are not sample trees
+      AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'                -- explicit: P2A GRM-only records out
+      AND T.STATUSCD IN (1, 2, 3)                           -- drop the STATUSCD=0 record itself
+      AND (   (T.STATUSCD = 1 AND C.COND_STATUS_CD = 1)     -- live: own condition is forest
+           OR (T.STATUSCD IN (2, 3) AND C.COND_STATUS_CD IN (1, 2)))
+      AND NOT (E.rc7_erroneous_measdate IS NOT NULL         -- erroneously tallied previously
+               AND CSY.MEASDATE < E.rc7_erroneous_measdate)
+      {where_state}
     """).pl()
 
     df = df.sort(TREE_ID + ["MEASDATE"])
     print(f"[step4] loaded {df.height:,} tree-measurements into polars")
+    return df
+
+
+def annotate_reconcile(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    curation-fix 2026-10-26 per-tree reconcile / censoring flags:
+      reconcile_new      RECONCILECD of the tree's first record when it is a non-growth
+                         entry (3 missed live, 4 missed dead, 6 moved in, 7 cruiser error,
+                         8 procedural change, 9 previously nonsampled area); else null
+      not_ingrowth       reconcile_new is not null (tell these from true ingrowth RC1/RC2)
+      censored           the tree has a STATUSCD=0 non-RC7 record: it left observation for
+                         a non-mortality reason (NOT a death or removal)
+      censor_measdate    MEASDATE of that STATUSCD=0 record
+      censor_reconcilecd its RECONCILECD (5 shrank, 6 moved, 8 procedural, 9 nonsampled)
+      censor_reason      label of the above ('not_in_sample' for null/other codes)
+    """
+    first_rc = (
+        df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+        .select(TREE_ID + [pl.col("RECONCILECD").cast(pl.Int32).alias("_rc_first")])
+    )
+    df = df.join(first_rc, on=TREE_ID, how="left").with_columns(
+        pl.when(pl.col("_rc_first").is_in(list(RECONCILE_NEW_CODES)))
+        .then(pl.col("_rc_first")).otherwise(pl.lit(None, dtype=pl.Int32))
+        .alias("reconcile_new")
+    ).drop("_rc_first")
+    reason = pl.col("censor_reconcilecd").replace_strict(
+        CENSOR_REASON, default="not_in_sample", return_dtype=pl.Utf8)
+    df = df.with_columns([
+        pl.col("reconcile_new").is_not_null().alias("not_ingrowth"),
+        pl.col("censor_measdate").is_not_null().alias("censored"),
+        pl.when(pl.col("censor_measdate").is_not_null()).then(reason)
+          .otherwise(pl.lit(None, dtype=pl.Utf8)).alias("censor_reason"),
+    ])
+    n_new = df.filter(pl.col("not_ingrowth")).select(TREE_ID).unique().height
+    n_cen = df.filter(pl.col("censored")).select(TREE_ID).unique().height
+    print(f"[step4r] reconcile_new trees: {n_new:,}  |  censored trees: {n_cen:,}")
     return df
 
 
@@ -395,7 +478,7 @@ def analyze_spcd_confusion(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame
             pl.lit(False).alias("spcd_changed"),
             pl.col("SPCD").alias("spcd_confusion_cluster"),
         ])
-        return df, pl.DataFrame(schema={
+        return _add_spgrpcd_resolved(df), pl.DataFrame(schema={
             "spcd_a": pl.Int32, "spcd_b": pl.Int32,
             "n_transitions": pl.UInt32, "n_trees": pl.UInt32,
         })
@@ -497,7 +580,20 @@ def analyze_spcd_confusion(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame
     n_resolved_diff = df.filter(pl.col("SPCD") != pl.col("spcd_resolved")).height
     print(f"         tree-measurements where SPCD != spcd_resolved: {n_resolved_diff:,}")
 
-    return df, confusion_edges
+    return _add_spgrpcd_resolved(df), confusion_edges
+
+
+def _add_spgrpcd_resolved(df: pl.DataFrame) -> pl.DataFrame:
+    """curation-fix 2026-10-26: SPGRPCD that goes with spcd_resolved (taken from the tree's
+    latest record whose SPCD == spcd_resolved), so cohort species AND group are per-tree
+    constants instead of the raw per-visit values."""
+    grp = (
+        df.filter(pl.col("SPCD") == pl.col("spcd_resolved"))
+        .sort(TREE_ID + ["MEASDATE"])
+        .unique(subset=TREE_ID, keep="last")
+        .select(TREE_ID + [pl.col("SPGRPCD").alias("spgrpcd_resolved")])
+    )
+    return df.join(grp, on=TREE_ID, how="left")
 
 
 # =============================================================================
@@ -506,132 +602,36 @@ def analyze_spcd_confusion(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame
 
 def handle_reconcile5(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Handle RECONCILECD=5 trees (diameter fell below the subplot minimum, ~5 in).
-    The tree is still alive but no longer tallied at the subplot level.
+    RECONCILECD=5 ("shrank": live tree that fell below the tally threshold; only valid with
+    STATUSCD=0) — curation-fix 2026-10-26.
 
-    Actions:
-      1. STATUSCD → 1 (alive) for all RECONCILECD=5 rows.
-      2. Impute DIA where null, using the minimum for the class the tree was
-         previously in (determined from its last non-null DIA):
-           prior DIA >= MACRO_BREAKPOINT_DIA  →  MACRO_BREAKPOINT_DIA
-           prior DIA >= 5.0 in               →  5.0  (subplot floor)
-           prior DIA >= 1.0 in               →  1.0  (microplot floor)
-           no prior DIA                       →  5.0  (assume subplot)
-      3. reconcile5_dia_imputed : TRUE where DIA was null and got imputed.
-      4. reconcile5_recovered   : TRUE on any measurement after the first
-           RECONCILECD=5 episode where the tree returns to RECONCILECD in {1,2}.
+    The old implementation (revived to STATUSCD=1 with an imputed DIA of 5.0/1.0 and a
+    propagated TPA such as 6.018) would FABRICATE records once STATUSCD=0 trees are no
+    longer excluded wholesale. It is NOT revived: RC5 is used as a censoring flag
+    (annotate_reconcile: censored / censor_reason='shrank'). The reconcile5_* columns are
+    kept for schema compatibility: no DIA/TPA is imputed or propagated (all null/False);
+    reconcile5_first_measdate = date of the RC5 STATUSCD=0 record, reconcile5_recovered =
+    a later live record of the same tree (re-entered the tally).
     """
-    r5 = pl.col("RECONCILECD") == 5
-    n_r5 = df.filter(r5).height
-
-    if n_r5 == 0:
-        return df.with_columns([
-            pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_dia_raw"),
-            pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_dia"),
-            pl.lit(False).alias("reconcile5_dia_imputed"),
-            pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_tpa_raw"),
-            pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_tpa"),
-            pl.lit(False).alias("reconcile5_tpa_propagated"),
-            pl.lit(None).cast(pl.Date).alias("reconcile5_first_measdate"),
-            pl.lit(False).alias("reconcile5_recovered"),
-        ])
-
-    # Most-recent non-null DIA before each row (within tree, sorted by MEASDATE)
-    # reconcile5_prev_dia: last observed DIA before this measurement — used to
-    #   determine which measurement class the tree was previously in
-    df = df.sort(TREE_ID + ["MEASDATE"]).with_columns(
-        pl.col("DIA").shift(1).over(TREE_ID).alias("reconcile5_prev_dia_raw")
-    ).with_columns(
-        pl.col("reconcile5_prev_dia_raw")
-        .fill_null(strategy="forward")
-        .over(TREE_ID)
-        .alias("reconcile5_prev_dia")
+    r5_date = (
+        pl.when(pl.col("censor_reconcilecd") == 5).then(pl.col("censor_measdate"))
+        .otherwise(pl.lit(None, dtype=pl.Date))
     )
-
-    # Build imputed DIA expression
-    macro_bp = pl.col("MACRO_BREAKPOINT_DIA").cast(pl.Float64)
-    prev     = pl.col("reconcile5_prev_dia")
-    needs_impute = r5 & pl.col("DIA").is_null()
-
     df = df.with_columns([
-        # DIA: impute where needed, leave unchanged elsewhere
-        pl.when(needs_impute)
-        .then(
-            pl.when(prev.is_not_null() &
-                    pl.col("MACRO_BREAKPOINT_DIA").is_not_null() &
-                    (prev >= macro_bp))
-            .then(macro_bp)
-            .when(prev.is_not_null() & (prev >= 5.0))
-            .then(pl.lit(5.0))
-            .when(prev.is_not_null() & (prev >= 1.0))
-            .then(pl.lit(1.0))
-            .otherwise(pl.lit(5.0))
-        )
-        .otherwise(pl.col("DIA"))
-        .alias("DIA"),
-
-        # Track which rows had DIA imputed
-        needs_impute.alias("reconcile5_dia_imputed"),
-    ])
-
-    # Override STATUSCD to 1 for all RECONCILECD=5 rows
-    df = df.with_columns(
-        pl.when(r5).then(pl.lit(1)).otherwise(pl.col("STATUSCD")).alias("STATUSCD")
+        pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_dia_raw"),
+        pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_dia"),
+        pl.lit(False).alias("reconcile5_dia_imputed"),
+        pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_tpa_raw"),
+        pl.lit(None).cast(pl.Float64).alias("reconcile5_prev_tpa"),
+        pl.lit(False).alias("reconcile5_tpa_propagated"),
+        r5_date.alias("reconcile5_first_measdate"),
+    ]).with_columns(
+        (pl.col("reconcile5_first_measdate").is_not_null() &
+         (pl.col("MEASDATE") > pl.col("reconcile5_first_measdate")) &
+         (pl.col("STATUSCD") == 1)).alias("reconcile5_recovered")
     )
-
-    # Propagate last non-zero TPA_UNADJ for RECONCILECD=5 rows where TPA_UNADJ
-    # is 0 or null (can happen when the original STATUSCD was 0).
-    # reconcile5_prev_tpa_raw : shift(1) of non-zero TPA within tree
-    # reconcile5_prev_tpa     : forward-filled — the value actually used
-    # reconcile5_tpa_propagated: TRUE where TPA_UNADJ was replaced
-    df = df.with_columns(
-        pl.when(pl.col("TPA_UNADJ").is_not_null() & (pl.col("TPA_UNADJ") > 0))
-        .then(pl.col("TPA_UNADJ"))
-        .otherwise(pl.lit(None))
-        .alias("_tpa_nonzero")
-    ).with_columns(
-        pl.col("_tpa_nonzero").shift(1).over(TREE_ID).alias("reconcile5_prev_tpa_raw")
-    ).with_columns(
-        pl.col("reconcile5_prev_tpa_raw")
-        .fill_null(strategy="forward")
-        .over(TREE_ID)
-        .alias("reconcile5_prev_tpa")
-    ).drop("_tpa_nonzero")
-
-    needs_tpa = r5 & (pl.col("TPA_UNADJ").is_null() | (pl.col("TPA_UNADJ") == 0))
-    df = df.with_columns([
-        pl.when(needs_tpa & pl.col("reconcile5_prev_tpa").is_not_null())
-        .then(pl.col("reconcile5_prev_tpa"))
-        .otherwise(pl.col("TPA_UNADJ"))
-        .alias("TPA_UNADJ"),
-
-        (needs_tpa & pl.col("reconcile5_prev_tpa").is_not_null())
-        .alias("reconcile5_tpa_propagated"),
-    ])
-
-    # Recovery flag: back to RECONCILECD∈{1,2} after the first RECONCILECD=5 date
-    # reconcile5_first_measdate: the first MEASDATE this tree dropped below threshold
-    first_r5_measdate = (
-        df.filter(r5)
-        .group_by(TREE_ID)
-        .agg(pl.col("MEASDATE").min().alias("reconcile5_first_measdate"))
-    )
-    df = df.join(first_r5_measdate, on=TREE_ID, how="left")
-    df = df.with_columns(
-        (
-            pl.col("reconcile5_first_measdate").is_not_null() &
-            pl.col("RECONCILECD").is_in([1, 2]) &
-            (pl.col("MEASDATE") > pl.col("reconcile5_first_measdate"))
-        ).alias("reconcile5_recovered")
-    )
-
-    n_imputed   = df.filter(pl.col("reconcile5_dia_imputed")).height
-    n_tpa_prop  = df.filter(pl.col("reconcile5_tpa_propagated")).height
-    n_recovered = df.filter(pl.col("reconcile5_recovered")).height
-    print(f"[handle_r5] {n_r5:,} RECONCILECD=5 measurements "
-          f"({n_imputed:,} DIA imputed, {n_tpa_prop:,} TPA propagated, "
-          f"{n_recovered:,} recovery events)")
-
+    n5 = df.filter(pl.col("reconcile5_first_measdate").is_not_null()).select(TREE_ID).unique().height
+    print(f"[handle_r5] {n5:,} trees censored by RECONCILECD=5 (shrank) — no records fabricated")
     return df
 
 
@@ -690,50 +690,49 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
         .alias("tree_fate")
     )
 
-    # ------
-    tree_final = (
-        df
-        .sort(TREE_ID + ["MEASDATE"])
-        .group_by(TREE_ID)
-        .agg(
-            pl.col("MEASDATE").last().alias("_tree_last_measdate"),
-            pl.col("tree_fate").last().alias("_final_tree_fate_raw"),
-        )
-    )
-
-    last_subp_measdates = (
-        df
-        .group_by(SUBPLOT_ID)
-        .agg(
-            pl.col("MEASDATE").max().alias("last_subp_measdate")
-        )
-    )
-
-    out = (
-        df
-        .join(tree_final, on=TREE_ID, how="left")
-        .join(last_subp_measdates, on=SUBPLOT_ID, how="left")
-        .with_columns(
-            pl.when(
-                (pl.col("_final_tree_fate_raw") == "alive")
-                & (pl.col("last_subp_measdate") > pl.col("_tree_last_measdate"))
-            )
-            .then(pl.lit("harvest_inferred"))
-            .otherwise(pl.col("_final_tree_fate_raw"))
-            .alias("final_tree_fate")
-        )
-    )
-
-    # -----
-
     df = df.drop(["_fate_raw", "_cond_has_explicit"])
+    return df
+
+
+def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame) -> pl.DataFrame:
+    """
+    Per-tree terminal fate (curation-fix 2026-10-26; this was dead code in v3 before):
+      last record dead/cut               -> its tree_fate (dead / harvest_explicit / harvest_inferred)
+      last record alive, and the tree was censored after it (STATUSCD=0 + RC 5/6/8/9)
+                                         -> 'censored_<reason>' (NOT a removal)
+      last record alive, subplot revisited later without the tree, no censoring record
+                                         -> 'disappeared_inferred_removal'
+      last record alive, no later visit  -> 'alive'
+    """
+    last = (
+        df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
+        .select(TREE_ID + [pl.col("MEASDATE").alias("_last_md"),
+                           pl.col("tree_fate").alias("_last_fate"),
+                           "censor_measdate", "censor_reason"])
+    )
+    last_visit = subplot_years.group_by(SUBPLOT_ID).agg(
+        pl.col("MEASDATE").max().alias("_last_subp_md"))
+    last = last.join(last_visit, on=SUBPLOT_ID, how="left").with_columns(
+        pl.when(pl.col("_last_fate") != "alive").then(pl.col("_last_fate"))
+        .when(pl.col("censor_measdate").is_not_null() &
+              (pl.col("censor_measdate") > pl.col("_last_md")))
+            .then(pl.lit("censored_") + pl.col("censor_reason"))
+        .when(pl.col("_last_subp_md") > pl.col("_last_md"))
+            .then(pl.lit("disappeared_inferred_removal"))
+        .otherwise(pl.lit("alive"))
+        .alias("final_tree_fate")
+    ).select(TREE_ID + ["final_tree_fate"])
+    df = df.join(last, on=TREE_ID, how="left")
 
     # Print breakdown
     fate_counts = df.group_by("tree_fate").len().sort("len", descending=True)
-    print("[step5] tree fate classification:")
+    print("[step5] tree fate classification (records):")
     for row in fate_counts.iter_rows():
-        print(f"        {row[0]:25s}: {row[1]:>12,}")
-
+        print(f"        {str(row[0]):25s}: {row[1]:>12,}")
+    print("        final_tree_fate (trees):")
+    for row in (df.unique(subset=TREE_ID).group_by("final_tree_fate").len()
+                .sort("len", descending=True).iter_rows()):
+        print(f"          {str(row[0]):30s}: {row[1]:>10,}")
     return df
 
 
@@ -1222,52 +1221,53 @@ def _select_best_anchor(candidates: pl.DataFrame,
                         tree_bounds: pl.DataFrame,
                         apply_min_shift: bool = False) -> pl.DataFrame:
     """
-    Select one source measurement per tree to use as the propagation anchor.
+    Select one anchor (date, age) per tree from its candidate age records.
 
     candidates must contain: TREE_ID + MEASDATE + "src_age"
     tree_bounds must contain: TREE_ID + first_measdate + prev_sub_measdate
-                              (output of _compute_tree_bounds)
 
-    apply_min_shift : if True, shift anchor age so tree is at least 1 yr old
-                      at its first measurement.  Use only for TOTAGE, which can
-                      record 0.  STDAGE/estage/model values should not be
-                      silently inflated.
+    curation-fix 2026-10-26 — MEDIAN anchor:
+      The old rule picked the candidate with the smallest "max-age violation" (implied age
+      at the last subplot visit before the tree's debut: "the crew was there and didn't see
+      it"). That bound is wrong for every new-tree class — ingrowth/through-growth trees
+      were below the tally threshold (not unborn), RC3/RC7 trees were present but missed,
+      RC8 trees were untallied by procedure, RC6/RC9 trees were outside the sampled area —
+      and it made the selection pick the YOUNGEST candidate ~78 % of the time (-2.7 yr
+      bias). The bound is therefore no longer used for selection (max_viol is kept as a
+      diagnostic only).
 
     Algorithm
     ---------
-    1. For each candidate compute implied age at the tree's first_measdate.
-    2. Optionally apply a min-age shift so that age at first_measdate >= 1
-       (TOTAGE only).
-    3. Compute potential max-age violation: implied age at the most recent
-       subplot visit before first_measdate (after any shift).
-    4. Select the candidate with the smallest max-age violation.
-       Tie-break: most recent candidate MEASDATE.
+    1. implied age at the tree's first_measdate for each candidate;
+    2. median of the implied ages per tree (the anchor age at first_measdate);
+    3. optional min-age shift (apply_min_shift) so the median age at first_measdate >= 1;
+    4. anchor_date = the candidate closest to the median (tie: most recent MEASDATE) — a
+       real record, so per-anchor metadata joins still work; anchor_age is the median age
+       carried to that date: median_at_first + (anchor_date - first_measdate).
 
-    Returns TREE_ID + [anchor_date, anchor_age, anchor_src_age, min_shift,
-                       max_viol] per tree.
-    anchor_age     : (possibly shifted) src_age at anchor_date
-    anchor_src_age : original src_age before shift (for diagnostics)
-    min_shift      : years added to satisfy the age >= 1 constraint (0 when
-                     apply_min_shift=False)
-    max_viol       : residual potential max-age violation after shift (years)
+    Returns TREE_ID + [anchor_date, anchor_age, anchor_src_age, min_shift, max_viol, n_cand].
+    anchor_src_age : raw src_age of the anchor-date candidate (diagnostic)
+    max_viol       : DIAGNOSTIC — implied age at the last subplot visit before debut
     """
     cands = candidates.join(tree_bounds, on=TREE_ID, how="left")
-
     cands = cands.with_columns(
         (
             pl.col("src_age").cast(pl.Float64) +
             (pl.col("first_measdate") - pl.col("MEASDATE")).dt.total_days() / 365.25
         ).alias("_implied_at_first")
     )
+    cands = cands.with_columns([
+        pl.col("_implied_at_first").median().over(TREE_ID).alias("_med_at_first"),
+        pl.len().over(TREE_ID).alias("n_cand"),
+    ])
     if apply_min_shift:
         cands = cands.with_columns(
-            (pl.lit(1.0) - pl.col("_implied_at_first")).clip(lower_bound=0.0)
-            .alias("min_shift")
-        )
+            (pl.lit(1.0) - pl.col("_med_at_first")).clip(lower_bound=0.0).alias("min_shift"))
     else:
         cands = cands.with_columns(pl.lit(0.0).alias("min_shift"))
     cands = cands.with_columns(
-        (pl.col("_implied_at_first") + pl.col("min_shift")).alias("_age_at_first")
+        (pl.col("_med_at_first") + pl.col("min_shift")).alias("_age_at_first"),
+        (pl.col("_implied_at_first") - pl.col("_med_at_first")).abs().alias("_dev"),
     )
     cands = cands.with_columns(
         pl.when(pl.col("prev_sub_measdate").is_not_null())
@@ -1284,11 +1284,12 @@ def _select_best_anchor(candidates: pl.DataFrame,
 
     best = (
         cands
-        .sort(TREE_ID + ["max_viol", "MEASDATE"],
+        .sort(TREE_ID + ["_dev", "MEASDATE"],
               descending=[False] * len(TREE_ID) + [False, True])
         .unique(subset=TREE_ID, keep="first")
         .with_columns(
-            (pl.col("src_age").cast(pl.Float64) + pl.col("min_shift"))
+            (pl.col("_age_at_first") +
+             (pl.col("MEASDATE") - pl.col("first_measdate")).dt.total_days() / 365.25)
             .alias("anchor_age")
         )
         .select(TREE_ID + [
@@ -1297,6 +1298,7 @@ def _select_best_anchor(candidates: pl.DataFrame,
             pl.col("src_age").cast(pl.Float64).alias("anchor_src_age"),
             pl.col("min_shift"),
             pl.col("max_viol"),
+            pl.col("n_cand"),
         ])
     )
     return best
@@ -1331,19 +1333,23 @@ def _propagate_from_anchor(df: pl.DataFrame,
 # Step 6d: External age estimates (estage)
 # =============================================================================
 
-def load_estage_csv(csv_dir: str) -> pl.DataFrame:
+def load_estage_csv(csv_dir: str, keep_cns: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     Load and concatenate all *_TREEAGE.csv files from csv_dir.
     Returns a DataFrame with columns: CN (Utf8), Tree_Age (Int32).
+    keep_cns (curation-fix): optional one-column frame of in-scope TREE CNs; rows are
+    semi-joined while scanning so subset runs don't hold the national table in memory.
     """
     files = sorted(glob.glob(os.path.join(csv_dir, "*_TREEAGE.csv")))
     if not files:
         raise FileNotFoundError(f"No *_TREEAGE.csv files found in {csv_dir}")
-    dfs = [
-        pl.read_csv(f, columns=["CN", "Tree_Age"])
-        .with_columns(pl.col("CN").cast(pl.Utf8))
-        for f in files
-    ]
+    dfs = []
+    for f in files:
+        lf = (pl.scan_csv(f, schema_overrides={"CN": pl.Utf8})
+              .select(["CN", "Tree_Age"]))
+        if keep_cns is not None:
+            lf = lf.join(keep_cns.lazy(), on="CN", how="semi")
+        dfs.append(lf.collect())
     estage_raw = pl.concat(dfs).unique(subset=["CN"])
     print(f"[step6d] loaded {estage_raw.height:,} estage records from {len(files)} state files")
     return estage_raw
@@ -1966,6 +1972,7 @@ def diagnostics(df: pl.DataFrame, snapshots: pl.DataFrame):
             .select(pl.col(f"age_diff_{tag}").abs().median())
             .item()
         )
+        med_diff = float("nan") if med_diff is None else med_diff   # empty subset guard
         print(f"  {a:20s} vs {b:20s}: "
               f"{n_both:>10,} with both, {n_disc:>8,} discrepant ({pct:.1f}%), "
               f"median |diff|={med_diff:.0f} yr")
@@ -2028,104 +2035,140 @@ def diagnostics(df: pl.DataFrame, snapshots: pl.DataFrame):
 # Pipeline
 # =============================================================================
 
-def run_pipeline(con, estage_dir: str = None):
-    """
-    Run the full curation pipeline.
-
-    Args:
-        con:        open DuckDB connection to the FIA database
-        estage_dir: directory containing *_TREEAGE.csv files (step 6d).
-                    If None, estage columns are added as all-null.
-    """
-    print("=" * 70)
-    print("FIA Curation Pipeline v2")
-    print("=" * 70)
-
-    # SQL steps
-    sql_base_measurements(con)
-    sql_clean_subplot_years(con)
-    sql_longitudinal_subplots(con)
-    sql_excluded_trees(con)
-
-    # Polars steps
-    df = load_trees(con)
-    df, confusion_edges = analyze_spcd_confusion(df)
+def _polars_steps(con, df: pl.DataFrame, estage_raw, all_subplot_years) -> pl.DataFrame:
+    """Steps 4b-6e for one batch (one state) of tree records."""
+    df = annotate_reconcile(df)
+    df, _confusion_edges = analyze_spcd_confusion(df)
     df = handle_reconcile5(df)
     df = classify_tree_fate(df)
+    df = add_final_tree_fate(df, all_subplot_years)
 
-    # All subplot measurement years — loaded early so tree_bounds can use them
-    # for max-age violation bounding across all age sources.
-    all_subplot_years = con.execute("""
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE
-        FROM clean_subplot_years
-    """).pl()
     tree_bounds = _compute_tree_bounds(df, all_subplot_years)
-
     df = propagate_totage(df, tree_bounds)
     df = assign_stdage(df, tree_bounds)
     df = merge_age_estimates(df)
 
-    # Step 6d: external age estimates
-    if estage_dir is not None:
-        estage_raw = load_estage_csv(estage_dir)
+    if estage_raw is not None:
         df = process_estage(df, estage_raw, tree_bounds)
     else:
         df = df.with_columns([
-            pl.lit(None).cast(pl.Utf8).alias("estage_raw"),
+            pl.lit(None).cast(pl.Int64).alias("estage_raw"),
             pl.lit(None).cast(pl.Float64).alias("estage_min_violation"),
             pl.lit(None).cast(pl.Float64).alias("estage_max_violation"),
+            pl.lit(None).cast(pl.Date).alias("estage_anchor_measdate"),
+            pl.lit(None).cast(pl.Float64).alias("estage_anchor_value"),
+            pl.lit(None).cast(pl.Int64).alias("estage_anchor_invyr"),
             pl.lit(None).cast(pl.Float64).alias("age_from_estage"),
             pl.lit(None).cast(pl.Int32).alias("estage"),
-            pl.lit(None).cast(pl.Int32).alias("estage_anchor_invyr"),
         ])
+    return flag_age_discrepancies(df)
 
-    # Step 6e: cross-source age discrepancy flags
-    df = flag_age_discrepancies(df)
 
-    scaffold = build_subplot_year_scaffold(con)
+# Columns appended by curation-fix 2026-10-26 (moved to the END of curated_trees so the old
+# column order/types are preserved as a prefix of the new schema).
+FIX_COLUMNS = [
+    "cond_status_cd", "cond_condprop_unadj", "cond_subpprop_unadj", "cond_micrprop_unadj",
+    "cond_macrprop_unadj", "subp_subpcond_prop", "subp_micrcond_prop", "subp_macrcond_prop",
+    "subp_forest_subpcond_prop", "subp_forest_micrcond_prop", "subp_has_cond_status3",
+    "n_clean_visits", "reconcile_new", "not_ingrowth", "censored", "censor_measdate",
+    "censor_reconcilecd", "censor_reason", "spgrpcd_resolved", "final_tree_fate",
+]
 
-    # Filter scaffold to subplots that ever held at least one live curated tree
-    # WITH a recorded DRYBIO_AG — matching the condition used in build_snapshots'
-    # tree_agg (STATUSCD=1 AND DRYBIO_AG is not null). Subplots whose only live
-    # trees all lack DRYBIO_AG would otherwise pass STATUSCD filter but still
-    # show zero biomass in every snapshot row.
-    ever_live = (
-        df.filter(
-            (pl.col("STATUSCD") == 1) & pl.col("DRYBIO_AG").is_not_null()
-        )
-        .select(SUBPLOT_ID).unique()
-    )
-    n_scaffold_before = scaffold.height
-    scaffold = scaffold.join(ever_live, on=SUBPLOT_ID, how="semi")
-    print(f"[filter] scaffold restricted to forested subplots: "
-          f"{scaffold.height:,} rows (dropped {n_scaffold_before - scaffold.height:,} "
-          f"from {n_scaffold_before - scaffold.height + scaffold.height:,})")
 
-    snapshots = build_snapshots(df, scaffold)
+def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
+    """
+    Run the full curation pipeline (curation-fix 2026-10-26).
 
-    # Persist curated tree-level df and snapshots into the DuckDB file
-    con.register("_df_view", df)
-    con.execute("CREATE OR REPLACE TABLE curated_trees AS SELECT * FROM _df_view")
-    con.unregister("_df_view")
-    con.register("_snapshots_view", snapshots)
-    con.execute("CREATE OR REPLACE TABLE curated_snapshots AS SELECT * FROM _snapshots_view")
-    con.unregister("_snapshots_view")
-    con.commit()
-    print(f"[save] curated_trees written to DuckDB ({df.height:,} rows)")
-    print(f"[save] curated_snapshots written to DuckDB ({snapshots.height:,} rows)")
+    SQL steps run once for the whole scope; the polars steps run ONE STATE AT A TIME
+    (every rule is tree/subplot/condition-local, all within a state) so peak memory stays
+    bounded; the per-state results are unioned into curated_trees / curated_snapshots.
+    Only the diagnostic spcd_confusion_cluster id is state-local.
+    """
+    print("=" * 70)
+    print("FIA Curation Pipeline v3 (curation-fix 2026-10-26)")
+    print("=" * 70)
+    scope = scope_sql(states, counties, "P")
 
-    diagnostics(df, snapshots)
+    sql_base_measurements(con, scope)
+    sql_clean_subplot_years(con)
+    sql_longitudinal_subplots(con)
+    sql_excluded_trees(con, scope)
 
-    print("\n[done] Returns: (curated_df, snapshots_df, confusion_edges_df)")
-    print("       SQL tables: base_subplot_cond, clean_subplot_years,")
-    print("       longitudinal_subplots, excluded_tree_ids,")
-    print("       curated_trees, curated_snapshots")
-    return df, snapshots, confusion_edges
+    estage_raw = None
+    if estage_dir is not None:
+        keep = con.execute("""
+            SELECT DISTINCT CAST(T.CN AS VARCHAR) AS CN FROM TREE T
+            JOIN clean_subplot_years CSY
+              ON T.STATECD=CSY.STATECD AND T.UNITCD=CSY.UNITCD AND T.COUNTYCD=CSY.COUNTYCD
+             AND T.PLOT=CSY.PLOT AND T.INVYR=CSY.INVYR AND T.SUBP=CSY.SUBP
+        """).pl()
+        estage_raw = load_estage_csv(estage_dir, keep)
+    scaffold_all = build_subplot_year_scaffold(con)
+
+    run_states = [r[0] for r in con.execute(
+        "SELECT DISTINCT STATECD FROM clean_subplot_years ORDER BY 1").fetchall()]
+    parts_t, parts_s = [], []
+    for st in run_states:
+        print(f"\n----- STATECD {st} -----")
+        df = load_trees(con, st)
+        if df.height == 0:
+            continue
+        all_subplot_years = con.execute(f"""
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE
+            FROM clean_subplot_years WHERE STATECD = {int(st)}
+        """).pl()
+        df = _polars_steps(con, df, estage_raw, all_subplot_years)
+        df = df.select([c for c in df.columns if c not in FIX_COLUMNS] + FIX_COLUMNS)
+
+        scaffold = scaffold_all.filter(pl.col("STATECD") == st)
+        ever_live = (df.filter((pl.col("STATUSCD") == 1) & pl.col("DRYBIO_AG").is_not_null())
+                     .select(SUBPLOT_ID).unique())
+        scaffold = scaffold.join(ever_live, on=SUBPLOT_ID, how="semi")
+        snapshots = build_snapshots(df, scaffold)
+
+        for name, frame, parts in (("t", df, parts_t), ("s", snapshots, parts_s)):
+            tab = f"_v3_{name}_{st}"
+            con.register("_part", frame)
+            con.execute(f"CREATE OR REPLACE TABLE {tab} AS SELECT * FROM _part")
+            con.unregister("_part")
+            parts.append(tab)
+        con.commit()
+        print(f"[save] state {st}: {df.height:,} tree rows, {snapshots.height:,} snapshot rows")
+        if st == run_states[-1]:
+            diagnostics(df, snapshots)
+        del df, snapshots
+
+    for target, parts in (("curated_trees", parts_t), ("curated_snapshots", parts_s)):
+        union = " UNION ALL BY NAME ".join(f"SELECT * FROM {p}" for p in parts)
+        con.execute(f"CREATE OR REPLACE TABLE {target} AS {union}")
+        for p in parts:
+            con.execute(f"DROP TABLE {p}")
+        con.commit()
+        n = con.execute(f"SELECT COUNT(*) FROM {target}").fetchone()[0]
+        print(f"[save] {target}: {n:,} rows")
+
+    print("\n[done] SQL tables: base_subplot_cond, clean_subplot_years, longitudinal_subplots,")
+    print("       tree_reconcile_events, excluded_tree_ids, curated_trees, curated_snapshots")
+
+
+def parse_counties(s):
+    """'13:59,13:121' -> [(13, 59), (13, 121)]"""
+    if not s:
+        return None
+    return [tuple(int(v) for v in x.split(":")) for x in s.split(",") if x]
 
 
 if __name__ == "__main__":
-    import sys
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "fiadb.duckdb"
-    estage_dir = sys.argv[2] if len(sys.argv) > 2 else None
-    con = duckdb.connect(db_path)
-    df, snapshots, confusion_edges = run_pipeline(con, estage_dir=estage_dir)
+    import argparse
+    import dbconn
+    ap = dbconn.add_db_args(argparse.ArgumentParser(description="FIA curation v3 (curation-fix)"))
+    ap.add_argument("--estage-dir", default=os.environ.get("FIA_ESTAGE_DIR"),
+                    help="directory of *_TREEAGE.csv (env FIA_ESTAGE_DIR)")
+    ap.add_argument("--counties", default=os.environ.get("FIA_COUNTIES"),
+                    help="subset: STATECD:COUNTYCD,... (env FIA_COUNTIES)")
+    a = ap.parse_args()
+    dbconn.check_args(a)
+    con = dbconn.connect(a.out_db, a.fiadb)
+    run_pipeline(con, estage_dir=a.estage_dir, states=dbconn.parse_states(a.states),
+                 counties=parse_counties(a.counties))
+    con.close()

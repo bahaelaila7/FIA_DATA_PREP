@@ -33,6 +33,8 @@ Standalone usage:
     # default: ../FIASQLITE2PGSQL/FIADB.duckdb
 """
 
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import sys
 
 import duckdb
@@ -57,19 +59,15 @@ MIN_RATE_TREES    = 10   # min trees for species×epa_l3 rate; else fall back to
 # =============================================================================
 
 def _has_column(con, table: str, col: str) -> bool:
-    rows = con.execute(
-        "SELECT column_name FROM information_schema.columns "
-        f"WHERE table_name = '{table}'"
-    ).fetchall()
-    return col.lower() in {r[0].lower() for r in rows}
+    """curation-fix: only the output DB / temp views are inspected — information_schema
+    would also list the attached FIADB's OLD curated tables."""
+    import dbconn
+    return col.lower() in dbconn.column_names(con, table)
 
 
 def _has_table(con, table: str) -> bool:
-    rows = con.execute(
-        "SELECT table_name FROM information_schema.tables "
-        f"WHERE table_name = '{table}'"
-    ).fetchall()
-    return len(rows) > 0
+    import dbconn
+    return dbconn.table_exists(con, table)
 
 
 # =============================================================================
@@ -106,9 +104,11 @@ def load_base_data(con) -> pl.DataFrame:
     df = con.execute(f"""
         SELECT
             t.STATECD, t.UNITCD, t.COUNTYCD, t.PLOT, t.SUBP, t.TREE,
-            t.SPCD,
+            t.spcd_resolved                        AS SPCD,   -- curation-fix: resolved species
             t.MEASDATE,
             t.DIA::DOUBLE                          AS dia,
+            t.TPA_UNADJ::DOUBLE                    AS tpa,
+            t.reconcile_new::INTEGER               AS reconcile_new,
             ROUND(t.estimated_age)::INTEGER        AS age_calc,
             (t.DRYBIO_AG * t.TPA_UNADJ
              * {LBS_ACRE_TO_G_M2})::DOUBLE         AS agb,
@@ -116,7 +116,7 @@ def load_base_data(con) -> pl.DataFrame:
             {epa_l4_expr},
             {ecosubcd_col},
             r.SPECIES_SYMBOL::VARCHAR              AS species_symbol,
-            t.SPGRPCD::INTEGER                     AS spgrpcd,
+            COALESCE(t.spgrpcd_resolved, t.SPGRPCD)::INTEGER AS spgrpcd,
             r.MAJOR_SPGRPCD::INTEGER               AS major_spgrpcd,
             r.SFTWD_HRDWD::VARCHAR                 AS sftwd_hrdwd
         FROM curated_trees t
@@ -127,7 +127,7 @@ def load_base_data(con) -> pl.DataFrame:
             AND e.plot     = t.PLOT
         {ecosubcd_join}
         LEFT JOIN REF_SPECIES r
-            ON  r.SPCD = t.SPCD
+            ON  r.SPCD = t.spcd_resolved
         WHERE
             t.STATUSCD = 1
             AND t.estimated_age IS NOT NULL
@@ -470,7 +470,101 @@ def print_mid_measurement_gaps(df: pl.DataFrame) -> None:
           f"({n_trees:,} trees / {n_plots:,} plots)  — not backfilled")
 
 
-def backfill_phantom_trees(df: pl.DataFrame) -> pl.DataFrame:
+# -----------------------------------------------------------------------------
+# curation-fix 2026-10-26: phantom-backfill blocking rules
+# -----------------------------------------------------------------------------
+# A phantom pre-debut row at prior subplot visit p for a tree debuting at D is NOT made when
+#   (a) the tree entered for a non-growth reason that means it was NOT in the sampled
+#       population before: RECONCILECD 6 (moved in), 8 (procedural change: newly tallied by
+#       a new procedure — the previous visit's own tallies represent that stratum), 9
+#       (previously nonsampled area);
+#   (b) the subplot had a PROCEDURAL BREAK b with p < b <= D: a STATUSCD=0 censoring with
+#       RECONCILECD 8 (tallies dropped by a procedure change) or a new-tree entry with
+#       RECONCILECD 8 on the same subplot at b — backfill must not span that interval
+#       (the pre-break tallies already represent the re-tallied stratum). STATUSCD=0/RC9
+#       (part of the subplot became nonsampled) is NOT a break for trees in the
+#       still-sampled part; RC9 new trees are covered by (a);
+#   (c) the tree debuted on the SUBPLOT (DIA >= 5 in, TPA ~6.018) as true ingrowth (not a
+#       missed tree RC3/RC7): at the earlier visits it was sapling-sized and that size class
+#       is represented by the microplot saplings (TPA ~74.965) wherever the microplot was
+#       sampled on forest (forest MICRCOND_PROP > 0) — scaling the subplot debut back at TPA
+#       6.018 double counts it. Backfill therefore stops at the latest prior visit with a
+#       sampled forest microplot (only visits after it keep phantoms, so trajectories stay
+#       contiguous).
+# Trees entering as RC3 / RC7 ("missed": present but not tallied) keep their backfill.
+BF_NONE_CODES  = (6, 8, 9)
+BF_MISSED_CODES = (3, 7)
+BREAK_CODES    = (8,)
+
+
+def load_backfill_context(con) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """(breaks, micro): subplot procedural/area break dates and the per-visit forest
+    microplot proportion, both from the curated DB."""
+    _codes = ",".join(map(str, BREAK_CODES))
+    breaks = con.execute(f"""
+        SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, censor_measdate AS break_date
+        FROM curated_trees WHERE censor_reconcilecd IN ({_codes})
+        UNION
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MIN(MEASDATE) AS break_date
+        FROM curated_trees WHERE reconcile_new IN ({_codes})
+        GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
+    """).pl().unique()
+    micro = con.execute("""
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE AS prior_measdate,
+               MAX(forest_micrcond_prop) AS _micro_prop
+        FROM clean_subplot_years GROUP BY ALL
+    """).pl()
+    print(f"[backfill ctx] {breaks.height:,} subplot procedural-break dates")
+    return breaks, micro
+
+
+def add_backfill_flags(df: pl.DataFrame) -> pl.DataFrame:
+    """Per-row tree-level flags used by the blocking rules (debut = first row of the tree)."""
+    debut = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+             .select(TREE_ID + [pl.col("dia").alias("_debut_dia")]))
+    df = df.join(debut, on=TREE_ID, how="left")
+    rn = pl.col("reconcile_new")
+    return df.with_columns([
+        rn.is_in(list(BF_NONE_CODES)).fill_null(False).alias("_bf_none"),
+        ((pl.col("_debut_dia") >= SAPLING_DIA_MAX) &
+         ~rn.is_in(list(BF_MISSED_CODES)).fill_null(False)).fill_null(False).alias("_bf_ge5_ingrowth"),
+    ]).drop("_debut_dia")
+
+
+def apply_backfill_blocks(prior: pl.DataFrame, ctx, key) -> pl.DataFrame:
+    """Drop candidate phantom slots per the rules above. `prior` carries SUBPLOT_ID, the
+    debut MEASDATE, prior_measdate, _bf_none, _bf_ge5_ingrowth; `key` identifies a slot."""
+    if ctx is None:
+        return prior
+    breaks, micro = ctx
+    n0 = prior.height
+    prior = prior.filter(~pl.col("_bf_none"))
+    n_none = n0 - prior.height
+    crossed = (
+        prior.select(list(dict.fromkeys(key + ["MEASDATE"]))).unique()
+        .join(breaks, on=SUBPLOT_ID, how="inner")
+        .filter((pl.col("break_date") > pl.col("prior_measdate")) &
+                (pl.col("break_date") <= pl.col("MEASDATE")))
+        .select(key).unique().with_columns(pl.lit(True).alias("_crossed"))
+    )
+    prior = prior.join(crossed, on=key, how="left").filter(pl.col("_crossed").is_null()).drop("_crossed")
+    n_break = n0 - n_none - prior.height
+    prior = prior.join(micro, on=SUBPLOT_ID + ["prior_measdate"], how="left")
+    owner = [k for k in key if k != "prior_measdate"]
+    prior = prior.with_columns(
+        pl.when(pl.col("_bf_ge5_ingrowth") & (pl.col("_micro_prop").fill_null(0) > 0))
+        .then(pl.col("prior_measdate")).otherwise(pl.lit(None, dtype=pl.Date))
+        .max().over(owner).alias("_last_micro"))
+    n1 = prior.height
+    prior = prior.filter(pl.col("_last_micro").is_null() |
+                         (pl.col("prior_measdate") > pl.col("_last_micro")))
+    print(f"[backfill blocks] dropped {n_none:,} (RC6/8/9 entry), {n_break:,} (across a "
+          f"procedural break), {n1 - prior.height:,} (>=5in ingrowth, microplot represents)"
+          f" of {n0:,} candidate slots")
+    return prior.drop(["_micro_prop", "_last_micro"])
+
+
+def backfill_phantom_trees(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
     """
     For every individual tree (TREE_ID), ensure each prior subplot visit where
     that tree would have been alive has a synthetic row.
@@ -509,6 +603,7 @@ def backfill_phantom_trees(df: pl.DataFrame) -> pl.DataFrame:
         )
         .filter(pl.col("prior_age") >= 1)
     )
+    prior = apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"])
 
     # Which (tree, prior_measdate) slots already exist in the data?
     existing = (
@@ -579,7 +674,7 @@ def backfill_phantom_trees(df: pl.DataFrame) -> pl.DataFrame:
     return pl.concat([df, synthetic.select(df.columns)], how="vertical")
 
 
-def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
+def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
     """
     Second-pass backfill at the cohort level (subplot × species × measdate × age_calc).
 
@@ -589,10 +684,14 @@ def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
 
     Preserves any intro_type values already set by backfill_phantom_trees.
     """
+    ckey = SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]
     cohort_debut = (
-        df.unique(subset=SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"],
-                  keep="first")
+        df.unique(subset=ckey, keep="first")
     )
+    if ctx is not None:
+        # a cohort slot is blocked only if EVERY member row is blocked by the same rule
+        flags = df.group_by(ckey).agg(pl.col("_bf_none").all(), pl.col("_bf_ge5_ingrowth").all())
+        cohort_debut = cohort_debut.drop(["_bf_none", "_bf_ge5_ingrowth"]).join(flags, on=ckey, how="left")
 
     subp_visits = (
         df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
@@ -609,6 +708,7 @@ def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
         )
         .filter(pl.col("prior_age") >= 1)
     )
+    prior = apply_backfill_blocks(prior, ctx, ckey + ["prior_measdate"])
 
     existing = (
         df.select(SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]).unique()
@@ -819,7 +919,7 @@ def check_cohort_continuity(df: pl.DataFrame, age_tol: int = 0) -> int:
 # Step 5: assemble
 # =============================================================================
 
-def build_cohorts_landis(con) -> pl.DataFrame:
+def build_cohorts_landis(con, backfill_blocks: bool = True) -> pl.DataFrame:
     print("=" * 70)
     print("LANDIS Cohort Curation Pipeline")
     print("=" * 70)
@@ -846,8 +946,10 @@ def build_cohorts_landis(con) -> pl.DataFrame:
     print_mid_measurement_gaps(df)
 
     # Backfill: tree level first, then cohort level to catch any remaining gaps
-    df = backfill_phantom_trees(df)
-    df = backfill_phantom_cohorts(df)
+    ctx = load_backfill_context(con) if backfill_blocks else None
+    df = add_backfill_flags(df)
+    df = backfill_phantom_trees(df, ctx)
+    df = backfill_phantom_cohorts(df, ctx)
 
     # plt_cn: unique string key per plot (not per visit); Julia uses it only to
     # count subplots (subp_count = unique subp per plt_cn) for AGB normalisation
@@ -924,10 +1026,14 @@ def build_cohorts_landis(con) -> pl.DataFrame:
 # =============================================================================
 
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "../FIASQLITE2PGSQL/FIADB.duckdb"
-
-    print(f"DB: {db_path}")
-    con = duckdb.connect(db_path)
+    # curation-fix 2026-10-26: explicit --out-db / --fiadb (dbconn); no default DB path.
+    import argparse
+    import dbconn
+    a = dbconn.add_db_args(argparse.ArgumentParser(description="curated_cohorts_landis")).parse_args()
+    dbconn.check_args(a)
+    con = dbconn.connect(a.out_db, a.fiadb)
+    dbconn.require_tables(con, "curated_trees", "curated_cohorts", "clean_subplot_years")
+    print(f"DB: {a.out_db}")
 
     cohorts = build_cohorts_landis(con)
 

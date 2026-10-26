@@ -29,6 +29,8 @@ Usage:
   python cohort_disturbance.py <db> [STATECD ...] --write    # also write the cohort_disturbance table
   python cohort_disturbance.py <db> [STATECD ...] --attach   # + attach disturbance_drop_pct into curated_cohorts_landis
 """
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import sys
 import duckdb
 import polars as pl
@@ -198,14 +200,21 @@ def diagnostics(coh):
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    write = "--write" in args or "--attach" in args
-    attach = "--attach" in args
-    args = [a for a in args if not a.startswith("--")]
-    db = args[0] if args else "../FIASQLITE2PGSQL/FIADB.duckdb"
-    states = [int(a) for a in args[1:]]
-    print(f"DB: {db}  states: {states or 'ALL'}  severity={SEVERITY_FRAC}  cohort_gate={APPLY_COHORT_GATE}")
-    con = duckdb.connect(db)
+    # curation-fix 2026-10-26: explicit --out-db/--fiadb (dbconn), no default DB path.
+    # Censored trees (terminal_fate censored_*) are not in DISTURB_FATES, so a STATUSCD=0
+    # procedural/nonsampled exit is never counted as a disturbance drop.
+    import argparse
+    import dbconn
+    ap = dbconn.add_db_args(argparse.ArgumentParser(description="cohort_disturbance"))
+    ap.add_argument("--write", action="store_true")
+    ap.add_argument("--attach", action="store_true")
+    a = ap.parse_args()
+    dbconn.check_args(a)
+    write, attach = a.write or a.attach, a.attach
+    states = dbconn.parse_states(a.states) or []
+    print(f"DB: {a.out_db}  states: {states or 'ALL'}  severity={SEVERITY_FRAC}  cohort_gate={APPLY_COHORT_GATE}")
+    con = dbconn.connect(a.out_db, a.fiadb)
+    dbconn.require_tables(con, "tree_trajectories", "curated_trees")
     coh = compute(load(con, states))
     diagnostics(coh)
     if write:

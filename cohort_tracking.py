@@ -26,6 +26,8 @@ Library usage:
     cohorts = build_cohorts(df)
 """
 
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import sys
 
 import duckdb
@@ -450,23 +452,46 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
 # Standalone entry point
 # =============================================================================
 
+LOAD_COLS = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "estimated_age", "DRYBIO_AG",
+                       "TPA_UNADJ", "DAMSEV1", "DAMSEV2", "DSTRBCD1", "DSTRBCD2", "DSTRBCD3",
+                       "TRTCD1", "TRTCD2", "TRTCD3", "cond_stdorgcd"]
+
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "../FIASQLITE2PGSQL/FIADB.duckdb"
-
-    print(f"DB: {db_path}")
-    con = duckdb.connect(db_path)
-
-    print("[load] reading curated_trees ...")
-    df = con.execute("SELECT * FROM curated_trees").pl()
-    print(f"       {df.height:,} rows, {len(df.columns)} columns")
-
-    cohorts = build_cohorts(df)
-
-    con.register("_cohorts_view", cohorts)
-    con.execute("CREATE OR REPLACE TABLE curated_cohorts AS SELECT * FROM _cohorts_view")
-    con.unregister("_cohorts_view")
+    # curation-fix 2026-10-26: explicit paths (dbconn); cohort species = spcd_resolved
+    # (constant per tree) instead of the raw per-visit SPCD, which flips between confused
+    # species and split one tree over two cohorts; only the needed columns are loaded and
+    # states are processed one at a time (cohorts never cross a subplot), with cohort_id
+    # offset per state so ids stay unique.
+    import argparse
+    import dbconn
+    a = dbconn.add_db_args(argparse.ArgumentParser(description="cohort tracking")).parse_args()
+    dbconn.check_args(a)
+    con = dbconn.connect(a.out_db, a.fiadb)
+    dbconn.require_tables(con, "curated_trees")
+    cols = ", ".join(LOAD_COLS)
+    states = [r[0] for r in con.execute(
+        "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]
+    parts, offset = [], 0
+    for st in states:
+        print(f"\n----- STATECD {st} -----")
+        df = con.execute(f"SELECT {cols}, spcd_resolved AS SPCD FROM curated_trees "
+                         f"WHERE STATECD = {int(st)}").pl()
+        print(f"       {df.height:,} rows, {len(df.columns)} columns")
+        cohorts = build_cohorts(df)
+        cohorts = cohorts.with_columns((pl.col("cohort_id") + offset).cast(pl.UInt32))
+        offset = int(cohorts["cohort_id"].max() or offset) + 1
+        tab = f"_ct_{st}"
+        con.register("_cohorts_view", cohorts)
+        con.execute(f"CREATE OR REPLACE TABLE {tab} AS SELECT * FROM _cohorts_view")
+        con.unregister("_cohorts_view")
+        parts.append(tab)
+        del df, cohorts
+    con.execute("CREATE OR REPLACE TABLE curated_cohorts AS " +
+                " UNION ALL BY NAME ".join(f"SELECT * FROM {p}" for p in parts))
+    for p in parts:
+        con.execute(f"DROP TABLE {p}")
     con.commit()
-    print(f"\n[save] curated_cohorts → {cohorts.height:,} rows")
-
+    n = con.execute("SELECT COUNT(*) FROM curated_cohorts").fetchone()[0]
+    print(f"\n[save] curated_cohorts → {n:,} rows")
     con.close()
     print("[done]")

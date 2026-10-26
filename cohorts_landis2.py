@@ -33,6 +33,8 @@ Standalone usage:
     # default: ../FIASQLITE2PGSQL/FIADB.duckdb
 """
 
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import sys
 
 import duckdb
@@ -57,19 +59,13 @@ MIN_RATE_TREES    = 10   # min trees for species×epa_l3 rate; else fall back to
 # =============================================================================
 
 def _has_column(con, table: str, col: str) -> bool:
-    rows = con.execute(
-        "SELECT column_name FROM information_schema.columns "
-        f"WHERE table_name = '{table}'"
-    ).fetchall()
-    return col.lower() in {r[0].lower() for r in rows}
+    import dbconn
+    return col.lower() in dbconn.column_names(con, table)
 
 
 def _has_table(con, table: str) -> bool:
-    rows = con.execute(
-        "SELECT table_name FROM information_schema.tables "
-        f"WHERE table_name = '{table}'"
-    ).fetchall()
-    return len(rows) > 0
+    import dbconn
+    return dbconn.table_exists(con, table)
 
 
 # =============================================================================
@@ -106,9 +102,8 @@ def load_base_data(con) -> pl.DataFrame:
     df = con.execute(f"""
         SELECT
             t.STATECD, t.UNITCD, t.COUNTYCD, t.PLOT, t.SUBP, t.TREE,
-            t.SPCD,
+            t.spcd_resolved AS SPCD,               -- curation-fix: resolved species (was raw t.SPCD)
             t.MEASDATE,
-            t.MEASYEAR,
             ROUND(t.estimated_age)::INTEGER        AS age_calc,
             (t.DRYBIO_AG * t.TPA_UNADJ
              * {LBS_ACRE_TO_G_M2})::DOUBLE         AS agb,
@@ -116,7 +111,7 @@ def load_base_data(con) -> pl.DataFrame:
             {epa_l4_expr},
             {ecosubcd_col},
             r.SPECIES_SYMBOL::VARCHAR              AS species_symbol,
-            t.SPGRPCD::INTEGER                     AS spgrpcd,
+            COALESCE(t.spgrpcd_resolved, t.SPGRPCD)::INTEGER AS spgrpcd,
             r.MAJOR_SPGRPCD::INTEGER               AS major_spgrpcd,
             r.SFTWD_HRDWD::VARCHAR                 AS sftwd_hrdwd
         FROM curated_trees t
@@ -127,7 +122,7 @@ def load_base_data(con) -> pl.DataFrame:
             AND e.plot     = t.PLOT
         {ecosubcd_join}
         LEFT JOIN REF_SPECIES r
-            ON  r.SPCD = t.SPCD
+            ON  r.SPCD = t.spcd_resolved
         WHERE
             t.STATUSCD = 1
             AND t.estimated_age IS NOT NULL
@@ -191,10 +186,10 @@ def build_plot_meas_num(df: pl.DataFrame) -> pl.DataFrame:
     Julia filter 'plot_meas_num > 1' selects only longitudinal plots.
     """
     return (
-        df.select(PLOT_KEY + ["MEASYEAR"])
+        df.select(PLOT_KEY + ["MEASDATE"])
         .unique()
         .group_by(PLOT_KEY)
-        .agg(pl.col("MEASYEAR").n_unique().alias("plot_meas_num"))
+        .agg(pl.col("MEASDATE").n_unique().alias("plot_meas_num"))
     )
 
 
@@ -203,91 +198,10 @@ def build_plot_meas_num(df: pl.DataFrame) -> pl.DataFrame:
 # =============================================================================
 
 def _diagnose_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
-    """
-    Identify trees absent at the plot visit immediately before their debut but
-    appearing with an age larger than the gap to that visit — i.e., they were
-    already alive when the crew last visited and should have been tallied.
-
-    One row per phantom tree (at its debut measurement):
-      TREE_ID + SPCD + species_symbol
-      prev_plot_measyear  : latest plot visit before this tree appeared
-      first_tree_measyear : year this tree first appears in the data
-      age_calc            : tree's age at first appearance
-      expected_age_at_prev: age_calc - (first_tree_measyear - prev_plot_measyear)
-      agb
-    """
-    # All distinct plot measurement years (needed to find the previous visit)
-    plot_years = df.select(PLOT_KEY + ["MEASYEAR"]).unique()
-
-    # Tree's debut year
-    tree_first = (
-        df.group_by(TREE_ID)
-        .agg(pl.col("MEASYEAR").min().alias("first_tree_measyear"))
-    )
-
-    # Latest plot visit strictly before the tree's debut
-    prev_meas = (
-        tree_first
-        .join(plot_years, on=PLOT_KEY, how="left")
-        .filter(pl.col("MEASYEAR") < pl.col("first_tree_measyear"))
-        .group_by(TREE_ID)
-        .agg(pl.col("MEASYEAR").max().alias("prev_plot_measyear"))
-    )
-
-    # Work at the debut row only — one row per tree
-    debut = (
-        df
-        .join(tree_first, on=TREE_ID, how="left")
-        .filter(pl.col("MEASYEAR") == pl.col("first_tree_measyear"))
-        .join(prev_meas, on=TREE_ID, how="left")
-        # Phantom = there was a prior plot visit where this tree was absent
-        .filter(pl.col("prev_plot_measyear").is_not_null())
-        .with_columns(
-            (pl.col("age_calc") -
-             (pl.col("first_tree_measyear") - pl.col("prev_plot_measyear")))
-            .alias("expected_age_at_prev")
-        )
-        # Keep only trees that would have been alive at the previous visit
-        .filter(pl.col("expected_age_at_prev") > 0)
-        .select(
-            TREE_ID + ["SPCD", "species_symbol",
-                        "prev_plot_measyear", "first_tree_measyear",
-                        "age_calc", "expected_age_at_prev", "agb"]
-        )
-        .sort(PLOT_KEY + ["SUBP", "TREE"])
-    )
-
-    n_trees = debut.height
-    n_plots = debut.select(PLOT_KEY).unique().height
-
-    print(f"\n[phantom cohorts] {n_trees:,} trees / {n_plots:,} plots")
-
-    if n_trees == 0:
-        print("  none found")
-        return debut
-
-    ages = debut["expected_age_at_prev"]
-    print(f"  expected_age_at_prev_meas:  "
-          f"p10={ages.quantile(0.10):.0f}  p25={ages.quantile(0.25):.0f}  "
-          f"p50={ages.quantile(0.50):.0f}  p75={ages.quantile(0.75):.0f}  "
-          f"p90={ages.quantile(0.90):.0f}  max={ages.max():.0f}")
-
-    by_sp = (
-        debut.group_by("species_symbol")
-        .agg([
-            pl.struct(TREE_ID).n_unique().alias("n_trees"),
-            pl.col("expected_age_at_prev").mean().alias("mean_phantom_age"),
-        ])
-        .sort("n_trees", descending=True)
-        .head(15)
-    )
-    print("\n  top phantom species:")
-    for row in by_sp.iter_rows(named=True):
-        print(f"    {str(row['species_symbol']):<10s}  "
-              f"trees={row['n_trees']:>6,}  "
-              f"mean_phantom_age={row['mean_phantom_age']:.1f}")
-
-    return debut
+    """curation-fix: the MEASYEAR-based version was replaced by the MEASDATE-based one in
+    cohorts_landis (v1) — never extract/order by year."""
+    import cohorts_landis
+    return cohorts_landis._diagnose_phantom_cohorts(df)
 
 
 # =============================================================================
@@ -319,7 +233,7 @@ def compute_sim_year_ages(df: pl.DataFrame) -> pl.DataFrame:
 
     # Per-tree debut: rounded age and sim_year at first measurement
     debut = (
-        df.sort(TREE_ID + ["MEASYEAR"])
+        df.sort(TREE_ID + ["MEASDATE"])
         .unique(subset=TREE_ID, keep="first")
         .select(TREE_ID + [
             pl.col("age_calc").alias("_debut_age"),
@@ -358,7 +272,7 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
       grp_rates  : (spgrpcd,        epa_l3) → rate
       glb_rates  : (spgrpcd)                → rate
     """
-    srt = df.sort(TREE_ID + ["MEASYEAR"])
+    srt = df.sort(TREE_ID + ["MEASDATE"])
 
     first = (
         srt.unique(subset=TREE_ID, keep="first")
@@ -433,15 +347,14 @@ def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
     """
     # One row per tree at its earliest measurement
     tree_debut = (
-        df.sort(TREE_ID + ["MEASYEAR"])
+        df.sort(TREE_ID + ["MEASDATE"])
         .unique(subset=TREE_ID, keep="first")
     )
 
     # All distinct subplot measurement visits (sim_year for integer age arithmetic)
     subp_visits = (
-        df.select(SUBPLOT_ID + ["MEASDATE", "MEASYEAR", "sim_year"]).unique()
-        .rename({"MEASDATE": "prior_measdate", "MEASYEAR": "prior_measyear",
-                 "sim_year": "prior_sim_year"})
+        df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
+        .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"})
     )
 
     # Cross-join each debut tree with all prior subplot visits, compute prior age
@@ -450,7 +363,7 @@ def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
     prior = (
         tree_debut
         .join(subp_visits, on=SUBPLOT_ID, how="left")
-        .filter(pl.col("prior_measyear") < pl.col("MEASYEAR"))
+        .filter(pl.col("prior_measdate") < pl.col("MEASDATE"))   # curation-fix: MEASDATE, not MEASYEAR
         .with_columns(
             (pl.col("age_calc") + pl.col("prior_sim_year") - pl.col("sim_year"))
             .cast(pl.Int32).alias("prior_age")
@@ -515,10 +428,9 @@ def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
     # Build synthetic rows: swap debut date/year/age/agb/sim_year with prior values
     synthetic = (
         missing
-        .drop(["MEASDATE", "MEASYEAR", "age_calc", "agb", "sim_year"])
+        .drop(["MEASDATE", "age_calc", "agb", "sim_year"])
         .rename({
             "prior_measdate": "MEASDATE",
-            "prior_measyear": "MEASYEAR",
             "prior_age":      "age_calc",
             "prior_sim_year": "sim_year",
             "prior_agb":      "agb",
@@ -762,13 +674,21 @@ def attach_land_use_and_cycle(con) -> None:
 # =============================================================================
 
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "../FIASQLITE2PGSQL/FIADB.duckdb"
-    attach_only = "--attach-only" in sys.argv      # skip the heavy rebuild; only add land_use+cycle
+    # curation-fix 2026-10-26: explicit --out-db/--fiadb (dbconn). The production table is
+    # built by cohorts_landis.py (v1: sim_year + subp_meas_num); this script is used with
+    # --attach-only to add land_use + cycle. Its own full build is kept (MEASDATE-fixed).
+    import argparse
+    import dbconn
+    ap = dbconn.add_db_args(argparse.ArgumentParser(description="cohorts_landis2"))
+    ap.add_argument("--attach-only", action="store_true",
+                    help="skip the rebuild; only add land_use + cycle")
+    a = ap.parse_args()
+    dbconn.check_args(a)
+    con = dbconn.connect(a.out_db, a.fiadb)
+    print(f"DB: {a.out_db}")
 
-    print(f"DB: {db_path}")
-    con = duckdb.connect(db_path)
-
-    if not attach_only:
+    if not a.attach_only:
+        dbconn.require_tables(con, "curated_trees", "curated_cohorts")
         cohorts = build_cohorts_landis(con)
         con.register("_landis_view", cohorts)
         con.execute(
@@ -778,6 +698,12 @@ if __name__ == "__main__":
         con.commit()
         print(f"\n[save] curated_cohorts_landis → {cohorts.height:,} rows")
 
+    dbconn.require_tables(con, "curated_cohorts_landis", "tree_trajectories", "base_subplot_cond")
+    have = dbconn.column_names(con, "curated_cohorts_landis")
+    drop = [c for c in ("land_use", "cycle") if c in have]
+    if drop:   # idempotent re-attach
+        con.execute("CREATE OR REPLACE TABLE curated_cohorts_landis AS "
+                    f"SELECT * EXCLUDE ({', '.join(drop)}) FROM curated_cohorts_landis")
     attach_land_use_and_cycle(con)
 
     con.close()

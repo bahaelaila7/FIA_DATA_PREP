@@ -22,6 +22,9 @@ Library usage (after run_pipeline has populated curated_trees):
     df = run_age_imputation(con, df)
 """
 
+import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import os
 import sys
 
 import duckdb
@@ -32,7 +35,10 @@ from sklearn.metrics import r2_score
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import OrdinalEncoder
 
-from fia_curation_v2 import (
+# curation-fix 2026-10-26: was `from fia_curation_v2 import ...` — v2's anchor selection is
+# the old youngest-candidate rule; v3 carries the median-anchor fix.
+from fia_curation_v3 import (
+    FIX_COLUMNS,
     SUBPLOT_ID,
     _compute_tree_bounds,
     _select_best_anchor,
@@ -46,6 +52,7 @@ TREE_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE"]
 _NUM_COLS = ["DIA", "HT", "CR", "CCLCD", "cond_alstkcd"]
 _CAT_COLS = ["major_spgrpcd", "epa_l3"]
 _ALL_COLS = _NUM_COLS + _CAT_COLS
+N_JOBS = int(os.environ.get("FIA_N_JOBS", "3"))
 
 
 # =============================================================================
@@ -173,7 +180,7 @@ def fit_age_model(df: pl.DataFrame) -> tuple:
     train_rmse = np.sqrt(
         np.mean((np.expm1(model.predict(X)) - np.expm1(y)) ** 2)
     )
-    cv_r2 = cross_val_score(model, X, y, cv=5, scoring="r2", n_jobs=-1)
+    cv_r2 = cross_val_score(model, X, y, cv=5, scoring="r2", n_jobs=N_JOBS)  # shared box: bounded
     print(f"         train RMSE : {train_rmse:.1f} yr")
     print(f"         5-fold CV R²: {cv_r2.mean():.3f} ± {cv_r2.std():.3f}")
 
@@ -291,59 +298,73 @@ def run_age_imputation(con, df: pl.DataFrame,
 # Standalone entry point
 # =============================================================================
 
-def _save(con, df: pl.DataFrame, snapshots: pl.DataFrame):
-    con.register("_df_view", df)
-    con.execute("CREATE OR REPLACE TABLE curated_trees AS SELECT * FROM _df_view")
-    con.unregister("_df_view")
+TRAIN_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "STATUSCD", "age_source",
+              "estimated_age", "DIA", "HT", "CR", "CCLCD", "cond_alstkcd"]
 
-    con.register("_snap_view", snapshots)
-    con.execute("CREATE OR REPLACE TABLE curated_snapshots AS SELECT * FROM _snap_view")
-    con.unregister("_snap_view")
 
-    con.commit()
-    print(f"[save] curated_trees    → {df.height:,} rows")
-    print(f"[save] curated_snapshots → {snapshots.height:,} rows")
+def _order_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Old curated_trees column order first, curation-fix columns last."""
+    fix = [c for c in FIX_COLUMNS if c in df.columns]
+    return df.select([c for c in df.columns if c not in fix] + fix)
 
 
 if __name__ == "__main__":
-    db_path = sys.argv[1] if len(sys.argv) > 1 else "../data_eco_cohorts.duckdb"
-
+    # curation-fix 2026-10-26: explicit --out-db/--fiadb (dbconn); the model is fitted ONCE
+    # on the training columns of all states in the DB, then applied state by state (bounded
+    # memory) — every age rule is tree-local, so this equals a single pass.
+    import argparse
+    import dbconn
+    a = dbconn.add_db_args(argparse.ArgumentParser(description="age imputation")).parse_args()
+    dbconn.check_args(a)
+    con = dbconn.connect(a.out_db, a.fiadb)
+    dbconn.require_tables(con, "curated_trees", "clean_subplot_years",
+                          "base_subplot_cond", "longitudinal_subplots", "excluded_tree_ids")
     print("=" * 70)
     print("Age Imputation Pipeline")
-    print(f"DB: {db_path}")
+    print(f"DB: {a.out_db}")
     print("=" * 70)
 
-    con = duckdb.connect(db_path)
+    cols = ", ".join(TRAIN_COLS)
+    train_df = attach_modeling_context(con, con.execute(f"SELECT {cols} FROM curated_trees").pl())
+    model, enc = fit_age_model(train_df)
+    del train_df
 
-    print("[load] reading curated_trees ...")
-    df = con.execute("SELECT * FROM curated_trees").pl()
-    print(f"       {df.height:,} rows, {len(df.columns)} columns")
+    if "age_from_model" in dbconn.column_names(con, "curated_trees"):
+        sys.exit("curated_trees already has age_from_model — re-run fia_curation_v3 first")
+    scaffold_all = build_subplot_year_scaffold(con)
+    states = [r[0] for r in con.execute(
+        "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]
+    parts_t, parts_s = [], []
+    for st in states:
+        print(f"\n----- STATECD {st} -----")
+        df = con.execute(f"SELECT * FROM curated_trees WHERE STATECD = {int(st)}").pl()
+        all_subplot_years = con.execute(f"""
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE
+            FROM clean_subplot_years WHERE STATECD = {int(st)}
+        """).pl()
+        df = attach_modeling_context(con, df)
+        tree_bounds = _compute_tree_bounds(df, all_subplot_years)
+        df = _order_columns(apply_age_model(df, model, enc, tree_bounds))
 
-    all_subplot_years = con.execute("""
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE
-        FROM clean_subplot_years
-    """).pl()
+        scaffold = scaffold_all.filter(pl.col("STATECD") == st)
+        ever_live = (df.filter((pl.col("STATUSCD") == 1) & pl.col("DRYBIO_AG").is_not_null())
+                     .select(SUBPLOT_ID).unique())
+        snapshots = build_snapshots(df, scaffold.join(ever_live, on=SUBPLOT_ID, how="semi"))
+        for name, frame, parts in (("t", df, parts_t), ("s", snapshots, parts_s)):
+            tab = f"_ai_{name}_{st}"
+            con.register("_part", frame)
+            con.execute(f"CREATE OR REPLACE TABLE {tab} AS SELECT * FROM _part")
+            con.unregister("_part")
+            parts.append(tab)
+        con.commit()
+        del df, snapshots
 
-    df = run_age_imputation(con, df, all_subplot_years)
-
-    # Rebuild snapshots so estimated_age groupings reflect the imputed ages.
-    # build_subplot_year_scaffold uses the SQL tables created by run_pipeline
-    # (base_subplot_cond, clean_subplot_years, longitudinal_subplots,
-    #  excluded_tree_ids) which remain in the database across runs.
-    scaffold = build_subplot_year_scaffold(con)
-    ever_live = (
-        df.filter(
-            (pl.col("STATUSCD") == 1) & pl.col("DRYBIO_AG").is_not_null()
-        )
-        .select(SUBPLOT_ID).unique()
-    )
-    n_before  = scaffold.height
-    scaffold  = scaffold.join(ever_live, on=SUBPLOT_ID, how="semi")
-    print(f"[scaffold] {scaffold.height:,} rows "
-          f"(dropped {n_before - scaffold.height:,} non-forested subplot-years)")
-
-    snapshots = build_snapshots(df, scaffold)
-
-    _save(con, df, snapshots)
+    for target, parts in (("curated_trees", parts_t), ("curated_snapshots", parts_s)):
+        union = " UNION ALL BY NAME ".join(f"SELECT * FROM {p}" for p in parts)
+        con.execute(f"CREATE OR REPLACE TABLE {target} AS {union}")
+        for p in parts:
+            con.execute(f"DROP TABLE {p}")
+        con.commit()
+        print(f"[save] {target} -> {con.execute(f'SELECT COUNT(*) FROM {target}').fetchone()[0]:,} rows")
     con.close()
     print("[done]")
