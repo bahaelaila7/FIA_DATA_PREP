@@ -53,12 +53,12 @@ allow-list rather than `search_path`, which would expose them. Helpers: `table_e
 | `SUBP_STATUS_CD <> 3` | **SUBP ≤ 4** (the national design; SUBP > 4 rows are auxiliary/regional points with NULL status), `SUBP_STATUS_CD IS DISTINCT FROM 3`, P2A records (`P2A_GRM_FLG='Y'`) excluded explicitly. The annual survey filter and the REF_SPECIES join are unchanged |
 | anchor = smallest "max-age violation" (picked the youngest candidate 78 % of the time, −2.7 yr) | anchor age = **median** of the candidates' implied ages at first measurement. Anchor date = the candidate closest to the median. The "crew was there and didn't see it" bound is not used for selection (it is wrong for every new-tree class). `max_viol` is kept as a diagnostic |
 | estage (Tree_Age) used at any size | an estage record is a candidate only if **DIA ≥ 5 in and Tree_Age > 1** (`ESTAGE_MIN_DIA`/`ESTAGE_MIN_AGE`). About 42 % of AL live 1–3 in saplings that have a Tree_Age carry Tree_Age ≤ 1 (≈45 % by the auditor's count), with a hard step at 5 in. Saplings get their age from a later ≥5 in record of the same tree (propagated back) or from the age model. `estage_raw` keeps the raw value. **Field scale (I2, user decision)**: every age follows the FIA field scale (TOTAGE, or STDAGE where the tree qualifies), and every estage candidate uses `estage_mapped` = f_g(Tree_Age); see "Field-age scale" below |
-| `final_tree_fate` was computed and discarded | returned: last dead/cut fate · `censored_<last reason>` · `diverted_landuse` · `disappeared_inferred_removal` · `alive`. `diverted_landuse` = the subplot is revisited but the land left forest: a later live record on a nonforest/water condition (`tree_landuse_exits`), or the next visit is entirely nonforest. `dead_at_first_visit` flags a tree that was already dead at the subplot's first visit (no observed mortality) |
+| `final_tree_fate` was computed and discarded | returned: FIRST dead/cut fate (r3) · `censored_<last reason>` · `diverted_landuse` · `disappeared_inferred_removal` · `alive`. `diverted_landuse` = the subplot is revisited but the land left forest: a later live record on a nonforest/water condition (`tree_landuse_exits`), or the next visit is entirely nonforest. `dead_at_first_visit` flags a tree that was already dead at the subplot's first visit (no observed mortality) |
 | harvest_inferred for any STATUSCD 2 on a TRTCD=10 condition without explicit cut markers | only when **AGENTCD is NULL**. A recorded agent 10–70 is FIA's own mortality call: all 152 AL harvest_inferred vs GRM MORTALITY disagreements had one. GRM CUT→harvest / MORTALITY→dead agreement is now 1.0000 (AL, KY) |
 | snapshots by raw SPCD | `curated_snapshots` grouped by `spcd_resolved` / `spgrpcd_resolved` |
 | — | `spgrpcd_resolved`; area proportions for consumer-side normalisation (`cond_condprop_unadj`, `cond_subpprop_unadj`, `cond_micrprop_unadj`, `cond_macrprop_unadj`, `subp_subpcond_prop`, `subp_micrcond_prop`, `subp_macrcond_prop`, `subp_forest_*_prop`, `subp_has_cond_status3`, `cond_status_cd`) |
 
-The 26 new curated_trees columns (incl. `estage_mapped`, `age_domain`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
+The 30 new curated_trees columns (incl. `estage_mapped`, `age_domain`, `rerecord_dead`, `tree_key_split`, `prev_status_cd`, `prev_tre_cn`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
 schema (names, types, order) is an exact prefix. The polars steps run one state at a time. Every
 rule is tree-, subplot- or condition-local, so this matches a single pass. Only the diagnostic
 `spcd_confusion_cluster` id is state-local. `age_imputation` fits its model once over all states
@@ -151,7 +151,8 @@ copied into the curated DB, so the slim builder can use it as its `--fiadb`) →
   - (a) no cohort-pass phantom whose members are all individually blocked;
   - (b) residual unrecorded saplings per state × MANUAL transition and per plot-visit stay
     below the re-tally rule, and only truly unrecorded saplings are censored;
-  - (c) GRM CUT→harvest / MORTALITY→dead agreement ≥ 99 %;
+  - (c1/c2/c3) fates from the FIRST raw dead/cut record, re-records never produce events,
+    land-clearing cuts are `diverted_landuse` (r3; replaces the circular GRM check);
   - (d) median age monotone in DIA class (1–3/3–5/5–7/7–9 in) for the top-25 species;
   - (h) pre-registered age step (3–5→5–7 in ≤ 2 × the 5–7→7–9 step + 2 yr), enforced for
     planted strata with ≥ 50 condition-visits; INFO otherwise (see the decision above);
@@ -330,6 +331,129 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
   `censored_procedural_unrecorded`.
 - The AL cohort pass went from 1,039 phantoms to 62. The tree pass grew because candidates now
   come from the full scaffold.
+
+### Round-3 audit (2026-10-26; GA/TN/FL audit, whole-state AL, KY, GA, TN, FL)
+- **I1 — re-records.** A dead/cut record with PREV_STATUS_CD = 2, or any dead/cut record
+  after the tree's first one, is a re-record of an earlier death. It is kept but flagged
+  `rerecord_dead`.
+  - Every fate, cause and harvest rule uses the FIRST dead/cut record: `final_tree_fate`,
+    `terminal_fate` / `death_cause` / `row_disturbed` (trajectories), and `harvest_inferred`,
+    which is never applied to a re-record. Explicit-harvest condition-years count first
+    records only.
+  - Re-records never create events: cohort_tracking interval events (hence `subp_has_dstrb`),
+    cut events, snapshots fate counts.
+  - Before → after:
+
+    | | GA | TN |
+    |---|---|---|
+    | Re-records labelled harvest_inferred | 54 → 0 | 58 → 0 |
+    | Trees last-record dead → first-record harvest_explicit | 345 | 211 |
+    | Trees last-record dead → first-record harvest_inferred | 730 | 413 |
+    | Sim A `subp_has_dstrb` subplots | 12,977 → 11,960 | 4,797 → 4,198 |
+
+    The auditor's measure of subplots flagged only by re-records was 221 in GA. The verifier
+    (c2) now finds 0 `subp_has_dstrb` subplots without a first dead/cut record.
+- **I2 — STAND-REPLACING resets only.** A reset is either an STDAGE drop with ≥ 50 % loss of
+  live trees or live BA since the previous visit, or TRTCD 10 together with TRTCD 30/40 or
+  with that loss. TRTCD 10 alone (also at a condition's first visit) and STDAGE drops without
+  the loss are not resets. Pre-reset trees never inherit STDAGE (the `pre_reset & ~survived`
+  branch is gone).
+  - **Resets by reason** (stdage_drop_with_loss / cut_with_regen / cut_with_loss; not resets:
+    drop-only / TRTCD-10-only):
+
+    | State | Resets | Not resets |
+    |---|---|---|
+    | AL | 1,518 / 2,310 / 2,030 | 974 / 1,918 |
+    | KY | 204 / 214 / 179 | 837 / 695 |
+    | GA | 2,182 / 2,366 / 2,889 | 1,420 / 3,189 |
+    | TN | 413 / 478 / 429 | 992 / 804 |
+    | FL | 766 / 612 / 912 | 499 / 720 |
+
+  - **Calibration set** (live ≥ 5 in with Tree_Age > 1 and a field age), planted vs natural
+    post-reset:
+
+    | State | Planted | Natural post-reset | Old set (planted / reset) |
+    |---|---|---|---|
+    | AL | 81.9 % | 18.1 % | – |
+    | KY | 28.2 % | 71.8 % (n 5,401) | – |
+    | GA | 92.4 % | 7.6 % | 147,846 / 101,991 |
+    | TN | 63.1 % | 36.9 % | 13,430 / 57,488 |
+    | FL | 97.2 % | 2.8 % | 62,722 / 26,596 |
+
+  - **Within-condition-visit SD**, field age vs raw TreeAge vs DIA: the field age is a stand
+    age (SD 0.0–0.4 yr), while TreeAge has SD 3.6–14.8 yr and DIA 1.3–3.4 in.
+- **I3 — age model.**
+  - **Outlier rule**: the per-source p90 trim is replaced by a robust rule (drop only targets
+    > p99.5 of the source, or > 3× the source's DIA-class median). The CV is scored on ALL
+    rows; `age_model_cv` holds MAE and bias by age decile and DIA class. The young bias of the
+    oldest field decile remains (AL d10 −18.4 yr, GA −16.8 yr; mapped d10 −6.2 / −8.0).
+  - **TreeAge coverage**: every tree with a valid TreeAge record at ANY measurement carries the
+    propagated estage on all its records (check (i), 0 exceptions). The model share of ≥ 5 in
+    records in 2017+ (16–22 %) and GA 1997–98 (57 %) is trees that have no TreeAge record at
+    all.
+  - **Pre-registered (j)**, median model − mapped-estage gap within ±3 yr per state × stratum ×
+    DIA class (≥ 200 trees): passes everywhere except **KY planted 5–10 in (−3.2, 512 trees)
+    and FL planted 15+ in (−5.1, 357 trees)**. These are reported as FAIL and were NOT tuned.
+- **I6 — independent age truth (SITETREE).**
+  - **Linkage**: AGEDIA = breast-height age. SITETREE has no TRE_CN, so trees are linked by
+    PLT_CN + SUBP + TREE with the same SPCD and |ΔDIA| ≤ 1 in, else by the unique live tally
+    tree with the same PLT_CN + CONDID + SPCD + DIA. About 20 % of aged site trees link.
+  - **Truth**: AGEDIA + 2 yr (softwood) / 5 yr (hardwood) to breast height. This is an
+    audit-specified rule of thumb; FIADB has no years-to-breast-height field.
+  - **Selection bias**: site trees are dominant / codominant, free-growing trees.
+  - **Results**, median bias of the final age (raw TreeAge in brackets):
+
+    | State | Planted | Natural |
+    |---|---|---|
+    | AL | −0.9 (raw +12.0), n 1,253 | **−15.5** (raw +2.0), n 3,648 |
+    | KY | +1.5, n 17 | −5.8 (raw −5.0) |
+    | GA | +1.9 (raw +7.0) | −6.7 (raw +4.0) |
+    | TN | −0.3 (raw +7.0) | −7.0 (raw −1.0) |
+    | FL | +0.8 (raw +5.0) | −3.3 (raw 0.0); mapped MAE 12.2 vs raw 10.0 |
+
+  - **Reading**: planted strata are enforced (|bias| ≤ 5) and pass. In NATURAL stands the
+    field-scale ages are biased young against bored ages, while the raw TreeAge is closer: the
+    field-age truth available for natural stands (post-reset STDAGE) does not represent
+    uneven-aged stands. This is INFO under the ACCEPT + FLAG decision, and these are the
+    records marked `natural_uncalibrated`.
+- **I4**: `n_trees_natural_uncalibrated`, `share_natural_uncalibrated` (AGB-weighted) and
+  `age_source_major` (dominant source by AGB) are appended to curated_cohorts_landis, _stdorg
+  and _simB, before `procedural_break`. Phantom rows inherit them from their source tree. The
+  slim builder carries them; old columns are unchanged.
+- **I5**: every MEASDATE is `MAKE_DATE(MEASYEAR, COALESCE(NULLIF(MEASMON,0),6),
+  COALESCE(NULLIF(MEASDAY,0),15))`. Periodic plots have MEASDAY = 0, which crashed the GA
+  verifier. The verifier's raw TREE ⋈ PLOT reads also carry the annual-survey filter.
+- **Check changes**:
+  - (b) is threshold-independent: in EVERY transition with ≥ 20 saplings, at most 5 % may be
+    unrecorded and uncensored. The maximum in AL is 0.25 %.
+  - (c) is replaced by (c1) first raw dead/cut record (100 % agreement), (c2) re-records and
+    (c3) diversions.
+  - (d) is enforced for planted stands only, INFO for natural (same ACCEPT + FLAG rationale as
+    (h); KY natural has 2/25 species non-monotone).
+- **M1**: Sim B keeps the Sim A / trajectory time axis: sim_year and age_calc are computed on
+  all live rows over the full scaffold BEFORE saplings are dropped. 0 drops misaligned. The
+  remaining unmatched drops are sapling-only cohorts that are absent from Sim B by design
+  (AL 346 / 6,666).
+- **M2**: sim_year is strictly increasing per subplot (`sim_year_map`: s_i = max(raw_i,
+  s_{i−1} + 1) on the full scaffold). It is shared by Sim A, Sim B, trajectory phantoms and
+  gap slots. Gap slots at visits with no live row used to get a NULL sim_year.
+- **M3**: a reused tree number starts a new tree (TREE + 100000·k) when the key's previous
+  record was dead/cut and PREV_TRE_CN is null, or PREV_TRE_CN points elsewhere
+  (`tree_key_split`). GA: 352 trees on split keys; AL: 10.
+- **M4**: DSTRBCD 60 is not a disturbance in cohort_tracking either.
+- **M5**: the age model and the calibration use the major group of `spcd_resolved`.
+- **M6**: a cut record on a condition that is no longer forest (COND_STATUS 2–4) is
+  `diverted_landuse`, decided by condition status rather than GRM. Diversions are excluded
+  from cut events and from cohort_disturbance. GA 7,110 cut records (7,108 trees were
+  harvest_explicit), TN 2,800. (c3): 100 % of such first records are diverted.
+- **Suspected RC3 duplicates (confirmed, fixed)**: RC3 ≥ 5 in debuts that pair with a
+  same-subplot, same-species RC7/RC8 closure (|PREVDIA − DIA| ≤ 2 in) at the debut visit are
+  the same tree re-tallied. They now get no backfill (rule a). GA a26: 41 → 0.
+- **Zombie trees**: trees recorded dead before their live debut get no phantom at or before
+  that dead record, and no interpolation across a dead record. This fixed 8 AL slots.
+- **Verifier totals**: AL 36 PASS / 7 INFO / 0 FAIL; GA 0 FAIL; TN 0 FAIL; KY and FL 1 FAIL
+  each (pre-registered (j)). Determinism (steps 4–7 rerun) is EXCEPT-identical in all five
+  states.
 
 ---
 

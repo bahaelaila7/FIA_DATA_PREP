@@ -38,6 +38,7 @@ from cohorts_landis import (
     PLOT_KEY, SUBPLOT_ID, TREE_ID,
     MIN_BACKFILL_AGB,
     compute_sim_year_ages,
+    sim_year_map,
     estimate_sapling_growth_rates,
     _has_column,
     BF_FLAGS,
@@ -105,6 +106,7 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
             {cycle_col},
             t.STATUSCD, t.tree_fate, t.AGENTCD, t.RECONCILECD,
             t.reconcile_new::INTEGER AS reconcile_new,          -- curation-fix 2026-10-26
+            t.rerecord_dead,
             t.RECONCILECD::INTEGER   AS rc_obs,
             t.censor_measdate, t.censor_reason,
             t.censor_last_measdate, t.censor_last_reason,
@@ -194,13 +196,12 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
     """
     # sim_year for any scaffold visit, anchored to the same per-subplot first
     # live MEASDATE that compute_sim_year_ages used.
-    subp_first = live.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_f"))
+    # r3 M2: the SAME strict per-subplot axis as compute_sim_year_ages (sim_year_map)
+    subp_first = live.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_first_measdate"))
     visit_sim = (
-        visits.join(subp_first, on=SUBPLOT_ID, how="inner")
-        .with_columns(
-            ((pl.col("MEASDATE") - pl.col("_f")).dt.total_days() / 365.25)
-            .round(0).cast(pl.Int32).alias("prior_sim_year"))
-        .select(SUBPLOT_ID + [pl.col("MEASDATE").alias("prior_measdate"), "prior_sim_year"])
+        sim_year_map(pl.concat([live.select(SUBPLOT_ID + ["MEASDATE"]),
+                                visits.select(SUBPLOT_ID + ["MEASDATE"])]), subp_first)
+        .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"})
     )
 
     tree_debut = live.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
@@ -277,8 +278,8 @@ def build_live_body(df: pl.DataFrame, visits: pl.DataFrame, ctx=None) -> pl.Data
     )
     print(f"[body] {live.height:,} live aged records")
 
-    live = compute_sim_year_ages(live)             # integer sim_year + exact age_calc
-    live = add_backfill_flags(live)
+    live = compute_sim_year_ages(live, visits)     # strict integer sim_year on the full scaffold
+    live = add_backfill_flags(live, ctx)
     live = backfill_phantom_full(live, visits, ctx)  # full-scaffold backward backfill
     return live.drop(BF_FLAGS)
 
@@ -302,7 +303,11 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
         pl.col("MEASDATE").max().alias("_last"),
     )
     # sim_year for any subplot visit (taken from already-computed rows)
-    sy_map = live.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
+    # r3: sim_year of ANY scaffold visit on the strict axis (a gap visit may have no live row
+    # of any tree — it used to get a null sim_year / age_calc)
+    sy_map = sim_year_map(
+        pl.concat([live.select(SUBPLOT_ID + ["MEASDATE"]), visits.select(SUBPLOT_ID + ["MEASDATE"])]),
+        real.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_first_measdate")))
 
     # candidate gap slots: subplot visits between first & last real record
     cand = (
@@ -449,12 +454,15 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
                            landuse_exits: pl.DataFrame | None = None) -> pl.DataFrame:
     """Per tree, derive terminal_fate + death_cause from its last real record and
     whether the subplot was visited again afterwards."""
-    last = (
-        full.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
-        .select(TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "AGENTCD",
-                           "row_disturbed", "censor_last_measdate", "censor_last_reason"])
-        .rename({"MEASDATE": "terminal_measdate"})
-    )
+    # r3 I1: the terminal record is the FIRST dead/cut record when the tree has one (later
+    # dead records are re-records of the same death); otherwise the last (live) record
+    cols = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "AGENTCD",
+                      "row_disturbed", "censor_last_measdate", "censor_last_reason"]
+    first_dead = (full.filter(pl.col("STATUSCD").is_in([2, 3]))
+                  .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first").select(cols))
+    last_live = (full.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last").select(cols)
+                 .join(first_dead.select(TREE_ID), on=TREE_ID, how="anti"))
+    last = pl.concat([first_dead, last_live]).rename({"MEASDATE": "terminal_measdate"})
     # was the subplot visited strictly after the tree's last record, and was that next
     # visit entirely nonforest / did the tree turn up live on a nonforest/water condition
     # (r2 M6 -> diverted_landuse)?
@@ -474,8 +482,8 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
     is_dist = pl.col("AGENTCD").is_in(DISTURBANCE_AGENTS) | pl.col("row_disturbed")
 
     last = last.with_columns(
-        pl.when(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred"]))
-            .then(pl.col("tree_fate"))
+        pl.when(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred", "diverted_landuse"]))
+            .then(pl.col("tree_fate"))      # r3 M6: a cut on now-nonforest land = diverted_landuse
         .when((pl.col("STATUSCD") == 2) & is_dist)
             .then(pl.lit("dead_disturbance"))
         .when(pl.col("STATUSCD") == 2)
@@ -527,7 +535,8 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     """
     # cut trees: harvest fate; cut happens at the harvest record's MEASDATE
     cut_rows = (
-        full.filter(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred"]))
+        full.filter(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred"])
+                    & ~pl.col("rerecord_dead"))      # r3 I1: re-records are not cut events
         .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
         .select(TREE_ID + ["CONDID", "MEASDATE"])
         .rename({"MEASDATE": "cut_measdate"})
@@ -686,7 +695,10 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     ws = f"AND STATECD IN ({','.join(map(str, states))})" if states else ""
     censor_events = con.execute(f"""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS _cdate
-        FROM tree_censor_events WHERE TRUE {ws}""").pl()
+        FROM tree_censor_events WHERE TRUE {ws}
+        UNION ALL   -- r3: never interpolate a 'live' slot across / at a dead record (data errors)
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE
+        FROM curated_trees WHERE STATUSCD IN (2, 3) {ws}""").pl()
     body = interpolate_gaps(body, visits, censor_events)
     body = body.with_columns(pl.col("intro_type").fill_null("real"))
 

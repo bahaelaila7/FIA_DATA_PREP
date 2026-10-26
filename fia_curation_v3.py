@@ -69,9 +69,7 @@ def sql_base_measurements(con, scope: str = ""):
     SELECT
         SUBP.STATECD, SUBP.UNITCD, SUBP.COUNTYCD, SUBP.PLOT, SUBP.INVYR, SUBP.SUBP,
         C.CONDID,
-        MAKE_DATE(P.MEASYEAR,
-                  COALESCE(CAST(P.MEASMON AS INTEGER), 6),
-                  COALESCE(P.MEASDAY, 15)) AS MEASDATE,
+        MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS MEASDATE,
         P.DESIGNCD, P.CYCLE,
         SUBP.SUBP_STATUS_CD,
         C.COND_STATUS_CD,
@@ -218,8 +216,7 @@ def _sql_procedural_breaks(con, scope: str = ""):
     CREATE OR REPLACE TEMP TABLE _pv AS
     SELECT P.CN AS PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.MANUAL,
            P.PLOT_STATUS_CD,
-           MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER), 6),
-                     COALESCE(P.MEASDAY, 15)) AS MEASDATE
+           MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS MEASDATE
     FROM PLOT P JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
     WHERE P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope};
     CREATE OR REPLACE TEMP TABLE _pv2 AS
@@ -332,8 +329,7 @@ def sql_excluded_trees(con, scope: str = ""):
     DROP TABLE IF EXISTS tree_status0_events;
     CREATE TABLE tree_status0_events AS
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, T.INVYR,
-           MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER), 6),
-                     COALESCE(P.MEASDAY, 15)) AS MEASDATE,
+           MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS MEASDATE,
            CAST(T.RECONCILECD AS INTEGER) AS RC, T.PREVDIA
     FROM TREE T
     JOIN PLOT P ON P.CN = T.PLT_CN
@@ -382,8 +378,7 @@ def sql_excluded_trees(con, scope: str = ""):
     DROP TABLE IF EXISTS tree_landuse_exits;
     CREATE TABLE tree_landuse_exits AS
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE,
-           MIN(MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER), 6),
-                         COALESCE(P.MEASDAY, 15))) AS exit_measdate
+           MIN(MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15))) AS exit_measdate
     FROM TREE T
     JOIN PLOT P ON P.CN = T.PLT_CN
     JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
@@ -429,9 +424,10 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
 
     curation-fix 2026-10-26 record rules (FIADB v9.4):
       * live trees (STATUSCD=1) must be on their OWN condition with COND_STATUS_CD=1
-        (accessible forest). Dead/cut records (STATUSCD 2/3) are kept on COND_STATUS_CD 1
-        or 2: a tree removed by land clearing sits on the now-nonforest condition, and
-        dropping that record would mislabel the removal as an unexplained disappearance;
+        (accessible forest). Dead/cut records (STATUSCD 2/3) are kept on COND_STATUS_CD 1-4
+        (forest, nonforest, water): a tree removed by land clearing sits on the now-nonforest
+        condition, and dropping that record would mislabel the removal as an unexplained
+        disappearance (it becomes 'diverted_landuse', r3 M6);
       * the STATUSCD=0 record itself is dropped (its information is carried as censoring /
         RC7 columns via tree_reconcile_events);
       * records BEFORE a STATUSCD=0 + RECONCILECD=7 event are dropped (erroneous tally);
@@ -450,6 +446,7 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
         T.CN,
         CSY.MEASDATE, CSY.CYCLE,
         T.CONDID, T.STATUSCD, T.RECONCILECD, T.AGENTCD,
+        T.PREV_STATUS_CD AS prev_status_cd, CAST(T.PREV_TRE_CN AS VARCHAR) AS prev_tre_cn,
         T.SPCD, T.SPGRPCD, SP.STOCKING_SPGRPCD, SP.JENKINS_SPGRPCD,
         T.DIA, T.HT, T.ACTUALHT, T.CR, T.CCLCD,
         T.DRYBIO_AG, T.CARBON_AG, T.TPA_UNADJ,
@@ -537,6 +534,36 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
     df = df.sort(TREE_ID + ["MEASDATE"])
     print(f"[step4] loaded {df.height:,} tree-measurements into polars")
     return df
+
+
+TREE_SPLIT_OFFSET = 100_000   # R4 TREE numbers are < 61,000
+
+
+def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    r3 M3 — tree-number reuse. A tree key (STATECD..SUBP, TREE) can be re-used for a new tree,
+    e.g. a dead tree's number given to a new RC1 tree. Following the PREV_TRE_CN chain, a record
+    starts a NEW tree when the key's previous record (in this table)
+      * was dead/cut and this record's PREV_TRE_CN is NULL, or
+      * is a different CN than this record's PREV_TRE_CN.
+    Later segments get TREE + k * TREE_SPLIT_OFFSET (k = 1, 2, ...); every record of a split key
+    has tree_key_split = TRUE. (Censoring / RC7 columns joined by the original key stay on all
+    segments; fates use their dates relative to each segment's own records.)
+    """
+    d = df.sort(TREE_ID + ["MEASDATE"]).with_columns([
+        pl.col("CN").cast(pl.Utf8).shift(1).over(TREE_ID).alias("_pcn"),
+        pl.col("STATUSCD").shift(1).over(TREE_ID).alias("_pst"),
+    ])
+    new_seg = pl.col("_pcn").is_not_null() & (
+        (pl.col("prev_tre_cn").is_null() & pl.col("_pst").is_in([2, 3])) |
+        (pl.col("prev_tre_cn").is_not_null() & (pl.col("prev_tre_cn") != pl.col("_pcn"))))
+    d = d.with_columns(new_seg.fill_null(False).cast(pl.Int64).cum_sum().over(TREE_ID).alias("_seg"))
+    d = d.with_columns((pl.col("_seg").max().over(TREE_ID) > 0).alias("tree_key_split"))
+    n_split = d.filter(pl.col("_seg") > 0).select(TREE_ID).unique().height
+    n_rec = d.filter(pl.col("_seg") > 0).height
+    d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(["_pcn", "_pst", "_seg"])
+    print(f"[step4s] tree-number reuse: {n_split:,} keys split, {n_rec:,} records moved to a new tree id")
+    return d.sort(TREE_ID + ["MEASDATE"])
 
 
 def annotate_reconcile(df: pl.DataFrame) -> pl.DataFrame:
@@ -826,13 +853,23 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
         (pl.col("TRTCD3") == 10)
     )
 
-    # Raw classification
+    # r3 I1: a dead/cut record whose PREV_STATUS_CD is 2 (already dead at the previous visit),
+    # or any dead/cut record after the tree's FIRST dead/cut record, is a RE-RECORD of an
+    # earlier death: kept, flagged rerecord_dead, and never an event / fate / harvest source.
+    dead = pl.col("STATUSCD").is_in([2, 3])
+    df = df.sort(TREE_ID + ["MEASDATE"]).with_columns(
+        (dead & ((pl.col("prev_status_cd") == 2).fill_null(False) |
+                 (dead.cast(pl.Int32).cum_sum().over(TREE_ID) > 1))).alias("rerecord_dead"))
+
+    # Raw classification. r3 M6: a cut on a condition that is no longer accessible forest
+    # (COND_STATUS 2-4 at that visit) is a land-use DIVERSION, not a harvest of forest.
+    is_cut = (pl.col("STATUSCD") == 3) | ((pl.col("STATUSCD") == 2) & (pl.col("AGENTCD") == 80))
     df = df.with_columns(
         pl.when(pl.col("STATUSCD") == 1)
             .then(pl.lit("alive"))
-        .when(pl.col("STATUSCD") == 3)
-            .then(pl.lit("harvest_explicit"))
-        .when((pl.col("STATUSCD") == 2) & (pl.col("AGENTCD") == 80))
+        .when(is_cut & (pl.col("cond_status_cd") != 1).fill_null(False))
+            .then(pl.lit("diverted_landuse"))
+        .when(is_cut)
             .then(pl.lit("harvest_explicit"))
         .when(pl.col("STATUSCD") == 2)
             .then(pl.lit("dead_raw"))
@@ -840,9 +877,9 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
         .alias("_fate_raw")
     )
 
-    # Find condition-years where at least one tree has explicit harvest
+    # Find condition-years where at least one tree has explicit harvest (first records only)
     explicit_harvest_conds = (
-        df.filter(pl.col("_fate_raw") == "harvest_explicit")
+        df.filter((pl.col("_fate_raw") == "harvest_explicit") & ~pl.col("rerecord_dead"))
         .select(COND_KEY)
         .unique()
         .with_columns(pl.lit(True).alias("_cond_has_explicit"))
@@ -858,7 +895,8 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
             pl.when(
                 cond_has_cutting &
                 ~pl.col("_cond_has_explicit").fill_null(False) &
-                pl.col("AGENTCD").is_null()
+                pl.col("AGENTCD").is_null() &
+                ~pl.col("rerecord_dead")          # r3 I1: never on a re-record
             )
             .then(pl.lit("harvest_inferred"))
             .otherwise(pl.lit("dead"))
@@ -917,7 +955,9 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
                         landuse_exits: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     Per-tree terminal fate (curation-fix 2026-10-26; this was dead code in v3 before):
-      last record dead/cut               -> its tree_fate (dead / harvest_explicit / harvest_inferred)
+      a dead/cut record exists           -> the tree_fate of its FIRST dead/cut record (r3 I1:
+                                         later ones are re-records); diverted_landuse for a
+                                         cut on a now-nonforest condition (r3 M6)
       last record alive, and the tree was censored after it (STATUSCD=0 + RC 5/6/8/9)
                                          -> 'censored_<reason>' (NOT a removal)
       last record alive, subplot revisited later, and the land left forest: the tree has a
@@ -930,11 +970,22 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
     Also adds dead_at_first_visit (r2 M8): the tree's first record is dead (STATUSCD 2) at
     the subplot's FIRST visit — standing dead when first seen, no observed mortality.
     """
+    # r3 I1: a tree that ever has a dead/cut record ends at its FIRST dead/cut record (later
+    # records of it are re-records); otherwise at its last (live) record
+    first_dead = (
+        df.filter(pl.col("STATUSCD").is_in([2, 3]))
+        .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+        .select(TREE_ID + [pl.col("MEASDATE").alias("_dmd"), pl.col("tree_fate").alias("_dfate")])
+    )
     last = (
         df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
-        .select(TREE_ID + [pl.col("MEASDATE").alias("_last_md"),
-                           pl.col("tree_fate").alias("_last_fate"),
+        .select(TREE_ID + [pl.col("MEASDATE").alias("_lmd"),
+                           pl.col("tree_fate").alias("_lfate"),
                            "censor_last_measdate", "censor_last_reason"])
+        .join(first_dead, on=TREE_ID, how="left")
+        .with_columns(pl.coalesce(["_dmd", "_lmd"]).alias("_last_md"),
+                      pl.coalesce(["_dfate", "_lfate"]).alias("_last_fate"))
+        .drop(["_dmd", "_lmd", "_dfate", "_lfate"])
     )
     nxt = _next_visit(last.select(TREE_ID + ["_last_md"]), subplot_years)
     if landuse_exits is None or landuse_exits.height == 0:
@@ -998,98 +1049,61 @@ def propagate_totage(df: pl.DataFrame,
     return df
 
 
+RESET_LOSS_FRAC = 0.5   # stand-replacing: >= 50 % of live trees or live BA lost since the previous visit
+
+
 def detect_condition_resets(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Detect conditions where a stand reset occurred, defined as any of:
-      1. STDAGE decreased between consecutive measurements (explicit reset)
-      2. Condition-level treatment flags: TRTCD=10 (cutting), or TRTCD=30/40 (regen)
-      3. Near-total tree loss: >=80% of live trees from previous measurement are
-         now dead/removed
+    r3 I2 — STAND-REPLACING resets only. A condition-visit is a reset when
+      1. STDAGE dropped since the condition's previous visit AND >= RESET_LOSS_FRAC of its live
+         trees (count) or live basal area was lost since then        -> 'stdage_drop_with_loss'
+      2. TRTCD 10 (cutting) together with TRTCD 30/40 (artificial / natural regeneration)
+                                                                      -> 'cut_with_regen'
+      3. TRTCD 10 together with that >= RESET_LOSS_FRAC loss          -> 'cut_with_loss'
+    TRTCD 10 alone (a partial cut), including at a condition's first visit, is NOT a reset, and
+    neither is an STDAGE drop without the loss (STDAGE re-estimation).
 
-    Returns a DataFrame of (COND_ID + MEASDATE) marking each reset event,
-    with a `reset_reason` column.
+    Returns (reset_flag, reset_reasons) keyed by COND_ID + MEASDATE.
     """
     COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
-
-    # --- 1. STDAGE resets ---
-    cond_traj = (
-        df.select(COND_ID + ["MEASDATE", "cond_stdage", "cond_stdorgcd",
-                              "TRTCD1", "TRTCD2", "TRTCD3",
-                              "DSTRBCD1", "DSTRBCD2", "DSTRBCD3"])
-        .unique(subset=COND_ID + ["MEASDATE"])
+    live = pl.col("STATUSCD") == 1
+    cv = (
+        df.with_columns((pl.col("DIA").pow(2) * 0.005454 * pl.col("TPA_UNADJ")).alias("_ba"))
+        .group_by(COND_ID + ["MEASDATE"])
+        .agg([
+            pl.col("cond_stdage").first().alias("cond_stdage"),
+            live.sum().alias("n_live"),
+            pl.col("_ba").filter(live).sum().alias("ba_live"),
+            pl.any_horizontal([pl.col(c) == 10 for c in ("TRTCD1", "TRTCD2", "TRTCD3")]).any().alias("cut"),
+            pl.any_horizontal([pl.col(c).is_in([30, 40]) for c in ("TRTCD1", "TRTCD2", "TRTCD3")]).any().alias("regen"),
+        ])
         .sort(COND_ID + ["MEASDATE"])
         .with_columns([
             pl.col("cond_stdage").shift(1).over(COND_ID).alias("_prev_stdage"),
-            pl.col("MEASDATE").shift(1).over(COND_ID).alias("_prev_measdate"),
+            pl.col("n_live").shift(1).over(COND_ID).alias("_prev_n"),
+            pl.col("ba_live").shift(1).over(COND_ID).alias("_prev_ba"),
         ])
-    )
-
-    stdage_resets = (
-        cond_traj.filter(
-            pl.col("_prev_stdage").is_not_null() &
-            pl.col("cond_stdage").is_not_null() &
-            (pl.col("cond_stdage") < pl.col("_prev_stdage"))
-        )
-        .select(COND_ID + ["MEASDATE"])
-        .with_columns(pl.lit("stdage_reset").alias("reset_reason"))
-    )
-
-    # --- 2. Treatment flags ---
-    trt_resets = (
-        cond_traj.filter(
-            (pl.col("TRTCD1") == 10) | (pl.col("TRTCD2") == 10) | (pl.col("TRTCD3") == 10) |
-            (pl.col("TRTCD1").is_in([30, 40])) | (pl.col("TRTCD2").is_in([30, 40])) |
-            (pl.col("TRTCD3").is_in([30, 40]))
-        )
-        .select(COND_ID + ["MEASDATE"])
-        .with_columns(pl.lit("treatment_flag").alias("reset_reason"))
-    )
-
-    # --- 3. Near-total tree loss ---
-    tree_counts = (
-        df.group_by(COND_ID + ["MEASDATE"])
-        .agg([
-            (pl.col("STATUSCD") == 1).sum().alias("n_live"),
-            pl.len().alias("n_total"),
-        ])
-        .sort(COND_ID + ["MEASDATE"])
         .with_columns(
-            pl.col("n_live").shift(1).over(COND_ID).alias("_prev_n_live"),
-        )
+            (((pl.col("_prev_n") > 0) & (pl.col("n_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
+             ((pl.col("_prev_ba") > 0) & (pl.col("ba_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
+            .fill_null(False).alias("_loss"))
     )
-
-    mortality_resets = (
-        tree_counts.filter(
-            (pl.col("_prev_n_live").is_not_null()) &
-            (pl.col("_prev_n_live") > 0) &
-            (pl.col("n_live").cast(pl.Float64) / pl.col("_prev_n_live") < 0.2)
-        )
-        .select(COND_ID + ["MEASDATE"])
-        .with_columns(pl.lit("near_total_loss").alias("reset_reason"))
-    )
-
-    # --- Combine and deduplicate ---
-    all_resets = pl.concat([stdage_resets, trt_resets, mortality_resets])
-    # Keep all reasons per condition-date (a reset can have multiple signals)
-    reset_reasons = (
-        all_resets.group_by(COND_ID + ["MEASDATE"])
-        .agg(pl.col("reset_reason").unique().sort().alias("reset_reasons"))
-    )
-    # Flat flag for joining
-    reset_flag = (
-        reset_reasons.select(COND_ID + ["MEASDATE"])
-        .unique()
-        .with_columns(pl.lit(True).alias("is_reset"))
-    )
-
-    n = reset_flag.height
-    n_stdage = stdage_resets.height
-    n_trt = trt_resets.height
-    n_mort = mortality_resets.height
-    print(f"[step6b-reset] detected {n:,} condition-year reset events")
-    print(f"               stdage_reset: {n_stdage:,}, treatment_flag: {n_trt:,}, "
-          f"near_total_loss: {n_mort:,}")
-
+    drop = (pl.col("_prev_stdage").is_not_null() & pl.col("cond_stdage").is_not_null()
+            & (pl.col("cond_stdage") < pl.col("_prev_stdage")))
+    parts = [
+        cv.filter(drop & pl.col("_loss")).select(COND_ID + ["MEASDATE"]).with_columns(pl.lit("stdage_drop_with_loss").alias("reset_reason")),
+        cv.filter(pl.col("cut") & pl.col("regen")).select(COND_ID + ["MEASDATE"]).with_columns(pl.lit("cut_with_regen").alias("reset_reason")),
+        cv.filter(pl.col("cut") & pl.col("_loss")).select(COND_ID + ["MEASDATE"]).with_columns(pl.lit("cut_with_loss").alias("reset_reason")),
+    ]
+    all_resets = pl.concat(parts)
+    reset_reasons = (all_resets.group_by(COND_ID + ["MEASDATE"])
+                     .agg(pl.col("reset_reason").unique().sort().alias("reset_reasons")))
+    reset_flag = reset_reasons.select(COND_ID + ["MEASDATE"]).unique().with_columns(pl.lit(True).alias("is_reset"))
+    n_drop_only = cv.filter(drop & ~pl.col("_loss")).height
+    n_cut_only = cv.filter(pl.col("cut") & ~pl.col("regen") & ~pl.col("_loss")).height
+    print(f"[step6b-reset] {reset_flag.height:,} stand-replacing condition-visit resets: "
+          + ", ".join(f"{p.get_column('reset_reason')[0] if p.height else '?'} {p.height:,}" for p in parts)
+          + f" | NOT resets: STDAGE drop without loss {n_drop_only:,}, TRTCD 10 alone {n_cut_only:,}")
     return reset_flag, reset_reasons
 
 
@@ -1103,16 +1117,15 @@ def assign_stdage(df: pl.DataFrame,
     Eligibility (conditions where STDAGE is trusted as individual tree age):
       - STDORGCD=1 (planted stands): always eligible. All trees were co-established
         at planting, so STDAGE == individual tree age.
-      - Confirmed reset + POST-RESET DEBUT: a condition that had a detected
-        reset (treatment flag, near-total tree loss, or STDAGE drop coupled with
-        ≥50% tree loss) is eligible ONLY for trees whose first measurement falls
-        at or after the condition's first reset year. These are genuinely new
-        cohort trees; STDAGE reflects their establishment age.
+      - Confirmed STAND-REPLACING reset + POST-RESET DEBUT (r3 I2): a condition with a
+        detected reset (detect_condition_resets: STDAGE drop with >= 50 % live-tree/BA loss,
+        or TRTCD 10 with TRTCD 30/40 or with that loss; TRTCD 10 alone is not a reset) is
+        eligible ONLY for trees whose first measurement falls at or after the condition's
+        first reset date. These are genuinely new cohort trees; STDAGE reflects their
+        establishment age.
 
-    Pre-reset carry-forwards are explicitly excluded from confirmed_reset
-    eligibility: the new cohort's STDAGE does not represent their individual age
-    (they are older remnants), and the old stand's STDAGE represents the whole
-    stand, not the specific tree.
+    ALL pre-reset trees are excluded (r3 I2b), whether they survived the reset or were cut /
+    died: the old stand's STDAGE is a stand-level mean, not the specific tree's age.
     """
     COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
 
@@ -1165,8 +1178,7 @@ def assign_stdage(df: pl.DataFrame,
     #     New cohort tree. Post-reset STDAGE = individual age. ✓ eligible
     #
     #   PRE-RESET, DID NOT SURVIVE (last_alive_measdate <= reset_measdate):
-    #     Harvested/removed cohort. Pre-reset STDAGE = their cohort age. ✓ eligible
-    #     Anchor is at their first (pre-reset) measurement → correct propagation.
+    #     r3 I2b: NOT eligible any more (pre-reset STDAGE is a stand mean).
     #
     #   PRE-RESET, SURVIVED RESET (first_measdate < reset_measdate AND
     #                               last_alive_measdate > reset_measdate):
@@ -1203,10 +1215,11 @@ def assign_stdage(df: pl.DataFrame,
         (pl.col("cond_fldszcd") == 1) |
         (pl.col("DIA") >= 5.0)
     )
+    # r3 I2(b): pre-reset trees NEVER inherit STDAGE — whether they survived the reset or
+    # not (the old `pre_reset & ~survived_reset` branch broadcast a stand age onto them)
     base_eligible = (
         (pl.col("cond_stdorgcd") == 1) |
-        post_reset_debut |
-        (pre_reset & ~survived_reset)
+        post_reset_debut
     )
     # Qualify/anchor on LIVE measurements only: STDAGE is the mean age of the
     # *live* trees in the size class, and a tree must not qualify (or be anchored)
@@ -1910,7 +1923,8 @@ def build_snapshots(df: pl.DataFrame, scaffold: pl.DataFrame) -> pl.DataFrame:
 
     # Also compute mortality/harvest summary per subplot-year
     fate_agg = (
-        df.filter(pl.col("STATUSCD").is_in([2, 3]))
+        df.filter(pl.col("STATUSCD").is_in([2, 3]) &
+                  ~(pl.col("rerecord_dead") if "rerecord_dead" in df.columns else pl.lit(False)))
         .group_by(SUBPLOT_INVYR)
         .agg([
             pl.len().alias("n_dead_or_removed"),
@@ -2296,6 +2310,7 @@ def diagnostics(df: pl.DataFrame, snapshots: pl.DataFrame):
 def _polars_steps(con, df: pl.DataFrame, estage_raw, all_subplot_years,
                   landuse_exits=None) -> pl.DataFrame:
     """Steps 4b-6e for one batch (one state) of tree records."""
+    df = split_reused_tree_numbers(df)
     df = annotate_reconcile(df)
     df, _confusion_edges = analyze_spcd_confusion(df)
     df = handle_reconcile5(df)
@@ -2334,6 +2349,7 @@ FIX_COLUMNS = [
     "censor_reconcilecd", "censor_reason", "spgrpcd_resolved", "final_tree_fate",
     "censor_last_measdate", "censor_last_reconcilecd", "censor_last_reason",
     "dead_at_first_visit", "estage_mapped", "age_domain",
+    "rerecord_dead", "tree_key_split", "prev_status_cd", "prev_tre_cn",
 ]
 
 

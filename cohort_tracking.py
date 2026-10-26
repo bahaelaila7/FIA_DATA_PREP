@@ -211,12 +211,15 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     # ---- Dead / removed trees ----
-    dead = df.filter(pl.col("STATUSCD").is_in([2, 3]) & has_cohort)
+    # r3 I1: only a tree's FIRST dead/cut record is an event; re-records are skipped
+    rerec = pl.col("rerecord_dead") if "rerecord_dead" in df.columns else pl.lit(False)
+    dead = df.filter(pl.col("STATUSCD").is_in([2, 3]) & has_cohort & ~rerec)
 
+    # r3 M4: DSTRBCD 60 (vegetation / competition) is not a disturbance — same as elsewhere
     disturbed_cond = (
-        (pl.col("DSTRBCD1").is_not_null() & (pl.col("DSTRBCD1") != 0)) |
-        (pl.col("DSTRBCD2").is_not_null() & (pl.col("DSTRBCD2") != 0)) |
-        (pl.col("DSTRBCD3").is_not_null() & (pl.col("DSTRBCD3") != 0))
+        (pl.col("DSTRBCD1").is_not_null() & ~pl.col("DSTRBCD1").is_in([0, 60])) |
+        (pl.col("DSTRBCD2").is_not_null() & ~pl.col("DSTRBCD2").is_in([0, 60])) |
+        (pl.col("DSTRBCD3").is_not_null() & ~pl.col("DSTRBCD3").is_in([0, 60]))
     )
 
     harvest_agg = (
@@ -454,7 +457,7 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
 
 LOAD_COLS = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "estimated_age", "DRYBIO_AG",
                        "TPA_UNADJ", "DAMSEV1", "DAMSEV2", "DSTRBCD1", "DSTRBCD2", "DSTRBCD3",
-                       "TRTCD1", "TRTCD2", "TRTCD3", "cond_stdorgcd"]
+                       "TRTCD1", "TRTCD2", "TRTCD3", "cond_stdorgcd", "rerecord_dead"]
 
 if __name__ == "__main__":
     # curation-fix 2026-10-26: explicit paths (dbconn); cohort species = spcd_resolved

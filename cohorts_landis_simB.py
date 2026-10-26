@@ -34,10 +34,24 @@ SAP    = c1.SAPLING_DIA_MAX  # 5.0 in — FIA sapling/timber boundary
 
 
 
+OUT_COLS = ["plt_cn", "statecd", "unitcd", "countycd", "plot", "subp",
+            "epa_l3", "epa_l4", "ecosubcd",
+            "species_symbol", "spgrpcd", "major_spgrpcd", "sftwd_hrdwd",
+            "measdate", "sim_year", "age_calc", "agb",
+            "subp_has_dstrb", "plot_meas_num", "subp_meas_num", "intro_type"]
+
+
 def build(con) -> pl.DataFrame:
     print("=" * 70); print("sim B (real, timber-sized) cohort curation"); print("=" * 70)
 
     df = c1.load_base_data(con)                       # one row per live tree×visit, carries 'dia'
+    # r3 M1: the time axis (sim_year, age_calc) is computed on ALL live rows (saplings
+    # included) over the full visit scaffold, BEFORE dropping saplings — the same axis as the
+    # Sim A table and tree_trajectories, so cohort_disturbance's (measdate, age_calc) keys
+    # match exactly (re-basing it on the timber-only rows shifted ages by a year).
+    scaffold = con.execute("SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE "
+                           "FROM clean_subplot_years").pl()
+    df = c1.compute_sim_year_ages(df, scaffold)
     n0 = df.height
     df = df.filter(pl.col("dia").is_not_null() & (pl.col("dia") >= SAP))
     print(f"[sapling-filter] dropped {n0 - df.height:,}/{n0:,} sapling/null-DIA rows "
@@ -47,7 +61,6 @@ def build(con) -> pl.DataFrame:
         pl.col("subp_has_dstrb").fill_null(False))
     df = df.join(c1.build_plot_meas_num(df), on=c1.PLOT_KEY, how="left")
     df = df.join(c1.build_subp_meas_num(df), on=c1.SUBPLOT_ID, how="left")
-    df = c1.compute_sim_year_ages(df)                 # sim_year + integer-anchored age_calc
 
     # NO phantom backfill — all remaining rows are real observations
     df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
@@ -55,23 +68,27 @@ def build(con) -> pl.DataFrame:
         pl.concat_str([pl.col(c).cast(pl.Utf8) for c in c1.PLOT_KEY], separator="_").alias("plt_cn"))
 
     df = df.rename({"STATECD": "statecd", "UNITCD": "unitcd", "COUNTYCD": "countycd",
-                    "PLOT": "plot", "SUBP": "subp", "MEASDATE": "measdate"}).select([
-        "plt_cn", "statecd", "unitcd", "countycd", "plot", "subp",
-        "epa_l3", "epa_l4", "ecosubcd",
-        "species_symbol", "spgrpcd", "major_spgrpcd", "sftwd_hrdwd",
-        "measdate", "sim_year", "age_calc", "agb",
-        "subp_has_dstrb", "plot_meas_num", "subp_meas_num", "intro_type"])
+                    "PLOT": "plot", "SUBP": "subp", "MEASDATE": "measdate"}).select(
+        OUT_COLS + ["_age_source", "_age_domain"])
 
     # Aggregate into cohorts: sum agb over trees sharing (subplot, species, age, visit).
+    # r3 I4: + n_trees_natural_uncalibrated, AGB-weighted share_natural_uncalibrated and the
+    # AGB-dominant age source of the member trees.
     n_pre = df.height
-    grp = [c for c in df.columns if c != "agb"]
+    grp = [c for c in OUT_COLS if c != "agb"]
+    nu = (pl.col("_age_domain") == "natural_uncalibrated").fill_null(False)
+    src = (df.group_by(grp + ["_age_source"]).agg(pl.col("agb").sum().alias("_a"))
+             .sort(grp + ["_a", "_age_source"], descending=[False] * len(grp) + [True, False], nulls_last=True)
+             .unique(subset=grp, keep="first")
+             .select(grp + [pl.col("_age_source").alias("age_source_major")]))
     df = (df.group_by(grp, maintain_order=True)
-            .agg(pl.col("agb").sum().alias("agb"))
-            .select(["plt_cn", "statecd", "unitcd", "countycd", "plot", "subp",
-                     "epa_l3", "epa_l4", "ecosubcd",
-                     "species_symbol", "spgrpcd", "major_spgrpcd", "sftwd_hrdwd",
-                     "measdate", "sim_year", "age_calc", "agb",
-                     "subp_has_dstrb", "plot_meas_num", "subp_meas_num", "intro_type"]))
+            .agg(pl.col("agb").sum().alias("agb"),
+                 nu.cast(pl.Int64).sum().alias("n_trees_natural_uncalibrated"),
+                 ((pl.col("agb") * nu.cast(pl.Float64)).sum() / pl.col("agb").sum())
+                 .alias("share_natural_uncalibrated"))
+            .join(src, on=grp, how="left", nulls_equal=True)
+            .select(OUT_COLS + c1.AGE_META_COLS)
+            .sort(["statecd", "unitcd", "countycd", "plot", "subp", "species_symbol", "measdate", "age_calc"]))
     print(f"[aggregate] {n_pre:,} tree-rows → {df.height:,} cohort-rows "
           f"({df.select(['statecd','unitcd','countycd','plot']).unique().height:,} plots, "
           f"{df['species_symbol'].n_unique():,} species)")
@@ -103,7 +120,9 @@ if __name__ == "__main__":
         SELECT STATECD AS statecd, UNITCD AS unitcd, COUNTYCD AS countycd, PLOT AS plot,
                MEASDATE AS measdate, MAX(CYCLE) AS cycle
         FROM base_subplot_cond GROUP BY 1,2,3,4,5)
-    SELECT c.*, s.lu AS land_use, cy.cycle
+    SELECT c.* EXCLUDE (n_trees_natural_uncalibrated, share_natural_uncalibrated, age_source_major),
+           s.lu AS land_use, cy.cycle,
+           c.n_trees_natural_uncalibrated, c.share_natural_uncalibrated, c.age_source_major
     FROM {TABLE}_base c
     LEFT JOIN stdorg s USING (statecd, unitcd, countycd, plot)
     LEFT JOIN plot_cycle cy USING (statecd, unitcd, countycd, plot, measdate)

@@ -79,17 +79,20 @@ def attach_modeling_context(con, df: pl.DataFrame) -> pl.DataFrame:
         FROM data_plot_eco
     """).pl()
 
+    # r3 M5: the major species group of the RESOLVED species (constant per tree), not of the
+    # raw per-visit SPCD
+    spcol = "spcd_resolved" if "spcd_resolved" in df.columns else "SPCD"
     spgrp = con.execute("""
         SELECT SPCD, MAJOR_SPGRPCD AS major_spgrpcd
         FROM REF_SPECIES
     """).pl().with_columns(
-        pl.col("SPCD").cast(df.schema["SPCD"])
-    )
+        pl.col("SPCD").cast(df.schema[spcol])
+    ).rename({"SPCD": spcol})
 
     plot_key = ["STATECD", "UNITCD", "COUNTYCD", "PLOT"]
     df = (
         df.join(eco,   on=plot_key, how="left")
-          .join(spgrp, on="SPCD",   how="left")
+          .join(spgrp, on=spcol,    how="left")
     )
 
     n = df.height
@@ -121,6 +124,7 @@ def attach_modeling_context(con, df: pl.DataFrame) -> pl.DataFrame:
 #     mapped vs raw Tree_Age against the field age.
 CAL_MIN_N = 200
 N_FOLDS = 5
+CV_REPORT = None
 
 
 def plot_fold(plot_keys) -> np.ndarray:
@@ -130,7 +134,7 @@ def plot_fold(plot_keys) -> np.ndarray:
     import zlib
     return np.array([zlib.crc32(str(k).encode()) % N_FOLDS for k in plot_keys], dtype=np.int64)
 CAL_SLOPE_MIN, CAL_SLOPE_MAX = 0.25, 1.5
-CAL_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "spgrpcd_resolved", "cond_stdorgcd",
+CAL_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "spcd_resolved", "spgrpcd_resolved", "cond_stdorgcd",
             "STATUSCD", "DIA", "estage_raw", "age_from_totage", "age_from_stdage"]
 
 
@@ -140,8 +144,9 @@ def _calibration_set(con) -> pl.DataFrame:
         SELECT {cols} FROM curated_trees
         WHERE STATUSCD = 1 AND DIA >= {ESTAGE_MIN_DIA} AND estage_raw > {ESTAGE_MIN_AGE}
           AND COALESCE(age_from_totage, age_from_stdage) IS NOT NULL""").pl()
-    spgrp = con.execute("SELECT SPCD, MAJOR_SPGRPCD AS major_spgrpcd FROM REF_SPECIES").pl()
-    df = (df.join(spgrp.with_columns(pl.col("SPCD").cast(df.schema["SPCD"])), on="SPCD", how="left")
+    spgrp = con.execute("SELECT SPCD AS spcd_resolved, MAJOR_SPGRPCD AS major_spgrpcd FROM REF_SPECIES").pl()
+    df = (df.join(spgrp.with_columns(pl.col("spcd_resolved").cast(df.schema["spcd_resolved"])),
+                  on="spcd_resolved", how="left")
             .with_columns([
                 pl.coalesce(["age_from_totage", "age_from_stdage"]).alias("field_age"),
                 (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("planted"),
@@ -354,7 +359,8 @@ def _build_X(df: pl.DataFrame, enc: OrdinalEncoder,
 # Step 2: fit model
 # =============================================================================
 
-TRIM_Q = 0.90          # per-source upper trim of the training target (field / mapped)
+OUTLIER_Q = 0.995       # r3 I3a: per-source outlier quantile
+OUTLIER_MEDIAN_X = 3.0  # ... or this many times the source's DIA-class median
 SUPPORT_MIN = 50       # age_domain: training rows needed in a DIA-class x stratum x size-class cell
 
 
@@ -390,16 +396,21 @@ def build_training_set(con, est) -> pl.DataFrame:
                           cand["major_spgrpcd"].to_list(), (cand["cond_stdorgcd"] == 1).fill_null(False).to_list())
         parts.append(cand.with_columns(pl.Series("target", m), pl.lit("mapped").alias("source")))
     train = pl.concat(parts, how="diagonal_relaxed")
-    kept = []
+    # r3 I3a: robust outlier rule instead of the per-source p90 trim (which cut the old trees
+    # and biased the model young): a row is an outlier when its target exceeds the source's
+    # p99.5, or 3x the source's median within its DIA 2-in class. Outliers are not trained on
+    # but ARE scored in the CV (`_kept` flag).
+    train = train.with_columns((pl.col("DIA") / 2).floor().clip(0, 15).cast(pl.Int32).alias("_dcls"))
+    train = train.with_columns(
+        ((pl.col("target") <= pl.col("target").quantile(OUTLIER_Q).over("source")) &
+         (pl.col("target") <= OUTLIER_MEDIAN_X * pl.col("target").median().over(["source", "_dcls"])))
+        .alias("_kept"))
     for src in ("field", "mapped"):
         sub = train.filter(pl.col("source") == src)
-        if sub.height == 0:
-            continue
-        q = sub["target"].quantile(TRIM_Q)
-        kept.append(sub.filter(pl.col("target") <= q))
-        print(f"[step2] training source {src:6s}: {sub.height:,} rows, p90 trim at {q:.1f} yr "
-              f"-> {kept[-1].height:,}")
-    train = pl.concat(kept)
+        if sub.height:
+            print(f"[step2] training source {src:6s}: {sub.height:,} rows, "
+                  f"{sub.filter(~pl.col('_kept')).height:,} outliers (> p{OUTLIER_Q*100:g} or "
+                  f"> {OUTLIER_MEDIAN_X:g}x DIA-class median) not trained on")
     return train.with_columns(pl.Series("_fold", plot_fold(train["_plot"].to_list())))
 
 
@@ -431,6 +442,7 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
     enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan,
                          encoded_missing_value=np.nan)
     X = _build_X(train, enc, fit_enc=True)
+    kept = train["_kept"].to_numpy() if "_kept" in train.columns else np.ones(train.height, dtype=bool)
     folds = train["_fold"].to_numpy()
     src = train["source"].to_numpy()
     y_full = train["target"].to_numpy().astype(float)
@@ -445,8 +457,8 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
             fold_models = fit_estage_mapping(est["cal"].filter(
                 pl.Series(plot_fold(est["cal"]["_plot"].to_list())) != k), est["stratify"])
         y_k = _remap_targets(train, est, fold_models) if fold_models is not None else y_full
-        m = _new_model().fit(X[tr], np.log1p(y_k[tr]))
-        oof[te] = np.expm1(m.predict(X[te]))
+        m = _new_model().fit(X[tr & kept], np.log1p(y_k[tr & kept]))
+        oof[te] = np.expm1(m.predict(X[te]))          # scored on ALL held-out rows
         y_oof_target[te] = y_k[te]          # held-out targets: field age / OOF-mapped age
     print(f"[step2] plot-grouped {N_FOLDS}-fold CV (same folds as the estage mapping), out-of-fold:")
     for s_ in ("field", "mapped", "all"):
@@ -455,8 +467,27 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
             e = oof[msk] - y_oof_target[msk]
             print(f"         {s_:6s} n={msk.sum():>9,}  MAE {np.nanmean(np.abs(e)):6.2f} yr  "
                   f"bias {np.nanmean(e):+6.2f} yr")
-    model = _new_model().fit(X, np.log1p(y_full))
-    support = (train.with_columns(_support_cell(train).alias("_cell"))
+    # r3 I3a: out-of-fold error by age decile and by DIA class (all rows, outliers included)
+    rep = pl.DataFrame({"source": src, "y": y_oof_target, "e": oof - y_oof_target,
+                        "dia": train["DIA"].to_numpy()}).filter(pl.col("e").is_not_nan())
+    rep = rep.with_columns(pl.col("y").qcut(10, labels=[f"d{i:02d}" for i in range(1, 11)], allow_duplicates=True)
+                           .cast(pl.Utf8).alias("age_decile"),
+                           pl.when(pl.col("dia") < 5).then(pl.lit("<5")).when(pl.col("dia") < 10).then(pl.lit("5-10"))
+                           .when(pl.col("dia") < 15).then(pl.lit("10-15")).otherwise(pl.lit("15+")).alias("dia_cls"))
+    global CV_REPORT
+    CV_REPORT = pl.concat([
+        rep.group_by(["source", "age_decile"]).agg(pl.len().alias("n"), pl.col("y").median().alias("median_target"),
+                                                   pl.col("e").abs().mean().alias("mae"), pl.col("e").mean().alias("bias"))
+           .rename({"age_decile": "stratum"}).with_columns(pl.lit("age_decile").alias("by")),
+        rep.group_by(["source", "dia_cls"]).agg(pl.len().alias("n"), pl.col("y").median().alias("median_target"),
+                                                pl.col("e").abs().mean().alias("mae"), pl.col("e").mean().alias("bias"))
+           .rename({"dia_cls": "stratum"}).with_columns(pl.lit("dia_class").alias("by")),
+    ]).with_columns(pl.col("stratum").cast(pl.Utf8)).sort(["by", "source", "stratum"])
+    with pl.Config(tbl_rows=60):
+        print(CV_REPORT)
+    model = _new_model().fit(X[kept], np.log1p(y_full[kept]))
+    support = (train.filter(pl.col("_kept") if "_kept" in train.columns else pl.lit(True))
+               .with_columns(_support_cell(train).alias("_cell"))
                .group_by("_cell").len().rename({"len": "_n_train"}))
     return model, enc, support
 
@@ -575,7 +606,7 @@ def run_age_imputation(con, df: pl.DataFrame,
 # Standalone entry point
 # =============================================================================
 
-TRAIN_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "STATUSCD", "age_source",
+TRAIN_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "spcd_resolved", "STATUSCD", "age_source",
               "estimated_age", "DIA", "HT", "CR", "CCLCD", "cond_alstkcd"]
 
 
@@ -624,6 +655,10 @@ if __name__ == "__main__":
     train_df = build_training_set(con, estage_models)
     model, enc, support = fit_age_model(train_df, estage_models)
     del train_df
+    if CV_REPORT is not None:
+        con.register("_cvr", CV_REPORT.to_arrow())
+        con.execute("CREATE OR REPLACE TABLE age_model_cv AS SELECT * FROM _cvr")
+        con.unregister("_cvr")
     scaffold_all = build_subplot_year_scaffold(con)
     states = [r[0] for r in con.execute(
         "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]

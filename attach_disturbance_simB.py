@@ -33,11 +33,14 @@ con.register("_cd", coh.to_pandas())
 con.execute("CREATE OR REPLACE TABLE cohort_disturbance AS SELECT * FROM _cd")
 con.unregister("_cd")
 
-_ex = [c for c in ("disturbance_drop_pct", "procedural_break") if c in dbconn.column_names(con, TABLE)]
+_meta = ["n_trees_natural_uncalibrated", "share_natural_uncalibrated", "age_source_major"]
+_have = dbconn.column_names(con, TABLE)
+_ex = [c for c in ["disturbance_drop_pct", "procedural_break"] + _meta if c in _have]
 keep = f"c.* EXCLUDE ({', '.join(_ex)})" if _ex else "c.*"   # idempotent re-attach, column order kept
+_meta_sel = "".join(f", c.{m}" for m in _meta if m in _have)   # r3 I4: after the old columns
 con.execute(f"""
     CREATE OR REPLACE TABLE {TABLE} AS
-    SELECT {keep}, COALESCE(d.disturbance_drop_pct, 0.0) AS disturbance_drop_pct
+    SELECT {keep}, COALESCE(d.disturbance_drop_pct, 0.0) AS disturbance_drop_pct{_meta_sel}
     FROM {TABLE} c
     LEFT JOIN cohort_disturbance d
       ON c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
