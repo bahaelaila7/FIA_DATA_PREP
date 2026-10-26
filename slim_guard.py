@@ -12,7 +12,11 @@ import argparse
 import os
 import sys
 
+import os as _os, sys as _sys  # sibling modules resolve under `python -I`
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import duckdb
+
+from fia_curation_v3 import FIX_COLUMNS
 
 CURATED_TABLES = ["curated_cohorts_landis_stdorg", "curated_trees", "COND", "PLOT",
                   "REF_SPECIES", "species_longevity_ref"]
@@ -41,10 +45,25 @@ if a.mode == "pre":
             sys.exit(f"[slim_guard] {p} is FIADB — the builder must read the NEW curated DBs")
         c, t = tables(p)
         miss = [x for x in need if x.lower() not in t]
-        c.close()
         if miss:
+            c.close()
             sys.exit(f"[slim_guard] {p} lacks {miss}")
-    print("[slim_guard] pre: sources OK")
+        # r2 M10: the curation-fix columns must be present (a pre-fix DB is refused)
+        def cols(tab):
+            return {r[0].lower() for r in c.execute(
+                "SELECT column_name FROM duckdb_columns() WHERE database_name=current_database() "
+                "AND lower(table_name)=lower(?)", [tab]).fetchall()}
+        need_cols = {"curated_trees": [x.lower() for x in FIX_COLUMNS],
+                     "curated_cohorts_landis_stdorg": ["procedural_break"],
+                     "curated_cohorts_landis_simB": ["procedural_break", "disturbance_drop_pct"]}
+        for tab, want in need_cols.items():
+            if tab in need:
+                lack = [w for w in want if w not in cols(tab)]
+                if lack:
+                    c.close()
+                    sys.exit(f"[slim_guard] {p}:{tab} lacks curation-fix columns {lack}")
+        c.close()
+    print("[slim_guard] pre: sources OK (tables + curation-fix columns)")
 else:
     c, t = tables(a.slim)
     miss = [x for x in SLIM_TABLES if x.lower() not in t]

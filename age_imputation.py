@@ -237,7 +237,9 @@ def apply_age_model(df: pl.DataFrame,
         pl.Series("src_age", raw, dtype=pl.Float64)
     )
 
-    anchors = _select_best_anchor(candidates, tree_bounds, apply_min_shift=False)
+    # r2 M4: floor the model age at the tree's first measurement to 1 yr (as for TOTAGE),
+    # so no negative / < 1 yr live ages remain from model anchors
+    anchors = _select_best_anchor(candidates, tree_bounds, apply_min_shift=True)
     df      = _propagate_from_anchor(df, anchors, "age_from_model")
 
     n_maxviol = anchors.filter(pl.col("max_viol") > 0).height
@@ -324,13 +326,27 @@ if __name__ == "__main__":
     print(f"DB: {a.out_db}")
     print("=" * 70)
 
+    # r2 M3: resumable. If step 2 already ran (age_from_model present), restore the v3 state
+    # BEFORE fitting: drop the step-2 columns and rebuild v3's merged training target
+    # (estimated_age = TOTAGE > STDAGE, age_source TOTAGE / STDAGE_<context>), which step 2
+    # overwrote. Re-running step 2 then gives the same result as the first run.
+    if "age_from_model" in dbconn.column_names(con, "curated_trees"):
+        print("[resume] curated_trees already imputed — restoring the v3 age columns first")
+        con.execute("""
+            CREATE OR REPLACE TABLE curated_trees AS
+            SELECT * EXCLUDE (epa_l3, major_spgrpcd, age_from_model)
+                     REPLACE (COALESCE(age_from_totage, age_from_stdage) AS estimated_age,
+                              CASE WHEN age_from_totage IS NOT NULL THEN 'TOTAGE'
+                                   WHEN age_from_stdage IS NOT NULL
+                                        THEN 'STDAGE_' || COALESCE(stdage_context, 'unknown')
+                              END AS age_source)
+            FROM curated_trees""")
+        con.commit()
+
     cols = ", ".join(TRAIN_COLS)
     train_df = attach_modeling_context(con, con.execute(f"SELECT {cols} FROM curated_trees").pl())
     model, enc = fit_age_model(train_df)
     del train_df
-
-    if "age_from_model" in dbconn.column_names(con, "curated_trees"):
-        sys.exit("curated_trees already has age_from_model — re-run fia_curation_v3 first")
     scaffold_all = build_subplot_year_scaffold(con)
     states = [r[0] for r in con.execute(
         "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]

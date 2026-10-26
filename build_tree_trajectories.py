@@ -33,6 +33,7 @@ import sys
 import duckdb
 import polars as pl
 
+from fia_curation_v3 import _next_visit   # shared next-visit / nonforest lookup (r2 M6)
 from cohorts_landis import (
     PLOT_KEY, SUBPLOT_ID, TREE_ID,
     MIN_BACKFILL_AGB,
@@ -170,8 +171,10 @@ def subplot_visit_scaffold(con, states: list[int] | None = None) -> pl.DataFrame
     could have been tallied at."""
     where_state = f"WHERE STATECD IN ({','.join(map(str, states))})" if states else ""
     return con.execute(f"""
-        SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE
-        FROM clean_subplot_years {where_state}
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE,
+               MAX(forest_subpcond_prop) AS forest_subpcond_prop,
+               MAX(forest_micrcond_prop) AS forest_micrcond_prop
+        FROM clean_subplot_years {where_state} GROUP BY ALL
     """).pl()
 
 
@@ -341,7 +344,8 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
 
     # curation-fix 2026-10-26: never interpolate across a censoring (STATUSCD=0 with
     # RECONCILECD 5/6/8/9 between the bracketing records): the tree was out of the sample.
-    # Uses EVERY STATUSCD=0 non-RC7 record (tree_status0_events), so censor -> live ->
+    # Uses EVERY censoring event (tree_censor_events: STATUSCD=0 non-RC7 records + saplings
+    # left unrecorded at a re-tally), so censor -> live ->
     # censor histories are handled (audit M8).
     n_g0 = g.height
     if censor_events is not None and censor_events.height:
@@ -441,7 +445,8 @@ def add_alt_age_axes(body: pl.DataFrame) -> pl.DataFrame:
 # Step 4: terminal fate (per tree)
 # =============================================================================
 
-def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFrame:
+def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
+                           landuse_exits: pl.DataFrame | None = None) -> pl.DataFrame:
     """Per tree, derive terminal_fate + death_cause from its last real record and
     whether the subplot was visited again afterwards."""
     last = (
@@ -450,14 +455,21 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame) -> pl.DataF
                            "row_disturbed", "censor_last_measdate", "censor_last_reason"])
         .rename({"MEASDATE": "terminal_measdate"})
     )
-    # was the subplot visited strictly after the tree's last record?
-    later = (
-        last.join(visits, on=SUBPLOT_ID, how="left")
-        .filter(pl.col("MEASDATE") > pl.col("terminal_measdate"))
-        .group_by(TREE_ID).agg(pl.len().alias("_n_later"))
-    )
-    last = last.join(later, on=TREE_ID, how="left").with_columns(
-        (pl.col("_n_later").fill_null(0) > 0).alias("_later_visit"))
+    # was the subplot visited strictly after the tree's last record, and was that next
+    # visit entirely nonforest / did the tree turn up live on a nonforest/water condition
+    # (r2 M6 -> diverted_landuse)?
+    nxt = _next_visit(last.select(TREE_ID + [pl.col("terminal_measdate").alias("_last_md")]), visits)
+    last = last.join(nxt, on=TREE_ID, how="left").with_columns(
+        pl.col("_later").fill_null(False).alias("_later_visit"))
+    if landuse_exits is not None and landuse_exits.height:
+        lex = (last.select(TREE_ID + ["terminal_measdate"]).join(landuse_exits, on=TREE_ID, how="inner")
+               .filter(pl.col("exit_measdate") > pl.col("terminal_measdate"))
+               .select(TREE_ID).unique().with_columns(pl.lit(True).alias("_lu_exit")))
+        last = last.join(lex, on=TREE_ID, how="left")
+    else:
+        last = last.with_columns(pl.lit(None, dtype=pl.Boolean).alias("_lu_exit"))
+    diverted = pl.col("_later_visit") & (pl.col("_lu_exit").fill_null(False) |
+                                         pl.col("_next_nonforest").fill_null(False))
 
     is_dist = pl.col("AGENTCD").is_in(DISTURBANCE_AGENTS) | pl.col("row_disturbed")
 
@@ -473,6 +485,8 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame) -> pl.DataF
         .when((pl.col("STATUSCD") == 1) & pl.col("censor_last_measdate").is_not_null() &
               (pl.col("censor_last_measdate") > pl.col("terminal_measdate")))
             .then(pl.lit("censored_") + pl.col("censor_last_reason"))
+        .when((pl.col("STATUSCD") == 1) & diverted)
+            .then(pl.lit("diverted_landuse"))
         .when((pl.col("STATUSCD") == 1) & pl.col("_later_visit"))
             .then(pl.lit("disappeared_inferred_removal"))
         .when(pl.col("STATUSCD") == 1)
@@ -573,6 +587,8 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
         )
         .select(COND_ID + ["cut_measdate", "cut_event_type",
                            "cut_pct_ba_removed", "cut_mean_age"])
+        # r2 M2: float sums depend on thread summation order — round for determinism
+        .with_columns(pl.col("cut_pct_ba_removed").round(9), pl.col("cut_mean_age").round(9))
     )
     print("[cut] cut-event classification:")
     for t, n in ev.group_by("cut_event_type").len().sort("len", descending=True).iter_rows():
@@ -610,7 +626,7 @@ def derive_land_use(full: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     purity = (
         sp_ba.group_by(COND_ID + ["MEASDATE"])
         .agg((pl.col("sp_ba").max() / pl.col("sp_ba").sum()).alias("_top_share"))
-        .group_by(COND_ID).agg(pl.col("_top_share").max().alias("dominant_species_frac"))
+        .group_by(COND_ID).agg(pl.col("_top_share").max().round(9).alias("dominant_species_frac"))
     )
 
     lu = (
@@ -655,17 +671,22 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
 
     # condition-level attributes derived from the FULL record set
     events = classify_cut_events(full)
-    fate   = classify_terminal_fate(full, visits)
+    import dbconn as _db
+    _db.require_tables(con, "tree_landuse_exits")
+    _ws = f"WHERE STATECD IN ({','.join(map(str, states))})" if states else ""
+    landuse_exits = con.execute(f"""SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate
+                                    FROM tree_landuse_exits {_ws}""").pl()
+    fate   = classify_terminal_fate(full, visits, landuse_exits)
     lu     = derive_land_use(full, events)
 
     # trajectory body (live + phantom + interpolated)
     body = build_live_body(full, visits, load_backfill_context(con))
     import dbconn
-    dbconn.require_tables(con, "tree_status0_events")
+    dbconn.require_tables(con, "tree_censor_events")
     ws = f"AND STATECD IN ({','.join(map(str, states))})" if states else ""
     censor_events = con.execute(f"""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS _cdate
-        FROM tree_status0_events WHERE RC IS DISTINCT FROM 7 {ws}""").pl()
+        FROM tree_censor_events WHERE TRUE {ws}""").pl()
     body = interpolate_gaps(body, visits, censor_events)
     body = body.with_columns(pl.col("intro_type").fill_null("real"))
 

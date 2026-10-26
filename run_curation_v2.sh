@@ -10,6 +10,7 @@
 #   FIA_STATES      comma STATECD list, e.g. 1,12,13,21,28,37,45,47       (required)
 #   FIA_COUNTIES    optional STATECD:COUNTYCD,... subset (smoke tests)
 #   FROM_STEP       resume from this step number (default 1 = fresh run; see STEPS below)
+#   TO_STEP         stop after this step number (default: all; e.g. reruns of steps 4-7)
 #   SLIM_OUT        slim DB to build (optional; the slim step is skipped when empty)
 #   SLIM_ECOS       comma EPA-L3 list for the slim builder                (with SLIM_OUT)
 #   LANDIS_PROJECT  Julia project holding tools/build_slim_db_region.jl   (with SLIM_OUT)
@@ -25,6 +26,7 @@
 set -euo pipefail
 : "${PY:?}" "${FIADB:?}" "${FIA_CURATED_DB:?}" "${FIA_SIMB_DB:?}" "${FIA_ESTAGE_DIR:?}" "${FIA_STATES:?}"
 FROM_STEP="${FROM_STEP:-1}"
+TO_STEP="${TO_STEP:-99}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-3}" OMP_NUM_THREADS="${OMP_NUM_THREADS:-3}"
@@ -56,14 +58,14 @@ STEPS=(
 # NOTE: paths must not contain spaces (steps are word-split).
 for i in "${!STEPS[@]}"; do
   n=$((i + 1))
-  (( n < FROM_STEP )) && { echo "skip step $n: ${STEPS[$i]%% *}"; continue; }
+  (( n < FROM_STEP || n > TO_STEP )) && { echo "skip step $n: ${STEPS[$i]%% *}"; continue; }
   echo; echo "===== step $n: ${STEPS[$i]} ($(date -Is))"
   # shellcheck disable=SC2086
   nice -n 10 "$PY" -I ${STEPS[$i]}
 done
 SLIM_STEP=$(( ${#STEPS[@]} + 1 ))
 
-if [[ -n "${SLIM_OUT:-}" ]] && (( SLIM_STEP >= FROM_STEP )); then
+if [[ -n "${SLIM_OUT:-}" ]] && (( SLIM_STEP >= FROM_STEP && SLIM_STEP <= TO_STEP )); then
   echo; echo "===== step $SLIM_STEP: slim builder ($(date -Is))"
   # Guarded wrapper around the UNCHANGED landis_region4 builder: its defaults point at the
   # old FIADB / old simB and it silently skips a missing simB, so both sources are passed

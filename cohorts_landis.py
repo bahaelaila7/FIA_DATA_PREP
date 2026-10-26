@@ -389,7 +389,8 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
     )
     meta = (
         df.select(TREE_ID + ["species_symbol", "spgrpcd", "epa_l3"])
-        .unique(subset=TREE_ID)
+        .sort(TREE_ID + ["species_symbol", "spgrpcd", "epa_l3"], nulls_last=True)
+        .unique(subset=TREE_ID, keep="first")
     )
 
     tree_rates = (
@@ -431,6 +432,9 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
         .agg(pl.col("rel_rate").mean().alias("rate"))
     )
 
+    # r2 M2: float means depend on summation order across threads — round for determinism
+    sp_rates, grp_rates, glb_rates = (r.with_columns(pl.col("rate").round(12))
+                                      for r in (sp_rates, grp_rates, glb_rates))
     print(f"           {sp_rates.height:,} (species, epa_l3) pairs  "
           f"| {grp_rates.height:,} (spgrpcd, epa_l3) pairs computed")
     return sp_rates, grp_rates, glb_rates
@@ -499,14 +503,23 @@ BF_NONE_CODES   = (6, 9)
 BF_C_EXEMPT     = (2, 3, 7, 8)      # first-record RECONCILECD exempt from rule (c)
 
 
-def load_backfill_context(con) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """(breaks, visit): plot-level procedural-break dates (procedural_breaks, from v3) and
-    the per-subplot-visit forest subplot / microplot proportions (clean_subplot_years)."""
+def load_backfill_context(con) -> dict:
+    """Blocking context, all from the curated DB:
+      breaks  plot-level procedural re-tally dates (procedural_breaks: break_kind,
+              n_closed_rc8_prev_sapling, n_unrecorded_saplings)
+      visit   the FULL subplot-visit scaffold (clean_subplot_years) with forest subplot /
+              microplot proportions — candidate prior visits AND the nonforest lookup
+              (r2 M1: visits with no live tree are not in the cohort rows, so a nonforest
+              visit between p and D was invisible before)
+      censor  every censoring event (tree_censor_events) for the cohort-pass gap members"""
     import dbconn
-    dbconn.require_tables(con, "procedural_breaks", "clean_subplot_years")
+    dbconn.require_tables(con, "procedural_breaks", "clean_subplot_years", "tree_censor_events")
     breaks = con.execute("""
-        SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS break_date
-        FROM procedural_breaks
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS break_date,
+               bool_or(break_kind = 'rc8') AS _brk_rc8,
+               bool_or(n_closed_rc8_prev_sapling > 0 OR break_kind = 'unrecorded'
+                       OR n_unrecorded_saplings > 0) AS _brk_sap
+        FROM procedural_breaks GROUP BY ALL
     """).pl()
     visit = con.execute("""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE AS prior_measdate,
@@ -514,17 +527,23 @@ def load_backfill_context(con) -> tuple[pl.DataFrame, pl.DataFrame]:
                MAX(COALESCE(forest_subpcond_prop, 0) + COALESCE(forest_micrcond_prop, 0)) AS _forest_prop
         FROM clean_subplot_years GROUP BY ALL
     """).pl()
-    print(f"[backfill ctx] {breaks.height:,} plot-visit procedural-break dates")
-    return breaks, visit
+    censor = con.execute("""
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS _cdate
+        FROM tree_censor_events""").pl()
+    print(f"[backfill ctx] {breaks.height:,} plot-visit procedural-break dates "
+          f"({breaks.filter(pl.col('_brk_sap')).height:,} sapling re-tallies), "
+          f"{visit.height:,} scaffold subplot-visits")
+    return {"breaks": breaks, "visit": visit, "censor": censor}
 
 
 def add_backfill_flags(df: pl.DataFrame) -> pl.DataFrame:
-    """Per-row tree-level flags used by the blocking rules (debut = first row of the tree).
-    Needs dia, reconcile_new and rc_first (RECONCILECD of the tree's first record)."""
-    debut = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+    """Per-row tree-level flags used by the blocking rules (debut = first REAL row of the
+    tree). Needs dia, reconcile_new and rc_obs (RECONCILECD)."""
+    real = df.filter(pl.col("intro_type").is_null()) if "intro_type" in df.columns else df
+    debut = (real.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
              .select(TREE_ID + [pl.col("dia").alias("_debut_dia"),
                                 pl.col("rc_obs").alias("_debut_rc")]))
-    df = df.join(debut, on=TREE_ID, how="left")
+    df = df.drop([c for c in BF_FLAGS if c in df.columns]).join(debut, on=TREE_ID, how="left")
     rn = pl.col("reconcile_new")
     return df.with_columns([
         rn.is_in(list(BF_NONE_CODES)).fill_null(False).alias("_bf_none"),
@@ -539,32 +558,56 @@ def add_backfill_flags(df: pl.DataFrame) -> pl.DataFrame:
 BF_FLAGS = ["_bf_none", "_bf_rc8", "_bf_sap", "_bf_ge5_ingrowth"]
 
 
+def scaffold_visits(df: pl.DataFrame, ctx) -> pl.DataFrame:
+    """Candidate prior visits: the full scaffold (ctx['visit']) restricted to the subplots in
+    df, with prior_sim_year on the same per-subplot axis as compute_sim_year_ages (years since
+    the subplot's first REAL row; may be negative before it). Without ctx: df's own visits."""
+    if ctx is None:
+        return (df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
+                .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"}))
+    real = df.filter(pl.col("intro_type").is_null()) if "intro_type" in df.columns else df
+    first = real.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_f"))
+    return (ctx["visit"].select(SUBPLOT_ID + ["prior_measdate"]).unique()
+            .join(first, on=SUBPLOT_ID, how="inner")
+            .with_columns(((pl.col("prior_measdate") - pl.col("_f")).dt.total_days() / 365.25)
+                          .round(0).cast(pl.Int32).alias("prior_sim_year"))
+            .drop("_f"))
+
+
 def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) -> pl.DataFrame:
     """Drop candidate phantom slots per the rules above. `prior` carries SUBPLOT_ID, the
-    debut MEASDATE, prior_measdate and the BF_FLAGS; `key` identifies a slot."""
+    debut MEASDATE (D), prior_measdate and the BF_FLAGS; `key` identifies a slot and
+    key minus prior_measdate identifies the source tree (the owner)."""
     if ctx is None:
         return prior
-    breaks, visit = ctx
+    breaks, visit = ctx["breaks"], ctx["visit"]
     owner = [k for k in key if k != "prior_measdate"]
     n0 = prior.height
     prior = prior.filter(~pl.col("_bf_none"))
     n_none = n0 - prior.height
 
-    # (n) nonforest prior visits: stop at the latest one
-    prior = prior.join(visit, on=SUBPLOT_ID + ["prior_measdate"], how="left").with_columns(
-        pl.when(pl.col("_forest_prop").fill_null(0) <= 0).then(pl.col("prior_measdate"))
-        .otherwise(pl.lit(None, dtype=pl.Date)).max().over(owner).alias("_last_nf"))
+    # (n) nonforest: latest entirely-nonforest scaffold visit before D (full scaffold, M1)
+    nf = visit.filter(pl.col("_forest_prop") <= 0).select(SUBPLOT_ID + [pl.col("prior_measdate").alias("_nfd")])
+    last_nf = (prior.select(list(dict.fromkeys(owner + ["MEASDATE"]))).unique()
+               .join(nf, on=SUBPLOT_ID, how="inner")
+               .filter(pl.col("_nfd") < pl.col("MEASDATE"))
+               .group_by(owner).agg(pl.col("_nfd").max().alias("_last_nf")))
+    prior = prior.join(last_nf, on=owner, how="left")
     n1 = prior.height
     prior = prior.filter(pl.col("_last_nf").is_null() | (pl.col("prior_measdate") > pl.col("_last_nf")))
     n_nf = n1 - prior.height
+    prior = prior.join(visit, on=SUBPLOT_ID + ["prior_measdate"], how="left")
 
-    # (b) plot-level procedural break in (p, D] — sapling debuts and RC8 entries
-    applies = pl.col("_bf_sap") | pl.col("_bf_rc8")
+    # (b) plot-level procedural break in (p, D]: the SAPLING part only for sapling re-tally
+    # breaks (closed RC8 saplings, or unrecorded saplings: r2 M9), the RC8-entry part for
+    # RC8 closure breaks
+    cand = prior.filter(pl.col("_bf_sap") | pl.col("_bf_rc8")).select(
+        list(dict.fromkeys(key + ["MEASDATE", "_bf_sap", "_bf_rc8"]))).unique()
     crossed = (
-        prior.filter(applies).select(list(dict.fromkeys(key + ["MEASDATE"]))).unique()
-        .join(breaks, on=PLOT_KEY, how="inner")
+        cand.join(breaks, on=PLOT_KEY, how="inner")
         .filter((pl.col("break_date") > pl.col("prior_measdate")) &
-                (pl.col("break_date") <= pl.col("MEASDATE")))
+                (pl.col("break_date") <= pl.col("MEASDATE")) &
+                ((pl.col("_bf_sap") & pl.col("_brk_sap")) | (pl.col("_bf_rc8") & pl.col("_brk_rc8"))))
         .select(key).unique().with_columns(pl.lit(True).alias("_crossed"))
     )
     n2 = prior.height
@@ -583,9 +626,184 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
                              (pl.col("prior_measdate") > pl.col("_last_micro"))).drop("_last_micro")
         n_c = n3 - prior.height
     print(f"[backfill blocks] of {n0:,} candidate slots dropped: {n_none:,} RC6/9 entry, "
-          f"{n_nf:,} nonforest prior visit, {n_break:,} across a plot procedural break, "
+          f"{n_nf:,} at/before a nonforest visit, {n_break:,} across a plot procedural break, "
           f"{n_c:,} >=5in ingrowth/microplot" + ("" if rule_c else " (rule c off)"))
     return prior.drop(["_micro_prop", "_forest_prop", "_last_nf"])
+
+
+def tree_prior_candidates(df: pl.DataFrame, ctx, rule_c: bool = True) -> pl.DataFrame:
+    """Allowed tree-level phantom slots: every REAL tree debut x every earlier scaffold visit
+    with prior_age >= 1, minus the blocked ones. One row per (tree, prior_measdate)."""
+    real = df.filter(pl.col("intro_type").is_null()) if "intro_type" in df.columns else df
+    tree_debut = real.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+    prior = (
+        tree_debut
+        .join(scaffold_visits(df, ctx), on=SUBPLOT_ID, how="inner")
+        .filter(pl.col("prior_measdate") < pl.col("MEASDATE"))
+        .with_columns(
+            (pl.col("age_calc") + pl.col("prior_sim_year") - pl.col("sim_year"))
+            .cast(pl.Int32).alias("prior_age")
+        )
+        .filter(pl.col("prior_age") >= 1)
+    )
+    return apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"], rule_c=rule_c)
+
+
+def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFrame:
+    """prior_agb = max(MIN_BACKFILL_AGB, agb * (1 - rate * years_back))."""
+    sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(df)
+    missing = (
+        missing
+        .join(sp_rates.rename({"rate": "_r_sp"}),  on=["species_symbol", "epa_l3"], how="left")
+        .join(grp_rates.rename({"rate": "_r_grp"}), on=["spgrpcd",        "epa_l3"], how="left")
+        .join(glb_rates.rename({"rate": "_r_glb"}), on="spgrpcd",                    how="left")
+        .with_columns(pl.coalesce(["_r_sp", "_r_grp", "_r_glb"]).alias("_rate"))
+        .drop(["_r_sp", "_r_grp", "_r_glb"])
+        .with_columns(
+            pl.when(pl.col("_rate").is_not_null())
+            .then(
+                (
+                    pl.col("agb") *
+                    (1.0 - pl.col("_rate") *
+                     (pl.col("age_calc").cast(pl.Float64) - pl.col("prior_age").cast(pl.Float64)))
+                ).clip(MIN_BACKFILL_AGB, None)
+            )
+            .otherwise(pl.lit(MIN_BACKFILL_AGB))
+            .alias("prior_agb")
+        )
+        .drop("_rate")
+    )
+    n_no_rate = missing.filter(pl.col("prior_agb") == MIN_BACKFILL_AGB).height
+    if n_no_rate > 0:
+        print(f"[{tag}] {n_no_rate:,} slots used MIN_BACKFILL_AGB floor (no sapling rate)")
+    return missing
+
+
+def _to_synthetic(missing: pl.DataFrame) -> pl.DataFrame:
+    return (
+        missing
+        .drop(["MEASDATE", "age_calc", "agb", "sim_year"])
+        .rename({"prior_measdate": "MEASDATE", "prior_age": "age_calc",
+                 "prior_sim_year": "sim_year", "prior_agb": "agb"})
+        .with_columns(pl.lit("phantom_backfill").cast(pl.Utf8).alias("intro_type"))
+    )
+
+
+def backfill_phantom_trees(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
+    """
+    For every individual tree (TREE_ID), ensure each prior subplot visit (full scaffold) where
+    that tree would have been alive, and that is not blocked, has a synthetic row
+    (intro_type='phantom_backfill'):
+        prior_age = debut_age + (prior_sim_year - debut_sim_year)
+        biomass   = max(MIN_BACKFILL_AGB, agb * (1 - rate * years_back))
+    """
+    if "intro_type" not in df.columns:
+        df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
+    prior = tree_prior_candidates(df, ctx)
+    existing = (df.select(TREE_ID + ["MEASDATE"]).unique()
+                .rename({"MEASDATE": "prior_measdate"}).with_columns(pl.lit(True).alias("_exists")))
+    missing = (prior.join(existing, on=TREE_ID + ["prior_measdate"], how="left")
+               .filter(pl.col("_exists").is_null()).drop("_exists")
+               .sort(TREE_ID + ["prior_measdate"]))
+    n_plots = missing.select(PLOT_KEY).unique().height if missing.height else 0
+    print(f"[backfill trees] {missing.height:,} missing tree-slots across {n_plots:,} plots")
+    if missing.height == 0:
+        return df
+    global PHANTOM_TREE_SOURCES
+    PHANTOM_TREE_SOURCES = missing.select(
+        TREE_ID + ["prior_measdate", pl.col("MEASDATE").alias("debut_measdate"),
+                   "species_symbol", "prior_age"])
+    synthetic = _to_synthetic(_phantom_agb(missing, df, "backfill trees"))
+    print(f"[backfill trees] generated {synthetic.height:,} synthetic rows")
+    return pl.concat([df, synthetic.select(df.columns)], how="vertical")
+
+
+def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
+    """
+    Second-pass backfill at the cohort level (subplot × species × measdate × age_calc).
+
+    r2 B1: blocks are evaluated PER MEMBER. A cohort slot (ckey at visit t, age a) gets a
+    phantom at an earlier visit p (age a - (t - p)) only if at least one MEMBER tree of
+    that cohort slot survives for that same p:
+      * p before the member's real debut D_m: (member, p) is an allowed tree-level slot
+        (tree_prior_candidates: the member's own debut, flags and blocks), or
+      * p after D_m (the member was missed at p): p is a forest visit and the member has no
+        censoring event in (p, t].
+    The representative row is the surviving member with the smallest TREE_ID.
+    Returns (df, sources) where sources = phantom_cohort_sources (one row per created slot
+    with its surviving member tree ids).
+    """
+    ckey = SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]
+    if "intro_type" not in df.columns:
+        df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
+    empty_src = pl.DataFrame(schema={**{k: pl.Int64 for k in SUBPLOT_ID}, "species_symbol": pl.Utf8,
+                                     "src_measdate": pl.Date, "src_age_calc": pl.Int32,
+                                     "prior_measdate": pl.Date, "prior_age": pl.Int32,
+                                     "n_members": pl.UInt32, "member_trees": pl.Utf8})
+    visits = scaffold_visits(df, ctx)
+    slots = (df.select(ckey + ["sim_year"]).unique()
+             .join(visits, on=SUBPLOT_ID, how="inner")
+             .filter(pl.col("prior_measdate") < pl.col("MEASDATE"))
+             .with_columns((pl.col("age_calc") + pl.col("prior_sim_year") - pl.col("sim_year"))
+                           .cast(pl.Int32).alias("prior_age"))
+             .filter(pl.col("prior_age") >= 1))
+    existing = (df.select(SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]).unique()
+                .rename({"MEASDATE": "prior_measdate", "age_calc": "prior_age"})
+                .with_columns(pl.lit(True).alias("_exists")))
+    slots = (slots.join(existing, on=SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"], how="left")
+             .filter(pl.col("_exists").is_null()).drop("_exists"))
+    if slots.height == 0:
+        print("[backfill cohorts] 0 additional cohort-slots")
+        return df, empty_src
+
+    # members of each source slot, with their own real debut
+    real = df.filter(pl.col("intro_type").is_null())
+    debut = real.group_by(TREE_ID).agg(pl.col("MEASDATE").min().alias("_D"))
+    members = (df.select(ckey + TREE_ID[-1:]).unique()      # TREE (SUBPLOT_ID already in ckey)
+               .join(debut, on=TREE_ID, how="left"))
+    cand = slots.join(members, on=ckey, how="inner")
+    allowed = (tree_prior_candidates(df, ctx).select(TREE_ID + ["prior_measdate"]).unique()
+               .with_columns(pl.lit(True).alias("_ok_pre")) if ctx is not None else
+               cand.select(TREE_ID + ["prior_measdate"]).unique().with_columns(pl.lit(True).alias("_ok_pre")))
+    cand = cand.join(allowed, on=TREE_ID + ["prior_measdate"], how="left")
+    if ctx is not None:
+        cen = (cand.select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
+               .join(ctx["censor"], on=TREE_ID, how="inner")
+               .filter((pl.col("_cdate") > pl.col("prior_measdate")) & (pl.col("_cdate") <= pl.col("MEASDATE")))
+               .select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
+               .with_columns(pl.lit(True).alias("_cen")))
+        forest = ctx["visit"].select(SUBPLOT_ID + ["prior_measdate", "_forest_prop"])
+        cand = (cand.join(cen, on=TREE_ID + ["prior_measdate", "MEASDATE"], how="left")
+                .join(forest, on=SUBPLOT_ID + ["prior_measdate"], how="left"))
+        gap_ok = ((pl.col("prior_measdate") > pl.col("_D")) & pl.col("_cen").is_null()
+                  & (pl.col("_forest_prop").fill_null(0) > 0))
+    else:
+        gap_ok = pl.lit(True)
+    surv = cand.filter(
+        ((pl.col("prior_measdate") < pl.col("_D")) & pl.col("_ok_pre").fill_null(False)) | gap_ok)
+    n_cand_slots = slots.select(ckey + ["prior_measdate"]).unique().height
+    slot_key = SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"]
+    # one phantom per target slot; representative = smallest surviving member (deterministic)
+    rep = (surv.sort(slot_key + ["MEASDATE", "TREE"])
+           .unique(subset=slot_key, keep="first")
+           .select(ckey + ["TREE", "prior_measdate", "prior_age", "prior_sim_year"]))
+    sources = (surv.sort(slot_key + ["MEASDATE", "TREE"])
+               .group_by(slot_key, maintain_order=True)
+               .agg(pl.col("MEASDATE").first().alias("src_measdate"),
+                    pl.col("age_calc").first().alias("src_age_calc"),
+                    pl.col("TREE").n_unique().cast(pl.UInt32).alias("n_members"),
+                    pl.col("TREE").unique().sort().cast(pl.Utf8).str.join(",").alias("member_trees"))
+               .select(empty_src.columns))
+    print(f"[backfill cohorts] {n_cand_slots:,} candidate cohort-slots, "
+          f"{rep.height:,} created (a member survives its own blocks), "
+          f"{n_cand_slots - rep.height:,} blocked (every member individually blocked)")
+    if rep.height == 0:
+        return df, empty_src
+    src_rows = df.sort(ckey + ["TREE", "intro_type"], nulls_last=False).unique(subset=ckey + ["TREE"], keep="first")
+    missing = rep.join(src_rows, on=ckey + ["TREE"], how="inner")
+    synthetic = _to_synthetic(_phantom_agb(missing, df, "backfill cohorts"))
+    print(f"[backfill cohorts] generated {synthetic.height:,} additional synthetic rows")
+    return pl.concat([df, synthetic.select(df.columns)], how="vertical"), sources
 
 
 def add_procedural_break(con, table: str) -> None:
@@ -606,223 +824,6 @@ def add_procedural_break(con, table: str) -> None:
     """)
     n = con.execute(f"SELECT count(*) FILTER (WHERE procedural_break), count(*) FROM {table}").fetchone()
     print(f"[procedural_break] {table}: {n[0]:,}/{n[1]:,} rows at a procedural re-tally visit")
-
-
-def backfill_phantom_trees(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
-    """
-    For every individual tree (TREE_ID), ensure each prior subplot visit where
-    that tree would have been alive has a synthetic row.
-
-    Working at the tree level prevents a cohort biomass jump when a tree
-    "appears" for the first time: its backfilled records are added regardless of
-    whether another tree of the same species happened to have the same age at
-    that prior visit.
-
-    prior_age = debut_age + (prior_sim_year - debut_sim_year)
-
-    Missing tree-visit slots get a synthetic row (intro_type='phantom_backfill')
-    with biomass = max(MIN_BACKFILL_AGB, agb * (1 - rate * years_back)).
-    """
-    # Each tree's first (debut) measurement.
-    tree_debut = (
-        df.sort(TREE_ID + ["MEASDATE"])
-        .unique(subset=TREE_ID, keep="first")
-    )
-
-    # All distinct subplot visits identified by MEASDATE; sim_year used only for arithmetic.
-    subp_visits = (
-        df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
-        .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"})
-    )
-
-    # Cross each tree debut with all strictly-earlier subplot visits.
-    # prior_age = debut_age + (prior_sim_year - debut_sim_year) — pure integer arithmetic.
-    prior = (
-        tree_debut
-        .join(subp_visits, on=SUBPLOT_ID, how="left")
-        .filter(pl.col("prior_measdate") < pl.col("MEASDATE"))
-        .with_columns(
-            (pl.col("age_calc") + pl.col("prior_sim_year") - pl.col("sim_year"))
-            .cast(pl.Int32).alias("prior_age")
-        )
-        .filter(pl.col("prior_age") >= 1)
-    )
-    prior = apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"])
-
-    # Which (tree, prior_measdate) slots already exist in the data?
-    existing = (
-        df.select(TREE_ID + ["MEASDATE"]).unique()
-        .rename({"MEASDATE": "prior_measdate"})
-        .with_columns(pl.lit(True).alias("_exists"))
-    )
-
-    missing = (
-        prior
-        .join(existing, on=TREE_ID + ["prior_measdate"], how="left")
-        .filter(pl.col("_exists").is_null())
-        .drop("_exists")
-        .unique(subset=TREE_ID + ["prior_measdate"], keep="first")
-    )
-
-    n_slots = missing.height
-    n_plots = missing.select(PLOT_KEY).unique().height if n_slots > 0 else 0
-    print(f"[backfill trees] {n_slots:,} missing tree-slots across {n_plots:,} plots")
-
-    if n_slots == 0:
-        return df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
-
-    # Biomass: scale debut agb back by sapling growth rate
-    sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(df)
-
-    missing = (
-        missing
-        .join(sp_rates.rename({"rate": "_r_sp"}),  on=["species_symbol", "epa_l3"], how="left")
-        .join(grp_rates.rename({"rate": "_r_grp"}), on=["spgrpcd",        "epa_l3"], how="left")
-        .join(glb_rates.rename({"rate": "_r_glb"}), on="spgrpcd",                    how="left")
-        .with_columns(pl.coalesce(["_r_sp", "_r_grp", "_r_glb"]).alias("_rate"))
-        .drop(["_r_sp", "_r_grp", "_r_glb"])
-        .with_columns(
-            pl.when(pl.col("_rate").is_not_null())
-            .then(
-                (
-                    pl.col("agb") *
-                    (1.0 - pl.col("_rate") *
-                     (pl.col("age_calc").cast(pl.Float64) - pl.col("prior_age").cast(pl.Float64)))
-                ).clip(MIN_BACKFILL_AGB, None)
-            )
-            .otherwise(pl.lit(MIN_BACKFILL_AGB))
-            .alias("prior_agb")
-        )
-        .drop("_rate")
-    )
-
-    n_no_rate = missing.filter(pl.col("prior_agb") == MIN_BACKFILL_AGB).height
-    if n_no_rate > 0:
-        print(f"[backfill trees] {n_no_rate:,} slots used MIN_BACKFILL_AGB floor (no sapling rate)")
-
-    # Build synthetic rows: swap debut date/age/agb/sim_year with prior values
-    synthetic = (
-        missing
-        .drop(["MEASDATE", "age_calc", "agb", "sim_year"])
-        .rename({
-            "prior_measdate": "MEASDATE",
-            "prior_age":      "age_calc",
-            "prior_sim_year": "sim_year",
-            "prior_agb":      "agb",
-        })
-        .with_columns(pl.lit("phantom_backfill").cast(pl.Utf8).alias("intro_type"))
-    )
-
-    print(f"[backfill trees] generated {synthetic.height:,} synthetic rows")
-    df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
-    return pl.concat([df, synthetic.select(df.columns)], how="vertical")
-
-
-def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
-    """
-    Second-pass backfill at the cohort level (subplot × species × measdate × age_calc).
-
-    Runs after backfill_phantom_trees to catch any remaining cohort-level gaps —
-    e.g. cases where two trees of the same species happen to share an age and the
-    tree-level pass didn't produce a separate record for each combinatorial slot.
-
-    Preserves any intro_type values already set by backfill_phantom_trees.
-    """
-    ckey = SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]
-    cohort_debut = (
-        df.unique(subset=ckey, keep="first")
-    )
-    if ctx is not None:
-        # a cohort slot is blocked only if EVERY member row is blocked by the same rule
-        flags = df.group_by(ckey).agg([pl.col(f).all() for f in BF_FLAGS])
-        cohort_debut = cohort_debut.drop(BF_FLAGS).join(flags, on=ckey, how="left")
-
-    subp_visits = (
-        df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
-        .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"})
-    )
-
-    prior = (
-        cohort_debut
-        .join(subp_visits, on=SUBPLOT_ID, how="left")
-        .filter(pl.col("prior_measdate") < pl.col("MEASDATE"))
-        .with_columns(
-            (pl.col("age_calc") + pl.col("prior_sim_year") - pl.col("sim_year"))
-            .cast(pl.Int32).alias("prior_age")
-        )
-        .filter(pl.col("prior_age") >= 1)
-    )
-    prior = apply_backfill_blocks(prior, ctx, ckey + ["prior_measdate"])
-
-    existing = (
-        df.select(SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]).unique()
-        .rename({"MEASDATE": "prior_measdate", "age_calc": "prior_age"})
-        .with_columns(pl.lit(True).alias("_exists"))
-    )
-
-    missing = (
-        prior
-        .join(existing, on=SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"],
-              how="left")
-        .filter(pl.col("_exists").is_null())
-        .drop("_exists")
-        .unique(subset=SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"],
-                keep="first")
-    )
-
-    n_slots = missing.height
-    n_plots = missing.select(PLOT_KEY).unique().height if n_slots > 0 else 0
-    print(f"[backfill cohorts] {n_slots:,} additional cohort-slots across {n_plots:,} plots")
-
-    if n_slots == 0:
-        if "intro_type" not in df.columns:
-            df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
-        return df
-
-    sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(df)
-
-    missing = (
-        missing
-        .join(sp_rates.rename({"rate": "_r_sp"}),  on=["species_symbol", "epa_l3"], how="left")
-        .join(grp_rates.rename({"rate": "_r_grp"}), on=["spgrpcd",        "epa_l3"], how="left")
-        .join(glb_rates.rename({"rate": "_r_glb"}), on="spgrpcd",                    how="left")
-        .with_columns(pl.coalesce(["_r_sp", "_r_grp", "_r_glb"]).alias("_rate"))
-        .drop(["_r_sp", "_r_grp", "_r_glb"])
-        .with_columns(
-            pl.when(pl.col("_rate").is_not_null())
-            .then(
-                (
-                    pl.col("agb") *
-                    (1.0 - pl.col("_rate") *
-                     (pl.col("age_calc").cast(pl.Float64) - pl.col("prior_age").cast(pl.Float64)))
-                ).clip(MIN_BACKFILL_AGB, None)
-            )
-            .otherwise(pl.lit(MIN_BACKFILL_AGB))
-            .alias("prior_agb")
-        )
-        .drop("_rate")
-    )
-
-    n_no_rate = missing.filter(pl.col("prior_agb") == MIN_BACKFILL_AGB).height
-    if n_no_rate > 0:
-        print(f"[backfill cohorts] {n_no_rate:,} slots used MIN_BACKFILL_AGB floor (no sapling rate)")
-
-    synthetic = (
-        missing
-        .drop(["MEASDATE", "age_calc", "agb", "sim_year"])
-        .rename({
-            "prior_measdate": "MEASDATE",
-            "prior_age":      "age_calc",
-            "prior_sim_year": "sim_year",
-            "prior_agb":      "agb",
-        })
-        .with_columns(pl.lit("phantom_backfill").cast(pl.Utf8).alias("intro_type"))
-    )
-
-    print(f"[backfill cohorts] generated {synthetic.height:,} additional synthetic rows")
-    if "intro_type" not in df.columns:
-        df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
-    return pl.concat([df, synthetic.select(df.columns)], how="vertical")
 
 
 # =============================================================================
@@ -991,9 +992,15 @@ def build_cohorts_landis(con, backfill_blocks: bool = True) -> pl.DataFrame:
 
     # Backfill: tree level first, then cohort level to catch any remaining gaps
     ctx = load_backfill_context(con) if backfill_blocks else None
-    df = add_backfill_flags(df)
+    df = add_backfill_flags(df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type")))
     df = backfill_phantom_trees(df, ctx)
-    df = backfill_phantom_cohorts(df, ctx)
+    df, sources = backfill_phantom_cohorts(df, ctx)
+    global PHANTOM_COHORT_SOURCES
+    PHANTOM_COHORT_SOURCES = sources
+    # phantoms at full-scaffold visits before the subplot's first real row get a negative
+    # sim_year: re-base so sim_year = years since the subplot's first row (>= 0)
+    df = df.with_columns((pl.col("sim_year") - pl.col("sim_year").min().over(SUBPLOT_ID)
+                          .clip(upper_bound=0)).alias("sim_year"))
 
     # plt_cn: unique string key per plot (not per visit); Julia uses it only to
     # count subplots (subp_count = unique subp per plt_cn) for AGB normalisation
@@ -1062,7 +1069,13 @@ def build_cohorts_landis(con, backfill_blocks: bool = True) -> pl.DataFrame:
 
     check_cohort_continuity(df)
 
-    return df
+    # r2 M2: deterministic row order
+    return df.sort(["statecd", "unitcd", "countycd", "plot", "subp", "species_symbol",
+                    "measdate", "age_calc", "intro_type", "agb"], nulls_last=False)
+
+
+PHANTOM_COHORT_SOURCES = None
+PHANTOM_TREE_SOURCES = None
 
 
 # =============================================================================
@@ -1086,8 +1099,20 @@ if __name__ == "__main__":
         "CREATE OR REPLACE TABLE curated_cohorts_landis AS SELECT * FROM _landis_view"
     )
     con.unregister("_landis_view")
+    # diagnostics: the source tree(s) of every phantom row (tree pass / cohort pass)
+    src = PHANTOM_COHORT_SOURCES
+    con.register("_src_view", src.to_arrow())
+    con.execute("CREATE OR REPLACE TABLE phantom_cohort_sources AS SELECT * FROM _src_view")
+    con.unregister("_src_view")
+    tsrc = PHANTOM_TREE_SOURCES if PHANTOM_TREE_SOURCES is not None else pl.DataFrame(
+        schema={**{k: pl.Int64 for k in TREE_ID}, "prior_measdate": pl.Date,
+                "debut_measdate": pl.Date, "species_symbol": pl.Utf8, "prior_age": pl.Int32})
+    con.register("_tsrc_view", tsrc.to_arrow())
+    con.execute("CREATE OR REPLACE TABLE phantom_tree_sources AS SELECT * FROM _tsrc_view")
+    con.unregister("_tsrc_view")
     con.commit()
-    print(f"\n[save] curated_cohorts_landis → {cohorts.height:,} rows")
+    print(f"\n[save] curated_cohorts_landis → {cohorts.height:,} rows; "
+          f"phantom_cohort_sources → {0 if src is None else src.height:,} rows")
 
     con.close()
     print("[done]")

@@ -134,7 +134,7 @@ def build_cohort_intro(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("STATUSCD") == 1) &
             pl.col("cohort_id").is_not_null()
         )
-        .sort(["cohort_id", "MEASDATE"])
+        .sort(["cohort_id", "MEASDATE"] + TREE_ID)     # r2 M2: full key tie-break
         .unique(subset=["cohort_id"], keep="first")
         .select([
             "cohort_id",

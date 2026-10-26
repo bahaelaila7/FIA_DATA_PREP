@@ -196,6 +196,104 @@ RECONCILE_NEW_CODES = (3, 4, 6, 7, 8, 9)
 CENSOR_REASON = {5: "shrank", 6: "moved", 8: "procedural", 9: "nonsampled"}
 
 
+# Silent sapling re-tally detector (audit r2 B2). Some state x MANUAL transitions re-tallied
+# the microplot saplings WITHOUT closing the old records (e.g. KY MANUAL 1.0 -> 4.0: 184 plots
+# lost all 1,134 saplings with no record at all). A plot-visit is an 'unrecorded' break when
+#   (i)  plot tier: >= RETALLY_MIN_SHARE and >= RETALLY_MIN_N of the previous visit's live
+#        saplings (SUBP <= 4, own COND_STATUS 1, subplot still sampled forest at the next
+#        visit = SUBP_STATUS_CD 1) have NO tree record at all at the next visit, or
+#   (ii) transition tier: the (STATECD, prev MANUAL, next MANUAL) transition loses
+#        >= RETALLY_MIN_SHARE of its pooled saplings (>= RETALLY_TRANS_MIN_N saplings) and
+#        this plot-visit has >= 1 unrecorded sapling (catches the 1-2 sapling plots).
+RETALLY_MIN_SHARE   = 0.5
+RETALLY_MIN_N       = 3
+RETALLY_TRANS_MIN_N = 20
+
+
+def _sql_procedural_breaks(con, scope: str = ""):
+    """procedural_breaks = per (plot, MEASDATE) re-tally visits, break_kind 'rc8' (STATUSCD=0
+    + RECONCILECD=8 closures) or 'unrecorded' (silent re-tally, detector above). Also leaves
+    _retally_saplings (every previous-visit live sapling with its next-visit status)."""
+    con.execute(f"""
+    CREATE OR REPLACE TEMP TABLE _pv AS
+    SELECT P.CN AS PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.MANUAL,
+           P.PLOT_STATUS_CD,
+           MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER), 6),
+                     COALESCE(P.MEASDAY, 15)) AS MEASDATE
+    FROM PLOT P JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
+    WHERE P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope};
+    CREATE OR REPLACE TEMP TABLE _pv2 AS
+    SELECT *, LEAD(PLT_CN) OVER w AS next_cn, LEAD(MEASDATE) OVER w AS next_md,
+              LEAD(MANUAL) OVER w AS next_manual, LEAD(PLOT_STATUS_CD) OVER w AS next_ps
+    FROM _pv WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY MEASDATE, INVYR);
+    CREATE OR REPLACE TEMP TABLE _retally_saplings AS
+    SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, v.MEASDATE, v.next_md,
+           v.MANUAL AS prev_manual, v.next_manual, (T2.CN IS NULL) AS unrecorded,
+           T2.STATUSCD AS next_statuscd, CAST(T2.RECONCILECD AS INTEGER) AS next_rc
+    FROM TREE T
+    JOIN _pv2 v ON v.PLT_CN = T.PLT_CN
+    JOIN COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
+    JOIN SUBPLOT SN ON SN.PLT_CN = v.next_cn AND SN.SUBP = T.SUBP AND SN.SUBP_STATUS_CD = 1
+    LEFT JOIN TREE T2 ON T2.PLT_CN = v.next_cn AND T2.SUBP = T.SUBP AND T2.TREE = T.TREE
+    WHERE T.STATUSCD = 1 AND T.DIA < 5 AND T.TPA_UNADJ > 0 AND T.SUBP <= 4
+      AND C.COND_STATUS_CD = 1 AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
+      AND v.PLOT_STATUS_CD < 3 AND v.next_cn IS NOT NULL AND v.next_ps < 3;
+    """)
+    con.execute(f"""
+    DROP TABLE IF EXISTS retally_transitions;
+    CREATE TABLE retally_transitions AS
+    SELECT STATECD, prev_manual, next_manual, COUNT(*) AS n_saplings,
+           COUNT(*) FILTER (WHERE unrecorded) AS n_unrecorded,
+           COUNT(*) FILTER (WHERE unrecorded) / COUNT(*) AS share_unrecorded,
+           (COUNT(*) >= {RETALLY_TRANS_MIN_N}
+            AND COUNT(*) FILTER (WHERE unrecorded) >= {RETALLY_MIN_SHARE} * COUNT(*)) AS is_retally_transition
+    FROM _retally_saplings GROUP BY ALL;
+    DROP TABLE IF EXISTS procedural_breaks;
+    CREATE TABLE procedural_breaks AS
+    WITH rc8 AS (
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE,
+               COUNT(*) AS n_closed_rc8,
+               COUNT(*) FILTER (WHERE PREVDIA < 5) AS n_closed_rc8_prev_sapling
+        FROM tree_status0_events WHERE RC = 8 GROUP BY ALL),
+    pv AS (
+        SELECT s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.next_md AS MEASDATE,
+               ANY_VALUE(s.prev_manual) AS prev_manual, ANY_VALUE(s.next_manual) AS next_manual,
+               COUNT(*) AS n_prev_saplings, COUNT(*) FILTER (WHERE s.unrecorded) AS n_unrecorded_saplings
+        FROM _retally_saplings s GROUP BY s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.next_md),
+    unrec AS (
+        SELECT pv.*,
+               CASE WHEN pv.n_unrecorded_saplings >= {RETALLY_MIN_N}
+                         AND pv.n_unrecorded_saplings >= {RETALLY_MIN_SHARE} * pv.n_prev_saplings THEN 'plot'
+                    WHEN pv.n_unrecorded_saplings >= 1 AND tr.is_retally_transition THEN 'transition'
+               END AS detect_tier
+        FROM pv LEFT JOIN retally_transitions tr
+          ON tr.STATECD = pv.STATECD AND tr.prev_manual IS NOT DISTINCT FROM pv.prev_manual
+         AND tr.next_manual IS NOT DISTINCT FROM pv.next_manual)
+    SELECT COALESCE(r.STATECD, u.STATECD) AS STATECD, COALESCE(r.UNITCD, u.UNITCD) AS UNITCD,
+           COALESCE(r.COUNTYCD, u.COUNTYCD) AS COUNTYCD, COALESCE(r.PLOT, u.PLOT) AS PLOT,
+           COALESCE(r.MEASDATE, u.MEASDATE) AS MEASDATE,
+           COALESCE(r.n_closed_rc8, 0) AS n_closed_rc8,
+           COALESCE(r.n_closed_rc8_prev_sapling, 0) AS n_closed_rc8_prev_sapling,
+           COALESCE(u.n_prev_saplings, 0) AS n_prev_saplings,
+           COALESCE(u.n_unrecorded_saplings, 0) AS n_unrecorded_saplings,
+           u.detect_tier,
+           CASE WHEN r.PLOT IS NOT NULL THEN 'rc8' ELSE 'unrecorded' END AS break_kind
+    FROM rc8 r
+    FULL JOIN (SELECT * FROM unrec WHERE detect_tier IS NOT NULL) u
+      ON u.STATECD=r.STATECD AND u.UNITCD=r.UNITCD AND u.COUNTYCD=r.COUNTYCD
+     AND u.PLOT=r.PLOT AND u.MEASDATE=r.MEASDATE
+    """)
+    # an rc8 break plot-visit also needs its unrecorded-sapling count (they are censored too)
+    con.execute("""
+    UPDATE procedural_breaks b SET n_prev_saplings = pv.n, n_unrecorded_saplings = pv.u
+    FROM (SELECT STATECD, UNITCD, COUNTYCD, PLOT, next_md, COUNT(*) n,
+                 COUNT(*) FILTER (WHERE unrecorded) u
+          FROM _retally_saplings GROUP BY ALL) pv
+    WHERE b.break_kind = 'rc8' AND pv.STATECD=b.STATECD AND pv.UNITCD=b.UNITCD
+      AND pv.COUNTYCD=b.COUNTYCD AND pv.PLOT=b.PLOT AND pv.next_md=b.MEASDATE
+    """)
+
+
 def sql_excluded_trees(con, scope: str = ""):
     """
     Step 3b — per-tree reconcile events (curation-fix 2026-10-26).
@@ -220,10 +318,15 @@ def sql_excluded_trees(con, scope: str = ""):
       tree_status0_events    one row per STATUSCD=0 record (tree, MEASDATE, RC) — ALL of them,
                              so a censor -> live -> censor history is not collapsed (audit M8)
       tree_reconcile_events  per tree: rc7_erroneous_measdate, FIRST and LAST censoring
-      procedural_breaks      per (plot, MEASDATE): STATUSCD=0 + RECONCILECD=8 closures, i.e.
-                             a procedural re-tally visit. Keyed per PLOT because the AL/GA
-                             (MANUAL 1.5-2.0) sapling re-tally was plot-wide: old saplings
-                             closed RC8 on one subplot, re-tallied as RC3/RC8 on others (B2)
+      procedural_breaks      per (plot, MEASDATE) re-tally visit; break_kind 'rc8'
+                             (STATUSCD=0 + RECONCILECD=8 closures; keyed per PLOT because the
+                             AL/GA MANUAL 1.5-2.0 sapling re-tally was plot-wide) or
+                             'unrecorded' (silent re-tally, _sql_procedural_breaks)
+      retally_transitions    per state x (prev MANUAL, next MANUAL): pooled unrecorded share
+      tree_censor_events     every censoring event (tree, MEASDATE, RC, reason): STATUSCD=0
+                             non-RC7 records + saplings left UNRECORDED at a break
+                             (reason 'procedural_unrecorded')
+      tree_landuse_exits     live records on a nonforest/water own condition (M6)
     """
     con.execute(f"""
     DROP TABLE IF EXISTS tree_status0_events;
@@ -238,27 +341,57 @@ def sql_excluded_trees(con, scope: str = ""):
     WHERE T.STATUSCD = 0 AND T.SUBP <= 4
       AND P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope}
     """)
+    _sql_procedural_breaks(con, scope)
+    con.execute("""
+    DROP TABLE IF EXISTS tree_censor_events;
+    CREATE TABLE tree_censor_events AS
+    SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE, RC,
+           CASE RC WHEN 5 THEN 'shrank' WHEN 6 THEN 'moved' WHEN 8 THEN 'procedural'
+                   WHEN 9 THEN 'nonsampled' ELSE 'not_in_sample' END AS reason
+    FROM tree_status0_events WHERE RC IS DISTINCT FROM 7
+    UNION ALL
+    SELECT s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.SUBP, s.TREE, s.next_md, NULL,
+           'procedural_unrecorded'
+    FROM _retally_saplings s
+    JOIN procedural_breaks b ON b.STATECD=s.STATECD AND b.UNITCD=s.UNITCD
+         AND b.COUNTYCD=s.COUNTYCD AND b.PLOT=s.PLOT AND b.MEASDATE=s.next_md
+    WHERE s.unrecorded
+    """)
     con.execute("""
     DROP TABLE IF EXISTS tree_reconcile_events;
     CREATE TABLE tree_reconcile_events AS
-    SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE,
-           MIN(MEASDATE) FILTER (WHERE RC = 7)                            AS rc7_erroneous_measdate,
-           MIN(MEASDATE) FILTER (WHERE RC IS DISTINCT FROM 7)             AS censor_measdate,
-           ARG_MIN(RC, MEASDATE) FILTER (WHERE RC IS DISTINCT FROM 7)     AS censor_reconcilecd,
-           MAX(MEASDATE) FILTER (WHERE RC IS DISTINCT FROM 7)             AS censor_last_measdate,
-           ARG_MAX(RC, MEASDATE) FILTER (WHERE RC IS DISTINCT FROM 7)     AS censor_last_reconcilecd,
-           COUNT(*)                                                       AS n_status0_records
-    FROM tree_status0_events
-    GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
+    WITH r7 AS (
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE,
+               MIN(MEASDATE) AS rc7_erroneous_measdate, COUNT(*) AS n_rc7
+        FROM tree_status0_events WHERE RC = 7 GROUP BY ALL),
+    c AS (
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE,
+               MIN(MEASDATE)                    AS censor_measdate,
+               ARG_MIN(RC, MEASDATE)            AS censor_reconcilecd,
+               ARG_MIN(reason, MEASDATE)        AS censor_reason,
+               MAX(MEASDATE)                    AS censor_last_measdate,
+               ARG_MAX(RC, MEASDATE)            AS censor_last_reconcilecd,
+               ARG_MAX(reason, MEASDATE)        AS censor_last_reason,
+               COUNT(*)                         AS n_censor_events
+        FROM tree_censor_events GROUP BY ALL)
+    SELECT * FROM r7 FULL JOIN c USING (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE)
     """)
-    con.execute("""
-    DROP TABLE IF EXISTS procedural_breaks;
-    CREATE TABLE procedural_breaks AS
-    SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE,
-           COUNT(*)                          AS n_closed_rc8,
-           COUNT(*) FILTER (WHERE PREVDIA < 5) AS n_closed_rc8_prev_sapling
-    FROM tree_status0_events WHERE RC = 8
-    GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE
+    # M6: live records on a NONFOREST / WATER own condition (excluded by the live rule): the
+    # tree still exists but its land left forest -> terminal fate 'diverted_landuse'
+    con.execute(f"""
+    DROP TABLE IF EXISTS tree_landuse_exits;
+    CREATE TABLE tree_landuse_exits AS
+    SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE,
+           MIN(MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER), 6),
+                         COALESCE(P.MEASDAY, 15))) AS exit_measdate
+    FROM TREE T
+    JOIN PLOT P ON P.CN = T.PLT_CN
+    JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
+    JOIN COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
+    WHERE T.STATUSCD = 1 AND T.SUBP <= 4 AND C.COND_STATUS_CD IN (2, 3, 4)
+      AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
+      AND P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope}
+    GROUP BY ALL
     """)
     # Backward-compatible table name: the trees whose earlier records are discarded.
     con.execute("""
@@ -276,11 +409,14 @@ def sql_excluded_trees(con, scope: str = ""):
     nb = con.execute("SELECT COUNT(*) FROM procedural_breaks").fetchone()[0]
     print(f"[step3b] tree_reconcile_events: {n:,} trees with STATUSCD=0 records; "
           f"{n7:,} RC7 erroneous-prior-tally trees (earlier records dropped); "
-          f"{nb:,} plot-visit procedural breaks (closed RC8)")
-    for rc, cnt in con.execute("""
-        SELECT censor_reconcilecd, COUNT(*) FROM tree_reconcile_events
-        WHERE censor_measdate IS NOT NULL GROUP BY 1 ORDER BY 2 DESC""").fetchall():
-        print(f"        censoring RC={rc} ({CENSOR_REASON.get(rc, 'not_in_sample')}): {cnt:,}")
+          f"{nb:,} plot-visit procedural breaks")
+    for reason, cnt in con.execute("""
+        SELECT reason, COUNT(*) FROM tree_censor_events GROUP BY 1 ORDER BY 2 DESC""").fetchall():
+        print(f"        censoring events {reason:22s}: {cnt:,}")
+    for kind, n, ns in con.execute("""
+        SELECT break_kind, COUNT(*), SUM(n_unrecorded_saplings) FROM procedural_breaks
+        GROUP BY 1 ORDER BY 1""").fetchall():
+        print(f"        procedural breaks {kind:10s}: {n:,} plot-visits ({ns or 0:,} unrecorded saplings)")
 
 
 # =============================================================================
@@ -358,8 +494,8 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
         CSY.forest_micrcond_prop  AS subp_forest_micrcond_prop,
         CSY.has_cond_status3      AS subp_has_cond_status3,
         LS.n_measurements         AS n_clean_visits,
-        E.censor_measdate, E.censor_reconcilecd,
-        E.censor_last_measdate, E.censor_last_reconcilecd
+        E.censor_measdate, E.censor_reconcilecd, E.censor_reason,
+        E.censor_last_measdate, E.censor_last_reconcilecd, E.censor_last_reason
     FROM TREE T
     JOIN REF_SPECIES SP ON SP.SPCD = T.SPCD
     JOIN clean_subplot_years CSY
@@ -391,7 +527,8 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
       AND (   (T.STATUSCD = 1 AND T.TPA_UNADJ > 0           -- live: a sample tree (TPA > 0) ...
                AND C.COND_STATUS_CD = 1)                    -- ... on its own forest condition
            OR (T.STATUSCD IN (2, 3)                         -- dead / cut: kept for FATE even with
-               AND C.COND_STATUS_CD IN (1, 2)))             -- a null TPA (audit I1)
+               AND C.COND_STATUS_CD IN (1, 2, 3, 4)))       -- a null TPA (audit I1); also on
+                                                            -- nonforest/water (r2 M5)
       AND NOT (E.rc7_erroneous_measdate IS NOT NULL         -- erroneously tallied previously
                AND CSY.MEASDATE < E.rc7_erroneous_measdate)
       {where_state}
@@ -413,7 +550,9 @@ def annotate_reconcile(df: pl.DataFrame) -> pl.DataFrame:
                          a non-mortality reason (NOT a death or removal)
       censor_measdate    MEASDATE of that STATUSCD=0 record
       censor_reconcilecd its RECONCILECD (5 shrank, 6 moved, 8 procedural, 9 nonsampled)
-      censor_reason      label of the above ('not_in_sample' for null/other codes)
+      censor_reason      label of the above ('not_in_sample' for null/other codes;
+                         'procedural_unrecorded' = live sapling with NO record at the next
+                         visit of a procedural re-tally plot-visit — r2 B2)
       censor_last_measdate / censor_last_reconcilecd / censor_last_reason
                          the LAST such record (a tree can be censored, re-enter, and be
                          censored again — audit M8); terminal fate uses the last one
@@ -427,17 +566,11 @@ def annotate_reconcile(df: pl.DataFrame) -> pl.DataFrame:
         .then(pl.col("_rc_first")).otherwise(pl.lit(None, dtype=pl.Int32))
         .alias("reconcile_new")
     ).drop("_rc_first")
-    reason = pl.col("censor_reconcilecd").replace_strict(
-        CENSOR_REASON, default="not_in_sample", return_dtype=pl.Utf8)
-    reason_last = pl.col("censor_last_reconcilecd").replace_strict(
-        CENSOR_REASON, default="not_in_sample", return_dtype=pl.Utf8)
+    # censor_reason / censor_last_reason come from tree_censor_events (SQL): RC-coded
+    # STATUSCD=0 exits plus 'procedural_unrecorded' (sapling silently dropped at a re-tally)
     df = df.with_columns([
         pl.col("reconcile_new").is_not_null().alias("not_ingrowth"),
         pl.col("censor_measdate").is_not_null().alias("censored"),
-        pl.when(pl.col("censor_measdate").is_not_null()).then(reason)
-          .otherwise(pl.lit(None, dtype=pl.Utf8)).alias("censor_reason"),
-        pl.when(pl.col("censor_last_measdate").is_not_null()).then(reason_last)
-          .otherwise(pl.lit(None, dtype=pl.Utf8)).alias("censor_last_reason"),
     ])
     n_new = df.filter(pl.col("not_ingrowth")).select(TREE_ID).unique().height
     n_cen = df.filter(pl.col("censored")).select(TREE_ID).unique().height
@@ -681,7 +814,10 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
       - alive: STATUSCD=1
       - harvest_explicit: STATUSCD=3 or (STATUSCD=2 + AGENTCD=80)
       - harvest_inferred: STATUSCD=2 + condition has TRTCD=10 +
-            no other tree in the same condition-year has explicit harvest
+            no other tree in the same condition-year has explicit harvest +
+            AGENTCD is NULL (r2 M7: a recorded non-harvest agent 10-70 is FIA's own
+            mortality call — all 152 AL harvest_inferred vs GRM MORTALITY disagreements
+            had one)
       - dead: STATUSCD=2 with non-harvest cause
     """
     cond_has_cutting = (
@@ -721,7 +857,8 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
         .then(
             pl.when(
                 cond_has_cutting &
-                ~pl.col("_cond_has_explicit").fill_null(False)
+                ~pl.col("_cond_has_explicit").fill_null(False) &
+                pl.col("AGENTCD").is_null()
             )
             .then(pl.lit("harvest_inferred"))
             .otherwise(pl.lit("dead"))
@@ -734,15 +871,64 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame) -> pl.DataFrame:
+def _next_visit(last: pl.DataFrame, subplot_years: pl.DataFrame) -> pl.DataFrame:
+    """Per tree: is there a subplot visit after its last record (`_later`), and is the FIRST
+    such visit entirely nonforest/water (`_next_nonforest`: forest subplot + microplot
+    proportion 0). `last` carries TREE_ID + _last_md; subplot_years needs SUBPLOT_ID +
+    MEASDATE (+ forest_subpcond_prop / forest_micrcond_prop when available)."""
+    sv = subplot_years.select(
+        SUBPLOT_ID + ["MEASDATE"] +
+        [c for c in ("forest_subpcond_prop", "forest_micrcond_prop") if c in subplot_years.columns]
+    ).unique()
+    if "forest_subpcond_prop" in sv.columns:
+        sv = sv.with_columns(
+            ((pl.col("forest_subpcond_prop").fill_null(0) + pl.col("forest_micrcond_prop").fill_null(0)) <= 0)
+            .alias("_nf"))
+    else:
+        sv = sv.with_columns(pl.lit(False).alias("_nf"))
+    return (last.join(sv, on=SUBPLOT_ID, how="inner")
+            .filter(pl.col("MEASDATE") > pl.col("_last_md"))
+            .sort(TREE_ID + ["MEASDATE"])
+            .group_by(TREE_ID, maintain_order=True)
+            .agg(pl.len().alias("_n_later"), pl.col("_nf").first().alias("_next_nonforest"))
+            .with_columns((pl.col("_n_later") > 0).alias("_later"))
+            .select(TREE_ID + ["_later", "_next_nonforest"]))
+
+
+def final_fate_expr(fate_col: str, last_md_col: str) -> pl.Expr:
+    """Shared terminal-fate decision for a tree whose last record is `fate_col` at
+    `last_md_col` (needs censor_last_measdate/_reason, _later, _next_nonforest, _lu_exit)."""
+    alive = pl.col(fate_col) == "alive"
+    return (
+        pl.when(~alive).then(pl.col(fate_col))
+        .when(pl.col("censor_last_measdate").is_not_null() &
+              (pl.col("censor_last_measdate") > pl.col(last_md_col)))
+            .then(pl.lit("censored_") + pl.col("censor_last_reason"))
+        .when(pl.col("_later").fill_null(False) &
+              (pl.col("_lu_exit").fill_null(False) | pl.col("_next_nonforest").fill_null(False)))
+            .then(pl.lit("diverted_landuse"))
+        .when(pl.col("_later").fill_null(False))
+            .then(pl.lit("disappeared_inferred_removal"))
+        .otherwise(pl.lit("alive"))
+    )
+
+
+def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
+                        landuse_exits: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     Per-tree terminal fate (curation-fix 2026-10-26; this was dead code in v3 before):
       last record dead/cut               -> its tree_fate (dead / harvest_explicit / harvest_inferred)
       last record alive, and the tree was censored after it (STATUSCD=0 + RC 5/6/8/9)
                                          -> 'censored_<reason>' (NOT a removal)
-      last record alive, subplot revisited later without the tree, no censoring record
+      last record alive, subplot revisited later, and the land left forest: the tree has a
+        live record on a nonforest/water condition after it (tree_landuse_exits), or the
+        subplot's next visit is entirely nonforest/water (forest subplot + microplot
+        proportion 0)                    -> 'diverted_landuse' (r2 M6; not a removal)
+      last record alive, subplot revisited later without the tree, otherwise
                                          -> 'disappeared_inferred_removal'
       last record alive, no later visit  -> 'alive'
+    Also adds dead_at_first_visit (r2 M8): the tree's first record is dead (STATUSCD 2) at
+    the subplot's FIRST visit — standing dead when first seen, no observed mortality.
     """
     last = (
         df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
@@ -750,19 +936,23 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame) -> pl.Dat
                            pl.col("tree_fate").alias("_last_fate"),
                            "censor_last_measdate", "censor_last_reason"])
     )
-    last_visit = subplot_years.group_by(SUBPLOT_ID).agg(
-        pl.col("MEASDATE").max().alias("_last_subp_md"))
-    last = last.join(last_visit, on=SUBPLOT_ID, how="left").with_columns(
-        pl.when(pl.col("_last_fate") != "alive").then(pl.col("_last_fate"))
-        .when(pl.col("censor_last_measdate").is_not_null() &
-              (pl.col("censor_last_measdate") > pl.col("_last_md")))
-            .then(pl.lit("censored_") + pl.col("censor_last_reason"))
-        .when(pl.col("_last_subp_md") > pl.col("_last_md"))
-            .then(pl.lit("disappeared_inferred_removal"))
-        .otherwise(pl.lit("alive"))
-        .alias("final_tree_fate")
-    ).select(TREE_ID + ["final_tree_fate"])
+    nxt = _next_visit(last.select(TREE_ID + ["_last_md"]), subplot_years)
+    if landuse_exits is None or landuse_exits.height == 0:
+        landuse_exits = pl.DataFrame(schema={**{k: pl.Int64 for k in TREE_ID}, "exit_measdate": pl.Date})
+    lex = (last.select(TREE_ID + ["_last_md"]).join(landuse_exits, on=TREE_ID, how="inner")
+           .filter(pl.col("exit_measdate") > pl.col("_last_md"))
+           .select(TREE_ID).unique().with_columns(pl.lit(True).alias("_lu_exit")))
+    last = (last.join(nxt, on=TREE_ID, how="left").join(lex, on=TREE_ID, how="left")
+            .with_columns(final_fate_expr("_last_fate", "_last_md").alias("final_tree_fate"))
+            .select(TREE_ID + ["final_tree_fate"]))
     df = df.join(last, on=TREE_ID, how="left")
+
+    first_subp = subplot_years.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_fsv"))
+    dfirst = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+              .join(first_subp, on=SUBPLOT_ID, how="left")
+              .select(TREE_ID + [((pl.col("STATUSCD") == 2) & (pl.col("MEASDATE") == pl.col("_fsv")))
+                                 .fill_null(False).alias("dead_at_first_visit")]))
+    df = df.join(dfirst, on=TREE_ID, how="left")
 
     # Print breakdown
     fate_counts = df.group_by("tree_fate").len().sort("len", descending=True)
@@ -2092,13 +2282,14 @@ def diagnostics(df: pl.DataFrame, snapshots: pl.DataFrame):
 # Pipeline
 # =============================================================================
 
-def _polars_steps(con, df: pl.DataFrame, estage_raw, all_subplot_years) -> pl.DataFrame:
+def _polars_steps(con, df: pl.DataFrame, estage_raw, all_subplot_years,
+                  landuse_exits=None) -> pl.DataFrame:
     """Steps 4b-6e for one batch (one state) of tree records."""
     df = annotate_reconcile(df)
     df, _confusion_edges = analyze_spcd_confusion(df)
     df = handle_reconcile5(df)
     df = classify_tree_fate(df)
-    df = add_final_tree_fate(df, all_subplot_years)
+    df = add_final_tree_fate(df, all_subplot_years, landuse_exits)
 
     tree_bounds = _compute_tree_bounds(df, all_subplot_years)
     df = propagate_totage(df, tree_bounds)
@@ -2130,6 +2321,7 @@ FIX_COLUMNS = [
     "n_clean_visits", "reconcile_new", "not_ingrowth", "censored", "censor_measdate",
     "censor_reconcilecd", "censor_reason", "spgrpcd_resolved", "final_tree_fate",
     "censor_last_measdate", "censor_last_reconcilecd", "censor_last_reason",
+    "dead_at_first_visit",
 ]
 
 
@@ -2172,10 +2364,14 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
         if df.height == 0:
             continue
         all_subplot_years = con.execute(f"""
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE,
+                   forest_subpcond_prop, forest_micrcond_prop
             FROM clean_subplot_years WHERE STATECD = {int(st)}
         """).pl()
-        df = _polars_steps(con, df, estage_raw, all_subplot_years)
+        landuse_exits = con.execute(f"""
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate
+            FROM tree_landuse_exits WHERE STATECD = {int(st)}""").pl()
+        df = _polars_steps(con, df, estage_raw, all_subplot_years, landuse_exits)
         df = df.select([c for c in df.columns if c not in FIX_COLUMNS] + FIX_COLUMNS)
 
         scaffold = scaffold_all.filter(pl.col("STATECD") == st)

@@ -30,7 +30,15 @@ ap.add_argument("--old-slim")
 ap.add_argument("--new-slim")
 ap.add_argument("--states")
 ap.add_argument("--counties")
+ap.add_argument("--determinism-db", help="a second curated DB built from the same input (cohort steps re-run)")
 a = ap.parse_args()
+FAILS = []
+
+
+def check(name, ok, detail=""):
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name} {detail}")
+    if not ok:
+        FAILS.append(name)
 
 con = duckdb.connect(":memory:")
 con.execute(f"SET threads={os.environ.get('FIA_DUCKDB_THREADS', '3')}; "
@@ -108,19 +116,29 @@ show("1c. reference records not in new curated (should be 0)", """
 SELECT count(*) n, round(sum(TPA_UNADJ),1) tpa FROM ref r ANTI JOIN newct n ON n.CN = r.CN""")
 show("1d. curated rows on SUBP > 4 (auxiliary points; should be 0)", f"""
 SELECT count(*) n FROM new.curated_trees WHERE SUBP > 4 AND {scope()}""")
-show("1e. dead/cut records lost: raw STATUSCD 2/3 (annual, SUBP<=4, not P2A, COND_STATUS 1/2) of "
-     "trees present in new curated, missing from it (should be ~0)", f"""
-WITH tr AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE FROM new.curated_trees WHERE {scope()}),
-raw AS (
-  SELECT T.CN, T.STATUSCD, T.TPA_UNADJ IS NULL AS tpa_null
+# (f) dead/cut records lost — over EVERY tree of the raw reference, including trees that are
+# absent from the new curated table altogether
+con.execute(f"""
+CREATE TEMP TABLE ref_trees AS
+SELECT DISTINCT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE
+FROM f.TREE T JOIN ref r ON r.CN = T.CN""")
+show("1e. (f) dead/cut records of raw-reference trees (annual, SUBP<=4, not P2A, own COND_STATUS 1-4) "
+     "and whether they are in new curated; trees of the reference absent from curated", f"""
+WITH raw AS (
+  SELECT T.CN, T.STATUSCD, T.TPA_UNADJ IS NULL AS tpa_null, C.COND_STATUS_CD AS cs
   FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y'
   JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
-  JOIN tr ON tr.STATECD=T.STATECD AND tr.UNITCD=T.UNITCD AND tr.COUNTYCD=T.COUNTYCD AND tr.PLOT=T.PLOT
-         AND tr.SUBP=T.SUBP AND tr.TREE=T.TREE
-  WHERE T.STATUSCD IN (2,3) AND T.SUBP<=4 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y' AND C.COND_STATUS_CD IN (1,2)
-    AND {scope('T')})
-SELECT raw.STATUSCD, raw.tpa_null, count(*) raw_n, count(n.CN) in_curated
+  JOIN f.SUBPLOT SU ON SU.PLT_CN=T.PLT_CN AND SU.SUBP=T.SUBP
+  JOIN ref_trees rt ON rt.STATECD=T.STATECD AND rt.UNITCD=T.UNITCD AND rt.COUNTYCD=T.COUNTYCD
+       AND rt.PLOT=T.PLOT AND rt.SUBP=T.SUBP AND rt.TREE=T.TREE
+  WHERE T.STATUSCD IN (2,3) AND T.SUBP<=4 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y' AND C.COND_STATUS_CD IN (1,2,3,4)
+    AND P.PLOT_STATUS_CD < 3 AND COALESCE(SU.SUBP_STATUS_CD, -1) <> 3)
+SELECT raw.STATUSCD, raw.tpa_null, raw.cs IN (3,4) AS on_water, count(*) raw_n, count(n.CN) in_curated
 FROM raw LEFT JOIN new.curated_trees n ON n.CN = raw.CN GROUP BY ALL ORDER BY ALL""")
+r = con.execute("""SELECT count(*) FROM ref_trees rt ANTI JOIN (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE
+                   FROM new.curated_trees) n USING (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE)""").fetchone()[0]
+check("1e reference trees absent from curated", r == 0, f"({r})")
+
 show("1f. phantom rows on entirely nonforest subplot-visits (should be 0)", """
 SELECT 'curated_cohorts_landis' t, count(*) phantoms,
        count(*) FILTER (WHERE COALESCE(s.forest_subpcond_prop,0)+COALESCE(s.forest_micrcond_prop,0)=0) nonforest
@@ -133,20 +151,203 @@ SELECT 'tree_trajectories', count(*),
 FROM new.tree_trajectories c JOIN new.clean_subplot_years s ON s.STATECD=c.statecd AND s.UNITCD=c.unitcd
   AND s.COUNTYCD=c.countycd AND s.PLOT=c.plot AND s.SUBP=c.subp AND s.MEASDATE=c.measdate
 WHERE c.intro_type='phantom_backfill'""")
-show("1g. phantom rows at a procedural re-tally (break) visit's PRIOR visit, by source tree entry "
-     "class: double-count risk (sapling debuts should be 0)", """
-WITH ph AS (SELECT * FROM new.tree_trajectories WHERE intro_type='phantom_backfill'),
-deb AS (SELECT statecd,unitcd,countycd,plot,subp,tree, min(measdate) d FROM new.tree_trajectories
-        WHERE intro_type='real' GROUP BY ALL),
-ddia AS (SELECT t.statecd,t.unitcd,t.countycd,t.plot,t.subp,t.tree, t.dia FROM new.tree_trajectories t
-         JOIN deb USING (statecd,unitcd,countycd,plot,subp,tree) WHERE t.measdate=deb.d AND t.intro_type='real')
-SELECT COALESCE(CAST(ph.reconcile_new AS VARCHAR),'rc1/2/null') entry, ddia.dia < 5 AS sap_debut,
-       count(*) phantom_rows,
-       count(*) FILTER (WHERE EXISTS (SELECT 1 FROM new.procedural_breaks b WHERE b.STATECD=ph.statecd
-            AND b.UNITCD=ph.unitcd AND b.COUNTYCD=ph.countycd AND b.PLOT=ph.plot
-            AND b.MEASDATE > ph.measdate AND b.MEASDATE <= deb.d)) crossing_a_break
-FROM ph JOIN deb USING (statecd,unitcd,countycd,plot,subp,tree) JOIN ddia USING (statecd,unitcd,countycd,plot,subp,tree)
-GROUP BY ALL ORDER BY ALL""")
+# ---- independent re-derivation of the phantom-backfill block rules (spec, raw FIADB) -------
+# raw subplot-visit forest proportions (scaffold: annual, PLOT_STATUS<3, SUBP<=4, SUBP_STATUS<>3)
+con.execute(f"""
+CREATE TEMP TABLE rv AS
+SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, SU.SUBP,
+       MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6), COALESCE(P.MEASDAY,15)) AS md,
+       COALESCE(SUM(CASE WHEN C.COND_STATUS_CD=1 THEN SC.SUBPCOND_PROP END),0) AS fsub,
+       COALESCE(SUM(CASE WHEN C.COND_STATUS_CD=1 THEN SC.MICRCOND_PROP END),0) AS fmic
+FROM f.PLOT P JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y'
+JOIN f.SUBPLOT SU ON SU.PLT_CN=P.CN AND SU.SUBP<=4 AND SU.SUBP_STATUS_CD IS DISTINCT FROM 3
+JOIN f.SUBP_COND SC ON SC.PLT_CN=P.CN AND SC.SUBP=SU.SUBP
+JOIN f.COND C ON C.PLT_CN=P.CN AND C.CONDID=SC.CONDID
+WHERE P.PLOT_STATUS_CD<3 AND {scope('P')} GROUP BY ALL""")
+# raw RC8 closure breaks (plot, date) and whether they closed saplings
+con.execute(f"""
+CREATE TEMP TABLE rb AS
+SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT,
+       MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6), COALESCE(P.MEASDAY,15)) AS bd,
+       bool_or(T.PREVDIA < 5) AS sap_closed
+FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y'
+WHERE T.STATUSCD=0 AND T.RECONCILECD=8 AND T.SUBP<=4 AND {scope('T')} GROUP BY ALL""")
+# silent (unrecorded) re-tally breaks: from the pipeline table, validated independently in (b)
+con.execute("""
+CREATE TEMP TABLE ub AS SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS bd
+FROM new.procedural_breaks WHERE break_kind='unrecorded' OR n_unrecorded_saplings > 0""")
+# member debut (first live record meeting the cohort-table filter)
+con.execute(f"""
+CREATE TEMP TABLE deb AS
+SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE,
+       arg_min(MEASDATE, MEASDATE) AS D, arg_min(DIA, MEASDATE) AS ddia,
+       arg_min(CAST(RECONCILECD AS INT), MEASDATE) AS drc, arg_min(reconcile_new, MEASDATE) AS drn
+FROM new.curated_trees
+WHERE STATUSCD=1 AND estimated_age IS NOT NULL AND DRYBIO_AG IS NOT NULL AND TPA_UNADJ IS NOT NULL
+  AND ROUND(estimated_age) >= 1 AND {scope()} GROUP BY ALL""")
+
+
+def block_reasons(src_sql, rule_c=True):
+    """Annotate (tree, p[, t]) rows with independently derived block reasons."""
+    return f"""
+    WITH src AS ({src_sql}),
+    j AS (SELECT s.*, d.D, d.ddia, d.drc, d.drn FROM src s JOIN deb d USING (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE))
+    SELECT j.*,
+      (j.p < j.D) AS pre_debut,
+      COALESCE(j.drn IN (6,9), FALSE) AS r_a,
+      EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=j.STATECD AND rv.UNITCD=j.UNITCD AND rv.COUNTYCD=j.COUNTYCD
+              AND rv.PLOT=j.PLOT AND rv.SUBP=j.SUBP AND rv.md >= j.p AND rv.md < j.D AND rv.fsub + rv.fmic <= 0) AS r_n,
+      (j.ddia < 5 AND (EXISTS (SELECT 1 FROM rb WHERE rb.STATECD=j.STATECD AND rb.UNITCD=j.UNITCD AND rb.COUNTYCD=j.COUNTYCD
+                             AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D AND rb.sap_closed)
+                    OR EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=j.STATECD AND ub.UNITCD=j.UNITCD AND ub.COUNTYCD=j.COUNTYCD
+                             AND ub.PLOT=j.PLOT AND ub.bd > j.p AND ub.bd <= j.D)))
+      OR (COALESCE(j.drn = 8, FALSE) AND EXISTS (SELECT 1 FROM rb WHERE rb.STATECD=j.STATECD AND rb.UNITCD=j.UNITCD
+                             AND rb.COUNTYCD=j.COUNTYCD AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D)) AS r_b,
+      {"(j.ddia >= 5 AND COALESCE(j.drc NOT IN (2,3,7,8), TRUE) AND EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=j.STATECD AND rv.UNITCD=j.UNITCD AND rv.COUNTYCD=j.COUNTYCD AND rv.PLOT=j.PLOT AND rv.SUBP=j.SUBP AND rv.md >= j.p AND rv.md < j.D AND rv.fmic > 0))" if rule_c else "FALSE"} AS r_c
+    FROM j"""
+
+
+print("\n=== 1g. (g) phantoms whose source tree is individually blocked (independent re-derivation; all 0)")
+for tab, src_sql, rc in (
+    ("curated_cohorts_landis/_stdorg: tree-pass phantoms",
+     "SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE, prior_measdate AS p FROM new.phantom_tree_sources", True),
+    ("tree_trajectories phantoms (rule c not applied)",
+     "SELECT statecd STATECD,unitcd UNITCD,countycd COUNTYCD,plot PLOT,subp SUBP,tree TREE, measdate AS p "
+     "FROM new.tree_trajectories WHERE intro_type='phantom_backfill'", False)):
+    r = con.execute(f"""SELECT count(*) n, count(*) FILTER (WHERE r_a) a, count(*) FILTER (WHERE r_n) nf,
+                        count(*) FILTER (WHERE r_b) b, count(*) FILTER (WHERE r_c) c,
+                        count(*) FILTER (WHERE r_a OR r_n OR r_b OR r_c) any_block
+                        FROM ({block_reasons(src_sql, rc)})""").fetchone()
+    print(f"  {tab}: phantoms={r[0]:,} blocked: a={r[1]} n={r[2]} b={r[3]} c={r[4]}  any={r[5]}")
+    check(f"1g {tab.split(':')[0]} no individually-blocked source", r[5] == 0, f"({r[5]})")
+n_ph = [con.execute(f"SELECT count(*) FILTER (WHERE intro_type='phantom_backfill') FROM new.{t} WHERE {scope('', 'statecd', 'countycd')}").fetchone()[0]
+        for t in ("curated_cohorts_landis", "curated_cohorts_landis_stdorg")]
+n_src = con.execute("SELECT (SELECT count(*) FROM new.phantom_tree_sources) + (SELECT count(*) FROM new.phantom_cohort_sources)").fetchone()[0]
+check("1g phantom rows: landis == stdorg == tree sources + cohort sources", n_ph[0] == n_ph[1] == n_src,
+      f"(landis {n_ph[0]:,}, stdorg {n_ph[1]:,}, sources {n_src:,})")
+
+# ---- (a) Sim A cohort-pass phantoms: a source member survives its own blocks ---------------
+r = con.execute(f"""
+WITH m AS (SELECT s.STATECD,s.UNITCD,s.COUNTYCD,s.PLOT,s.SUBP, CAST(UNNEST(string_split(s.member_trees, ',')) AS BIGINT) AS TREE,
+                  s.prior_measdate AS p, s.src_measdate AS t, s.species_symbol, s.prior_age
+           FROM new.phantom_cohort_sources s),
+br AS ({block_reasons("SELECT * FROM m", True)}),
+g AS (SELECT br.*, EXISTS (SELECT 1 FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN
+            WHERE T.STATECD=br.STATECD AND T.UNITCD=br.UNITCD AND T.COUNTYCD=br.COUNTYCD AND T.PLOT=br.PLOT
+              AND T.SUBP=br.SUBP AND T.TREE=br.TREE AND T.STATUSCD=0 AND T.RECONCILECD IS DISTINCT FROM 7
+              AND MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6), COALESCE(P.MEASDAY,15)) > br.p
+              AND MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6), COALESCE(P.MEASDAY,15)) <= br.t) AS gap_cens,
+            EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=br.STATECD AND rv.UNITCD=br.UNITCD AND rv.COUNTYCD=br.COUNTYCD
+              AND rv.PLOT=br.PLOT AND rv.SUBP=br.SUBP AND rv.md=br.p AND rv.fsub+rv.fmic<=0) AS gap_nf
+      FROM br),
+ok AS (SELECT *, CASE WHEN pre_debut THEN NOT (r_a OR r_n OR r_b OR r_c) ELSE NOT (gap_cens OR gap_nf) END AS survives FROM g)
+SELECT count(DISTINCT (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,species_symbol,p,prior_age)) slots,
+       count(*) members, count(*) FILTER (WHERE NOT survives) blocked_members,
+       count(DISTINCT (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,species_symbol,p,prior_age)) FILTER (WHERE survives) slots_with_survivor
+FROM ok""").fetchone()
+print(f"\n=== (a) cohort-pass phantom slots={r[0]:,} members={r[1]:,} individually-blocked members={r[2]:,} "
+      f"slots with >=1 surviving member={r[3]:,}")
+check("(a) every cohort-pass phantom slot has a member that survives its own blocks", r[0] == r[3])
+
+# ---- (b) silent re-tally: residual unrecorded saplings by state x MANUAL transition ----------
+con.execute(f"""
+CREATE TEMP TABLE pv AS
+SELECT P.CN PLT_CN, P.STATECD,P.UNITCD,P.COUNTYCD,P.PLOT,P.INVYR,P.MANUAL,P.PLOT_STATUS_CD ps,
+       MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6), COALESCE(P.MEASDAY,15)) md
+FROM f.PLOT P JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y' WHERE {scope('P')};
+CREATE TEMP TABLE pv2 AS SELECT *, lead(PLT_CN) OVER w ncn, lead(md) OVER w nmd, lead(MANUAL) OVER w nman, lead(ps) OVER w nps
+FROM pv WINDOW w AS (PARTITION BY STATECD,UNITCD,COUNTYCD,PLOT ORDER BY md, INVYR);
+CREATE TEMP TABLE us AS
+SELECT T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE, v.MANUAL, v.nman, v.nmd, (T2.CN IS NULL) unrec
+FROM f.TREE T JOIN pv2 v ON v.PLT_CN=T.PLT_CN JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
+JOIN f.SUBPLOT SN ON SN.PLT_CN=v.ncn AND SN.SUBP=T.SUBP AND SN.SUBP_STATUS_CD=1
+LEFT JOIN f.TREE T2 ON T2.PLT_CN=v.ncn AND T2.SUBP=T.SUBP AND T2.TREE=T.TREE
+WHERE T.STATUSCD=1 AND T.DIA<5 AND T.TPA_UNADJ>0 AND T.SUBP<=4 AND C.COND_STATUS_CD=1 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y'
+  AND v.ps<3 AND v.ncn IS NOT NULL AND v.nps<3""")
+con.execute("""
+CREATE TEMP TABLE us2 AS
+SELECT us.*, (e.TREE IS NOT NULL) AS censored_unrec
+FROM us LEFT JOIN (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,MEASDATE FROM new.tree_censor_events
+                   WHERE reason='procedural_unrecorded') e
+  ON e.STATECD=us.STATECD AND e.UNITCD=us.UNITCD AND e.COUNTYCD=us.COUNTYCD AND e.PLOT=us.PLOT
+ AND e.SUBP=us.SUBP AND e.TREE=us.TREE AND e.MEASDATE=us.nmd""")
+show("(b) unrecorded saplings by state x MANUAL transition (raw), censored by the pipeline, residual", """
+SELECT STATECD, MANUAL prev_manual, nman next_manual, count(*) n_saplings,
+       count(*) FILTER (WHERE unrec) n_unrecorded, round(avg(unrec::INT),3) share_unrecorded,
+       count(*) FILTER (WHERE unrec AND censored_unrec) n_censored,
+       count(*) FILTER (WHERE unrec AND NOT censored_unrec) n_residual,
+       round(avg((unrec AND NOT censored_unrec)::INT),3) residual_share
+FROM us2 GROUP BY ALL HAVING count(*) >= 20 ORDER BY 1,2,3""")
+r = con.execute("""
+WITH t AS (SELECT STATECD, MANUAL, nman, count(*) n, count(*) FILTER (WHERE unrec AND NOT censored_unrec) res FROM us2 GROUP BY ALL),
+p AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,nmd, count(*) n, count(*) FILTER (WHERE unrec AND NOT censored_unrec) res FROM us2 GROUP BY ALL)
+SELECT (SELECT count(*) FROM t WHERE n >= 20 AND res >= 0.5*n),
+       (SELECT count(*) FROM p WHERE res >= 3 AND res >= 0.5*n),
+       (SELECT count(*) FROM us2 WHERE censored_unrec AND NOT unrec)""").fetchone()
+check("(b) no transition with >= 50 % uncensored unrecorded saplings (n >= 20)", r[0] == 0, f"({r[0]})")
+check("(b) no plot-visit with >= 3 and >= 50 % uncensored unrecorded saplings", r[1] == 0, f"({r[1]})")
+check("(b) censored only saplings that are really unrecorded", r[2] == 0, f"({r[2]})")
+show("(b) censoring events by reason (pipeline)", """
+SELECT reason, count(*) events, count(DISTINCT (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE)) trees
+FROM new.tree_censor_events GROUP BY 1 ORDER BY 2 DESC""")
+show("(b) fates of procedural_unrecorded censored trees (final_tree_fate / terminal_fate / disturbance)", """
+WITH t AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE FROM new.tree_censor_events WHERE reason='procedural_unrecorded')
+SELECT 'final_tree_fate' k, c.final_tree_fate v, count(DISTINCT (c.STATECD,c.UNITCD,c.COUNTYCD,c.PLOT,c.SUBP,c.TREE)) n
+FROM t JOIN new.curated_trees c USING (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE) GROUP BY ALL
+UNION ALL
+SELECT 'terminal_fate', tt.terminal_fate, count(DISTINCT (tt.statecd,tt.unitcd,tt.countycd,tt.plot,tt.subp,tt.tree))
+FROM t JOIN new.tree_trajectories tt ON tt.statecd=t.STATECD AND tt.unitcd=t.UNITCD AND tt.countycd=t.COUNTYCD
+  AND tt.plot=t.PLOT AND tt.subp=t.SUBP AND tt.tree=t.TREE GROUP BY ALL ORDER BY 1, 3 DESC""")
+
+# ---- (c) fates vs FIA GRM ---------------------------------------------------------------------
+con.execute(f"""
+CREATE TEMP TABLE grm AS
+SELECT CAST(TRE_CN AS VARCHAR) cn,
+       regexp_replace(CASE WHEN SUBP_COMPONENT_AL_FOREST IS NOT NULL AND SUBP_COMPONENT_AL_FOREST <> 'NOT USED'
+                           THEN SUBP_COMPONENT_AL_FOREST ELSE MICR_COMPONENT_AL_FOREST END, '[0-9]', '') comp
+FROM f.TREE_GRM_COMPONENT WHERE {scope()}""")
+show("(c) FIA GRM component of the end record vs pipeline tree_fate", """
+SELECT g.comp, t.tree_fate, count(*) n FROM grm g JOIN new.curated_trees t ON CAST(t.CN AS VARCHAR)=g.cn
+WHERE g.comp IN ('CUT','MORTALITY') GROUP BY ALL ORDER BY 1, 3 DESC""")
+r = con.execute("""
+SELECT count(*) FILTER (WHERE (g.comp='CUT' AND t.tree_fate LIKE 'harvest%') OR (g.comp='MORTALITY' AND t.tree_fate='dead')),
+       count(*)
+FROM grm g JOIN new.curated_trees t ON CAST(t.CN AS VARCHAR)=g.cn WHERE g.comp IN ('CUT','MORTALITY')""").fetchone()
+agree = r[0] / r[1] if r[1] else 1.0
+check("(c) GRM CUT->harvest / MORTALITY->dead agreement >= 99 %", agree >= 0.99, f"({agree:.4f} of {r[1]:,})")
+
+# ---- (d) median age monotone in DIA class for the top-25 species ------------------------------
+d = con.execute(f"""
+WITH l AS (SELECT spcd_resolved sp, estimated_age a,
+             CASE WHEN DIA>=1 AND DIA<3 THEN 1 WHEN DIA>=3 AND DIA<5 THEN 2 WHEN DIA>=5 AND DIA<7 THEN 3
+                  WHEN DIA>=7 AND DIA<9 THEN 4 END k
+           FROM new.curated_trees WHERE STATUSCD=1 AND estimated_age IS NOT NULL AND {scope()}),
+top AS (SELECT sp FROM l GROUP BY sp ORDER BY count(*) DESC LIMIT 25),
+m AS (SELECT sp, k, count(*) n, median(a) med FROM l WHERE k IS NOT NULL AND sp IN (SELECT sp FROM top) GROUP BY ALL)
+SELECT sp, list(med ORDER BY k) meds, min(n) min_n, count(*) nk FROM m GROUP BY sp""").fetchall()
+viol, tested = [], 0
+for sp, meds, mn, nk in d:
+    if nk < 4 or mn < 50:
+        continue
+    tested += 1
+    if any(meds[i] > meds[i + 1] for i in range(len(meds) - 1)):
+        viol.append((sp, [round(x, 1) for x in meds]))
+print(f"\n=== (d) median age by DIA class 1-3/3-5/5-7/7-9 in: {tested} species tested, {len(viol)} non-monotone")
+for v in viol:
+    print("    ", v)
+check("(d) median age monotone in DIA class (top-25 species, >= 50 records/class)", not viol, f"({len(viol)}/{tested})")
+show("(d) negative / < 1 yr live ages", f"""
+SELECT age_source, count(*) FILTER (WHERE estimated_age < 0) neg, count(*) FILTER (WHERE estimated_age < 1) lt1,
+       count(*) FILTER (WHERE ROUND(estimated_age) < 1) round_lt1, count(*) n
+FROM new.curated_trees WHERE STATUSCD=1 AND {scope()} GROUP BY 1 ORDER BY 1""")
+
+# ---- (e) determinism ---------------------------------------------------------------------------
+if a.determinism_db:
+    con.execute(f"ATTACH '{a.determinism_db}' AS rep (READ_ONLY)")
+    for t in ("curated_cohorts_landis", "curated_cohorts_landis_stdorg", "tree_trajectories"):
+        x = con.execute(f"SELECT count(*) FROM (SELECT * FROM new.{t} EXCEPT ALL SELECT * FROM rep.{t})").fetchone()[0]
+        y = con.execute(f"SELECT count(*) FROM (SELECT * FROM rep.{t} EXCEPT ALL SELECT * FROM new.{t})").fetchone()[0]
+        check(f"(e) {t} identical across two runs (EXCEPT ALL both ways)", x == 0 and y == 0, f"({x}, {y})")
 
 # ---- 2. record counts ---------------------------------------------------------------------
 rows = []
@@ -268,3 +469,4 @@ if a.old_slim and a.new_slim:
         nc = con.execute(f"SELECT count(*) FROM nslim.main.{t}").fetchone()[0]
         print(f"  rows {t:32s} old(in scope)={oc}  new={nc}")
 con.close()
+print(f"\n=== SUMMARY: {len(FAILS)} failed check(s): {FAILS}")
