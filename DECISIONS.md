@@ -133,3 +133,28 @@ decided and how to reverse it.
 - **D8–D12 outcome (2026-10-26):** whole-state KY and FL reruns give 0 FAIL, with one KNOWN cell each (KY (k) natural −5.7; FL (j) planted 15+ −3.5).
   - Flags: KY 239,128 live records; FL only 6 live model ages. FL's (j) trees carry their TreeAge age as the final age.
   - The KY step-2 resume (`FROM_STEP=2`) is EXCEPT-identical.
+
+## D13 — Natural-stand site-tree check after audit r4 (2026-10-26, agent; per the user's rule; refines D5 / D6 / D8)
+- **Evidence (r4 audit, NC / SC / MS whole-state):** raw TreeAge against bored SITETREE ages splits by wood group in natural stands.
+  - Softwoods run OLD: NC +6.4 / +7.9, SC +5.7 / +6.3, MS +7.0 / +4.2 yr.
+  - Hardwoods run YOUNG: NC −2.9, SC −1.4, KY −6.4 yr.
+  - The stratum medians pass only where the two cancel (NC +3.0, SC +4.0). MS fails at +5.9, and KY's −5.7 is the hardwood side.
+  - The +2 / +5 yr breast-height allowance alone moves the two groups 3 yr against each other.
+  - 72–92 % of site-tree links are proxy matches (a unique live tree on the same condition, species and DIA).
+  - D5's stated evidence ("natural raw TreeAge −1 to +4 yr") was wrong: KY was −5.0 even in its own table, and MS is +6.0.
+- **Options:**
+  - (a) add a KNOWN exception per failing state (MS now, more in a Region-4 run): exception creep, and it hides the wood-group pattern;
+  - (b) calibrate natural TreeAge onto site trees per wood group, cross-fitted on half the plots: it uses the only per-tree truth, but that truth is weak here (dominant trees, mostly proxy links, an allowance uncertain by ±3 yr), the check stops being independent, and the user declined this option in D5;
+  - (c) **natural (k) becomes INFO, reported per state × wood group (softwood / hardwood) × link method; natural ages stay on the TreeAge scale (D5) and remain flagged `natural_treeage_scale`; the KY-specific KNOWN entry and flag are retired, since all natural ages already carry the natural flag; planted (k) stays enforced; D5's evidence text is corrected**;
+  - (d) widen the natural limit, which the user declined in D6 (c).
+- **Chosen:** (c). The natural age scale is decided (D5). What the site trees give in natural stands is a documented uncertainty of about ±6 yr by wood group, not a reliable gate.
+- **To reverse:** set natural (k) back to enforced, and pick (a) or (b).
+- **FL (j):** stays a KNOWN exception (D6). It must be re-measured under the pooled Region-4 fit (D14).
+
+## D14 — Exception values under a pooled fit (2026-10-26, agent)
+- **Context:** the age model and the TreeAge mapping are fitted on all states in the DB. The recorded KNOWN values came from single-state fits, so a Region-4 run may drift past them.
+- **Options:**
+  - (a) re-measure them in the production Region-4 run, which may FAIL it;
+  - (b) **measure them on a pooled multi-state test DB now (FL + KY + MS), and record the values as a function of the fit scope**;
+  - (c) loosen the drift tolerance.
+- **Chosen:** (b).
