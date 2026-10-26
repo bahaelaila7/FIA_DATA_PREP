@@ -33,7 +33,8 @@ con.register("_cd", coh.to_pandas())
 con.execute("CREATE OR REPLACE TABLE cohort_disturbance AS SELECT * FROM _cd")
 con.unregister("_cd")
 
-_meta = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major"]
+_meta = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
+        "n_trees_known_bias", "share_known_bias"]
 _have = dbconn.column_names(con, TABLE)
 _ex = [c for c in ["disturbance_drop_pct", "procedural_break"] + _meta if c in _have]
 keep = f"c.* EXCLUDE ({', '.join(_ex)})" if _ex else "c.*"   # idempotent re-attach, column order kept

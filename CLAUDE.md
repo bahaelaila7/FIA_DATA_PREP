@@ -234,6 +234,9 @@ are interim, on the raw scale.
     - `out_of_support`: planted, and the record falls in a DIA 2-in class × stratum ×
       FLDSZCD (1 vs other) cell with < 50 training rows;
     - `in_support`: otherwise.
+    - `known_bias_ky_natural_treeage` / `known_bias_fl_planted_model_15plus` (r4 ACCEPT + FLAG,
+      override the values above, also set on KY natural estage rows): see "Round-4 ACCEPT +
+      FLAG" below.
     The column flows into the slim DB, because the slim builder copies `curated_trees.*`.
 
 Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monotone ages: 0/25 and 0/25):
@@ -419,8 +422,9 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
     records marked `natural_uncalibrated`.
 - **I4**: `n_trees_natural_treeage_scale`, `share_natural_treeage_scale` (AGB-weighted; named
   `*_natural_uncalibrated` before r4) and
-  `age_source_major` (dominant source by AGB) are appended to curated_cohorts_landis, _stdorg
-  and _simB, before `procedural_break`. Phantom rows inherit them from their source tree. The
+  `age_source_major` (dominant source by AGB), and since r4 ACCEPT + FLAG `n_trees_known_bias` /
+  `share_known_bias`, are appended to curated_cohorts_landis, _stdorg and _simB, before
+  `procedural_break`. Phantom rows inherit them from their source tree. The
   slim builder carries them; old columns are unchanged.
 - **I5**: every MEASDATE is `MAKE_DATE(MEASYEAR, COALESCE(NULLIF(MEASMON,0),6),
   COALESCE(NULLIF(MEASDAY,0),15))`. Periodic plots have MEASDAY = 0, which crashed the GA
@@ -544,6 +548,67 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
   | FL | 36 | 6 | 1 ((j) planted 15+) |
 
   Determinism (steps 4–7 rerun) is EXCEPT-identical in all five states.
+
+### Round-4 ACCEPT + FLAG (2026-10-26, user; DECISIONS.md D6, D8–D12)
+The two r4 failures are accepted, flagged in the data, and guarded against drift. Every other
+cell and state stays strict.
+- **Verifier `KNOWN_EXCEPTIONS`** (`verify_curation_v2.py`; exact keys only):
+
+  | Key | Recorded | Limit | Reason | Flag |
+  |---|---|---|---|---|
+  | (k) KY (21) natural | −5.7 yr | ±5 | TreeAge itself is −5.0 yr vs bored SITETREE ages | `known_bias_ky_natural_treeage` |
+  | (j) FL (12) planted 15+ in | −3.5 yr | ±3 | model vs mapped TreeAge regression to the mean; only trees WITHOUT a TreeAge record take the model age | `known_bias_fl_planted_model_15plus` |
+
+  - A failing excepted cell prints `[KNOWN]` (with the recorded value, the reason and the
+    flag) while |value| ≤ |recorded| + 1 yr (`KNOWN_DRIFT`). Beyond that it FAILS as "known
+    exception DRIFTED".
+  - An excepted cell that starts passing gets an INFO line suggesting the exception be retired.
+  - The summary lists every KNOWN cell.
+  - The values are whole-state; county-subset runs can differ.
+- **`age_domain` flags** (`age_imputation.KNOWN_BIAS_FLAGS`, applied by `flag_known_bias()`
+  after the model domains, which they override):
+  - `known_bias_ky_natural_treeage`: STATECD 21, natural (STDORGCD ≠ 1 or null), age_source
+    estage or model;
+  - `known_bias_fl_planted_model_15plus`: STATECD 12, STDORGCD = 1, age_source model, DIA ≥ 15 in.
+  - The verifier re-derives both rules in SQL and requires 0 missing and 0 extra flags.
+- **Cohort columns** (generic, D10): `n_trees_known_bias` and `share_known_bias` (AGB-weighted
+  in Sim B) are appended after `age_source_major` on curated_cohorts_landis, _stdorg, _simB
+  and the slim tables. `*_natural_treeage_scale` still means natural MODEL ages (D11): it
+  includes KY natural model ages that now carry the known-bias flag. Old columns are unchanged.
+- **Oldest-decile limitation (not fixable by recalibration).** The age model is biased young
+  at the oldest TRUE ages (r4 out-of-fold d10, recalibrated):
+
+  | Stratum / source | AL | GA | TN | FL | KY |
+  |---|---|---|---|---|---|
+  | field, planted | −38.0 (n 392) | −28.4 (n 670) | −40.1 (n 166) | −27.5 (n 1,972) | – |
+  | treeage, natural | −3.4 | −3.2 | −7.0 | −3.2 | −7.6 |
+
+  - The cause is regression to the mean. With imperfect features, the model's prediction
+    varies less than the truth, so E[prediction | true age] is pulled toward the mean.
+  - The isotonic recalibration is a monotone function g of the prediction. Fitted to the
+    out-of-fold data, it makes E[target | g(prediction)] ≈ g(prediction): it removes bias
+    conditional on the PREDICTION, which is what the per-DIA-class checks (j) measure.
+  - Grouping rows by their TRUE age instead (the deciles) still shows the spread lost to the
+    noise. No map of the prediction can restore that spread without making errors larger on
+    average, because it is information the features do not carry.
+  - Only better features, or a target-aware method, which is impossible at prediction time,
+    would help. The oldest planted field ages are a few hundred to 2k rows of old planted
+    stands, mostly outside the bulk of the training support.
+  - Consumers should treat the oldest model-aged trees as biased young. They are a small
+    share: ≥ 5 in trees are 82–97 % estage.
+- **Step-2 resume** (`FROM_STEP=2 TO_STEP=2` on a copy of the finished KY DB, EXCEPT ALL both
+  ways): curated_trees (280,508 rows), curated_snapshots (235,771),
+  estage_calibration and age_model_cv are all EXCEPT-identical (0 / 0).
+- **Whole-state reruns, KY and FL (steps 1–11 + verify)**: **0 FAIL in both**. KY: 34 PASS / 10 INFO / 1 KNOWN ((k)
+  natural −5.7). FL: 38 PASS / 6 INFO / 1 KNOWN ((j) planted 15+ −3.5). Determinism is
+  EXCEPT-identical, and both flag-rule checks show 0 missing / 0 extra.
+  - Flagged live records: KY 239,128 (all natural model and estage ages; 53,535 of them are
+    model ages, the former natural_treeage_scale count). FL: only 6 live model ages. (j) counts
+    trees that have both a model and a TreeAge age, and those carry the TreeAge age as their
+    final age, so the FL bias reaches almost no final ages.
+  - AGB share known_bias: KY 0.997 (stdorg and simB; KY is almost entirely natural), FL 0.0.
+    `share_natural_treeage_scale` is unchanged (KY 0.071 / 0.009).
+  - The slim DB carries both new cohort columns and the flags.
 
 ---
 

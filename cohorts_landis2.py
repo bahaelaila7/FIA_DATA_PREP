@@ -654,10 +654,10 @@ def attach_land_use_and_cycle(con) -> None:
         FROM base_subplot_cond
         GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE
     )
-    SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major),
+    SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major, n_trees_known_bias, share_known_bias),
            lu.land_use, cy.cycle,
            -- r3 I4: appended AFTER the old columns (old schema stays an exact prefix)
-           c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major
+           c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major, c.n_trees_known_bias, c.share_known_bias
     FROM curated_cohorts_landis c
     LEFT JOIN plot_lu lu
         ON c.statecd=lu.statecd AND c.unitcd=lu.unitcd AND c.countycd=lu.countycd AND c.plot=lu.plot

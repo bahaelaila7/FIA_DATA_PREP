@@ -44,6 +44,40 @@ def check(name, ok, detail=""):
 def info(name, detail=""):
     print(f"  [INFO] {name} {detail}")
 
+
+# r4 ACCEPT + FLAG (user decision 2026-10-26): the ONLY cells allowed to miss their limit. An
+# excepted cell prints KNOWN instead of FAIL while |value| <= |observed| + KNOWN_DRIFT; worse than
+# that it FAILS, so an exception cannot drift silently. Every other cell / state stays strict.
+# The records' ages are flagged in curated_trees.age_domain (age_imputation.KNOWN_BIAS_FLAGS).
+# Values were observed on the whole-state r4 runs; a county-subset run may differ.
+KNOWN_DRIFT = 1.0
+KNOWN_EXCEPTIONS = {
+    ("k", 21, "natural"): dict(
+        observed=-5.7, limit=5.0, flag="known_bias_ky_natural_treeage",
+        reason="KY: TreeAge itself is -5.0 yr vs bored SITETREE ages (median bias of raw Tree_Age)"),
+    ("j", 12, "planted", "15+"): dict(
+        observed=-3.5, limit=3.0, flag="known_bias_fl_planted_model_15plus",
+        reason="FL: model vs mapped TreeAge regression to the mean; only trees WITHOUT a TreeAge "
+               "record take the model age"),
+}
+KNOWN = []
+
+
+def check_known(key, name, ok, value, detail=""):
+    exc = KNOWN_EXCEPTIONS.get(key)
+    if ok or exc is None:
+        check(name, ok, detail)
+        if ok and exc is not None:
+            info(f"{name}: known exception {key} now passes", "(consider retiring it)")
+        return
+    bound = abs(exc["observed"]) + KNOWN_DRIFT
+    if abs(value) <= bound:
+        print(f"  [KNOWN] {name} {detail} — recorded {exc['observed']:+.1f} (limit {exc['limit']}, "
+              f"FAILS beyond |{bound:.1f}|); {exc['reason']}; flag age_domain={exc['flag']}")
+        KNOWN.append(name)
+    else:
+        check(f"{name} [known exception DRIFTED: |{value:.1f}| > |{exc['observed']:.1f}|+{KNOWN_DRIFT}]", False, detail)
+
 con = duckdb.connect(":memory:")
 con.execute(f"SET threads={os.environ.get('FIA_DUCKDB_THREADS', '3')}; "
             f"SET memory_limit='{os.environ.get('FIA_DUCKDB_MEMORY', '5GB')}'; SET enable_progress_bar=false")
@@ -520,7 +554,7 @@ print("\n=== (j) median model - mapped-estage gap (yr) per state x stratum x DIA
 for st_, pl_, dc, nt, gap in rows:
     name = f"(j) state {st_} {'planted' if pl_ else 'natural'} DIA {dc[2:]}: median gap {gap:+.1f} within +-3"
     if nt >= 200:
-        check(name, abs(gap) <= 3, f"({nt:,} trees)")
+        check_known(("j", st_, "planted" if pl_ else "natural", dc[2:]), name, abs(gap) <= 3, gap, f"({nt:,} trees)")
     else:
         info(name, f"({nt:,} trees < 200: not enforced)")
 
@@ -569,9 +603,22 @@ for st_, pl_, n, b in con.execute("SELECT STATECD, planted, count(*), median(est
     # target is the pre-registered basis of the user's split-by-stratum decision)
     name = f"(k) state {st_} {'planted' if pl_ else 'natural'}: |median bias of final age vs SITETREE| = {abs(b):.1f} <= 5"
     if n >= 100:
-        check(name, abs(b) <= 5, f"(n {n:,})")
+        check_known(("k", st_, "planted" if pl_ else "natural"), name, abs(b) <= 5, b, f"(n {n:,})")
     else:
         info(name, f"(n {n:,} < 100: not enforced)")
+
+# ---- (l) r4 ACCEPT + FLAG: known-bias age_domain flags match their rules exactly ---------------
+_kb_rules = {
+    "known_bias_ky_natural_treeage": "STATECD=21 AND COALESCE(cond_stdorgcd,0)<>1 AND age_source IN ('estage','model')",
+    "known_bias_fl_planted_model_15plus": "STATECD=12 AND cond_stdorgcd=1 AND age_source='model' AND DIA>=15",
+}
+for flag_, rule_ in _kb_rules.items():
+    r = con.execute(f"""SELECT count(*) FILTER (WHERE ({rule_}) AND age_domain IS DISTINCT FROM '{flag_}'),
+                               count(*) FILTER (WHERE NOT ({rule_}) AND age_domain = '{flag_}'),
+                               count(*) FILTER (WHERE age_domain = '{flag_}' AND STATUSCD=1)
+                        FROM new.curated_trees WHERE {scope()}""").fetchone()
+    check(f"(l) known-bias flag {flag_} set exactly on its rule", r[0] == 0 and r[1] == 0,
+          f"(missing {r[0]:,}, extra {r[1]:,}; live flagged {r[2]:,})")
 
 # ---- (l) M1 / M2 / M3 / I4 --------------------------------------------------------------------------
 if a.simb_db:
@@ -603,12 +650,15 @@ SELECT STATECD, count(DISTINCT (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE)) trees, 
 FROM new.curated_trees WHERE tree_key_split AND {scope()} GROUP BY 1""")
 for t, db in (("curated_cohorts_landis_stdorg", "new"),) + ((("curated_cohorts_landis_simB", "newsimb"),) if a.simb_db else ()):
     cols = dbcols = {r[0] for r in con.execute(f"SELECT column_name FROM duckdb_columns() WHERE database_name='{db}' AND table_name='{t}'").fetchall()}
-    need = {"n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major", "procedural_break"}
+    need = {"n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
+            "n_trees_known_bias", "share_known_bias", "procedural_break"}
     check(f"(l) I4: {t} carries the age metadata columns", need <= cols, f"(missing {sorted(need - cols)})")
     r = con.execute(f"""SELECT count(*), count(*) FILTER (WHERE age_source_major IS NULL),
-                        round(sum(agb*share_natural_treeage_scale)/sum(agb),3)
+                        round(sum(agb*share_natural_treeage_scale)/sum(agb),3),
+                        round(sum(agb*share_known_bias)/sum(agb),3)
                         FROM {db}.{t} WHERE {scope('', 'statecd', 'countycd')}""").fetchone()
-    info(f"(l) I4: {t}", f"(rows {r[0]:,}; age_source_major null {r[1]:,}; AGB share natural_treeage_scale {r[2]})")
+    info(f"(l) I4: {t}", f"(rows {r[0]:,}; age_source_major null {r[1]:,}; AGB share natural_treeage_scale {r[2]}; "
+                         f"AGB share known_bias {r[3]})")
 n_ph_null = con.execute(f"""SELECT count(*) FROM new.curated_cohorts_landis WHERE intro_type='phantom_backfill'
                            AND age_source_major IS NULL AND {scope('', 'statecd', 'countycd')}""").fetchone()[0]
 check("(l) I4: phantom rows inherit age metadata from their source tree", n_ph_null == 0, f"({n_ph_null} null)")
@@ -754,4 +804,5 @@ if a.old_slim and a.new_slim:
         nc = con.execute(f"SELECT count(*) FROM nslim.main.{t}").fetchone()[0]
         print(f"  rows {t:32s} old(in scope)={oc}  new={nc}")
 con.close()
+print(f"\n=== KNOWN exceptions shown ({len(KNOWN)}): {KNOWN}")
 print(f"\n=== SUMMARY: {len(FAILS)} failed check(s): {FAILS}")

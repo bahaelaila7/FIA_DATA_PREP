@@ -72,13 +72,22 @@ def _has_table(con, table: str) -> bool:
 
 # r3 I4: age-source metadata carried onto the cohort tables (Sim A rows are one tree each;
 # phantom rows inherit their source tree's values; Sim B aggregates them AGB-weighted)
-AGE_META_COLS = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major"]
+# r4 ACCEPT + FLAG: + n_trees_known_bias / share_known_bias (members whose age_domain is any
+# known_bias_* flag; one generic pair, the flag names live in age_imputation.KNOWN_BIAS_FLAGS).
+# *_natural_treeage_scale keeps its r4 meaning (natural MODEL ages), including KY natural model
+# ages that now carry known_bias_ky_natural_treeage.
+AGE_META_COLS = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
+                 "n_trees_known_bias", "share_known_bias"]
+IS_NATURAL_MODEL = ((pl.col("_age_domain") == "natural_treeage_scale") |
+                    ((pl.col("_age_domain") == "known_bias_ky_natural_treeage") &
+                     (pl.col("_age_source") == "model"))).fill_null(False)
+IS_KNOWN_BIAS = pl.col("_age_domain").str.starts_with("known_bias_").fill_null(False)
 AGE_META_EXPRS = [
-    (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False).cast(pl.Int64)
-      .alias("n_trees_natural_treeage_scale"),
-    (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False).cast(pl.Float64)
-      .alias("share_natural_treeage_scale"),
+    IS_NATURAL_MODEL.cast(pl.Int64).alias("n_trees_natural_treeage_scale"),
+    IS_NATURAL_MODEL.cast(pl.Float64).alias("share_natural_treeage_scale"),
     pl.col("_age_source").alias("age_source_major"),
+    IS_KNOWN_BIAS.cast(pl.Int64).alias("n_trees_known_bias"),
+    IS_KNOWN_BIAS.cast(pl.Float64).alias("share_known_bias"),
 ]
 
 

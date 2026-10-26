@@ -569,6 +569,34 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
 # Step 3: apply + merge
 # =============================================================================
 
+# r4 ACCEPT + FLAG (user decision 2026-10-26): two verifier cells fail for reasons the curation
+# cannot fix without tuning; their ages are kept and flagged in age_domain (which then overrides
+# the model-age values above). Each rule: (age_domain value, STATECD, planted?, age sources,
+# minimum DIA). planted = cond STDORGCD == 1; natural = anything else, incl. unknown.
+#   known_bias_ky_natural_treeage      KY natural, TreeAge-sourced and model ages: TreeAge itself
+#                                      is -5.0 yr vs bored SITETREE ages (verifier (k): -5.7)
+#   known_bias_fl_planted_model_15plus FL planted model ages, DIA >= 15 in: model vs mapped
+#                                      TreeAge regression to the mean (verifier (j): -3.5); only
+#                                      trees without a TreeAge record take the model age
+KNOWN_BIAS_FLAGS = [
+    ("known_bias_ky_natural_treeage",      21, False, ("estage", "model"), None),
+    ("known_bias_fl_planted_model_15plus", 12, True,  ("model",),          15.0),
+]
+
+
+def flag_known_bias(df: pl.DataFrame) -> pl.DataFrame:
+    if "age_domain" not in df.columns:
+        df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("age_domain"))
+    planted = (pl.col("cond_stdorgcd") == 1).fill_null(False)
+    for val, st, pl_, srcs, min_dia in KNOWN_BIAS_FLAGS:
+        m = (pl.col("STATECD") == st) & (planted if pl_ else ~planted) & pl.col("age_source").is_in(list(srcs))
+        if min_dia is not None:
+            m = m & (pl.col("DIA") >= min_dia)
+        df = df.with_columns(pl.when(m.fill_null(False)).then(pl.lit(val)).otherwise(pl.col("age_domain"))
+                             .alias("age_domain"))
+    return df
+
+
 def apply_age_model(df: pl.DataFrame,
                     model: HistGradientBoostingRegressor,
                     enc: OrdinalEncoder,
@@ -634,7 +662,7 @@ def apply_age_model(df: pl.DataFrame,
         .alias("age_source"),
     ])
 
-    # age_domain (model ages only; null for other sources):
+    # age_domain (model ages; null for other sources, except the KNOWN_BIAS_FLAGS overrides):
     #   natural_treeage_scale condition STDORGCD != 1 (or unknown): natural-stand ages are on
     #                         the RAW TreeAge scale (r4 user decision: split by stratum)
     #   out_of_support        planted, DIA-class x stratum x stand-size cell with fewer than
@@ -653,6 +681,7 @@ def apply_age_model(df: pl.DataFrame,
                           .then(pl.lit("in_support")).otherwise(pl.lit("out_of_support")))
                     .otherwise(pl.lit(None, dtype=pl.Utf8)).alias("age_domain"))
                 .drop(["_cell", "_n_train"]))
+    df = flag_known_bias(df)
     n_estage_filled = df.filter(pl.col("age_source") == "estage").height if has_estage else 0
     n_model_filled  = df.filter(pl.col("age_source") == "model").height
     n_still_na = df.filter(

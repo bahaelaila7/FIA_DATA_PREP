@@ -76,7 +76,8 @@ def build(con) -> pl.DataFrame:
     # AGB-dominant age source of the member trees.
     n_pre = df.height
     grp = [c for c in OUT_COLS if c != "agb"]
-    nu = (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False)
+    nu = c1.IS_NATURAL_MODEL
+    kb = c1.IS_KNOWN_BIAS
     src = (df.group_by(grp + ["_age_source"]).agg(pl.col("agb").sum().alias("_a"))
              .sort(grp + ["_a", "_age_source"], descending=[False] * len(grp) + [True, False], nulls_last=True)
              .unique(subset=grp, keep="first")
@@ -85,7 +86,10 @@ def build(con) -> pl.DataFrame:
             .agg(pl.col("agb").sum().alias("agb"),
                  nu.cast(pl.Int64).sum().alias("n_trees_natural_treeage_scale"),
                  ((pl.col("agb") * nu.cast(pl.Float64)).sum() / pl.col("agb").sum())
-                 .alias("share_natural_treeage_scale"))
+                 .alias("share_natural_treeage_scale"),
+                 kb.cast(pl.Int64).sum().alias("n_trees_known_bias"),
+                 ((pl.col("agb") * kb.cast(pl.Float64)).sum() / pl.col("agb").sum())
+                 .alias("share_known_bias"))
             .join(src, on=grp, how="left", nulls_equal=True)
             .select(OUT_COLS + c1.AGE_META_COLS)
             .sort(["statecd", "unitcd", "countycd", "plot", "subp", "species_symbol", "measdate", "age_calc"]))
@@ -120,9 +124,9 @@ if __name__ == "__main__":
         SELECT STATECD AS statecd, UNITCD AS unitcd, COUNTYCD AS countycd, PLOT AS plot,
                MEASDATE AS measdate, MAX(CYCLE) AS cycle
         FROM base_subplot_cond GROUP BY 1,2,3,4,5)
-    SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major),
+    SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major, n_trees_known_bias, share_known_bias),
            s.lu AS land_use, cy.cycle,
-           c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major
+           c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major, c.n_trees_known_bias, c.share_known_bias
     FROM {TABLE}_base c
     LEFT JOIN stdorg s USING (statecd, unitcd, countycd, plot)
     LEFT JOIN plot_cycle cy USING (statecd, unitcd, countycd, plot, measdate)
