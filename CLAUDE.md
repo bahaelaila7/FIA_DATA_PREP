@@ -44,17 +44,20 @@ allow-list rather than `search_path`, which would expose them. Helpers: `table_e
 ### Corrected rule set (fia_curation_v3.py)
 | Old rule | New rule |
 |---|---|
-| exclude all records of trees with RC 3/4/6/7/8/9 or STATUSCD 0 | drop only the STATUSCD 0 record itself. STATUSCD 0 + RC7 ("erroneously tallied previously") → drop the tree's EARLIER records (`excluded_tree_ids`, now only these). STATUSCD 0 + RC 5/6/8/9 (or null) → **censoring** (`censored`, `censor_measdate`, `censor_reconcilecd`, `censor_reason` ∈ shrank/moved/procedural/nonsampled/not_in_sample), NOT death or removal. New trees with RC 3/4/6/7/8/9 are kept as live trees, flagged `reconcile_new` (code) / `not_ingrowth`. Per-tree events: table `tree_reconcile_events` |
+| exclude all records of trees with RC 3/4/6/7/8/9 or STATUSCD 0 | drop only the STATUSCD 0 record itself. STATUSCD 0 + RC7 ("erroneously tallied previously") → drop the tree's EARLIER records (`excluded_tree_ids`, now only these). STATUSCD 0 + RC 5/6/8/9 (or null) → **censoring**, NOT death or removal: `censored`, first event `censor_measdate`/`censor_reconcilecd`/`censor_reason` (shrank/moved/procedural/nonsampled/not_in_sample), last event `censor_last_*` (a tree can be censored → live → censored; fates use the last). Every STATUSCD 0 record: `tree_status0_events`; per tree: `tree_reconcile_events`. New trees with RC 3/4/6/7/8/9 are kept as live trees, flagged `reconcile_new` (code) / `not_ingrowth` |
+| — | `procedural_breaks`: per (PLOT, MEASDATE) with STATUSCD 0 + RC8 closures, i.e. a procedural re-tally visit. Keyed per plot, because the AL/GA MANUAL 1.5–2.0 sapling re-tally was plot-wide |
 | `handle_reconcile5` revived RC5 rows as live with DIA 5.0 / TPA 6.018 | not revived (it would fabricate records). RC5 is a censoring reason. `reconcile5_*` columns are kept for schema compatibility (no imputation; `reconcile5_first_measdate` = RC5 date) |
 | subplots with ≥2 clean visits only | no visit-count filter; `n_clean_visits` column (downstream filters itself) |
-| drop a subplot-visit if ANY condition has COND_STATUS_CD 3 | kept (3 = noncensus water, not nonforest). Live trees must be on their OWN condition with COND_STATUS_CD = 1; dead/cut records on COND_STATUS_CD 1 or 2 (land-clearing removals sit on the now-nonforest condition). `clean_subplot_years` gains `has_cond_status3`, `forest_subpcond_prop`, `forest_micrcond_prop` |
-| `SUBP_STATUS_CD <> 3` (silently dropped NULL) | `IS DISTINCT FROM 3`, plus an explicit exclusion of P2A (`P2A_GRM_FLG='Y'`) and null/zero-TPA rows. TPA_UNADJ > 0, annual survey and the REF_SPECIES join are unchanged |
-| anchor = smallest "max-age violation" (picked the youngest candidate 78 % of the time, −2.7 yr) | anchor age = **median** of the candidates' implied ages at first measurement. Anchor date = the candidate closest to the median. The "crew was there and didn't see it" bound is not used for selection: it is wrong for ingrowth, RC3/RC7 (missed), RC8 (untallied) and RC6/RC9 (outside the sample). `max_viol` is kept as a diagnostic |
-| `final_tree_fate` was computed and discarded | returned: last dead/cut fate · `censored_<reason>` · `disappeared_inferred_removal` · `alive` |
-| — | `spgrpcd_resolved` = SPGRPCD that goes with `spcd_resolved` |
-| — | area proportions for consumer-side normalisation: `cond_condprop_unadj`, `cond_subpprop_unadj`, `cond_micrprop_unadj`, `cond_macrprop_unadj`, `subp_subpcond_prop`, `subp_micrcond_prop`, `subp_macrcond_prop`, `subp_forest_*_prop`, `subp_has_cond_status3`, `cond_status_cd` |
+| drop a subplot-visit if ANY condition has COND_STATUS_CD 3 | kept (3 = noncensus water, not nonforest). `clean_subplot_years` gains `has_cond_status3`, `forest_subpcond_prop`, `forest_micrcond_prop` |
+| TPA_UNADJ > 0 on every record | **live** records: TPA_UNADJ > 0 on their OWN condition with COND_STATUS_CD = 1. **Dead/cut** records: kept on COND_STATUS 1/2 even with a NULL TPA. FIADB leaves TPA null on many mortality records of previously-live trees, and dropping them turned real deaths into inferred removals. A dead record's TPA is never used in a live total |
+| `SUBP_STATUS_CD <> 3` | **SUBP ≤ 4** (the national design; SUBP > 4 rows are auxiliary/regional points with NULL status), `SUBP_STATUS_CD IS DISTINCT FROM 3`, P2A records (`P2A_GRM_FLG='Y'`) excluded explicitly. The annual survey filter and the REF_SPECIES join are unchanged |
+| anchor = smallest "max-age violation" (picked the youngest candidate 78 % of the time, −2.7 yr) | anchor age = **median** of the candidates' implied ages at first measurement. Anchor date = the candidate closest to the median. The "crew was there and didn't see it" bound is not used for selection (it is wrong for every new-tree class). `max_viol` is kept as a diagnostic |
+| estage (Tree_Age) used at any size | an estage record is a candidate only if **DIA ≥ 5 in and Tree_Age > 1** (`ESTAGE_MIN_DIA`/`ESTAGE_MIN_AGE`). About 70 % of live 1–3 in saplings have Tree_Age ≤ 1, with a hard step at 5 in. Saplings get their age from a later ≥5 in record of the same tree (propagated back) or from the age model. `estage_raw` keeps the raw value |
+| `final_tree_fate` was computed and discarded | returned: last dead/cut fate · `censored_<last reason>` · `disappeared_inferred_removal` · `alive` |
+| snapshots by raw SPCD | `curated_snapshots` grouped by `spcd_resolved` / `spgrpcd_resolved` |
+| — | `spgrpcd_resolved`; area proportions for consumer-side normalisation (`cond_condprop_unadj`, `cond_subpprop_unadj`, `cond_micrprop_unadj`, `cond_macrprop_unadj`, `subp_subpcond_prop`, `subp_micrcond_prop`, `subp_macrcond_prop`, `subp_forest_*_prop`, `subp_has_cond_status3`, `cond_status_cd`) |
 
-The 20 new curated_trees columns are APPENDED after all old columns (`FIX_COLUMNS`), so the old
+The 23 new curated_trees columns are APPENDED after all old columns (`FIX_COLUMNS`), so the old
 schema (names, types, order) is an exact prefix. The polars steps run one state at a time. Every
 rule is tree-, subplot- or condition-local, so this matches a single pass. Only the diagnostic
 `spcd_confusion_cluster` id is state-local. `age_imputation` fits its model once over all states
@@ -62,56 +65,89 @@ in the DB, then applies it state by state. It now imports from **v3**: it used t
 anchor selection.
 
 ### Downstream changes
-- **Cohort species** come from `spcd_resolved` / `spgrpcd_resolved`, not the raw per-visit SPCD:
-  `cohorts_landis.load_base_data`, `cohorts_landis2`, `cohort_tracking`, `build_tree_trajectories`.
-- **Phantom backfill blocks** (`cohorts_landis.apply_backfill_blocks`, shared with
-  `build_tree_trajectories.backfill_phantom_full` and the cohort-level pass). No phantom at a
-  prior visit p of a tree debuting at D when:
-  - (a) the tree entered as RC 6/8/9 (it was not in the sampled population);
-  - (b) a PROCEDURAL break (a STATUSCD 0 + RC8 drop, or an RC8 entry, on the same subplot at
-    b) lies in p < b ≤ D;
-  - (c) the tree debuted at DIA ≥ 5 in as true ingrowth (not RC3/RC7) and p is at or before the
-    latest prior visit with a sampled forest microplot: that sapling class is already
-    represented at TPA ~74.965, and scaling the TPA-6.018 subplot debut back double counts it.
-  RC3/RC7 trees (missed) keep their backfill. `check_cohort_continuity` therefore reports
-  violations; they are expected and are not errors.
-- `cohorts_landis2.py`: MEASDATE replaces MEASYEAR everywhere (it was `:453`); this script is
-  used with `--attach-only`. The production `curated_cohorts_landis` comes from
-  `cohorts_landis.py` (v1: sim_year + subp_meas_num).
-- `build_tree_trajectories`: terminal fate `censored_<reason>` when a STATUSCD 0 + RC 5/6/8/9
-  record follows the last live record (it used to be `disappeared_inferred_removal`, i.e. a
-  removal). Gap interpolation never spans a censoring. Output gains `reconcile_new`,
-  `censor_reason`. `cohort_disturbance` therefore never counts censoring as a disturbance drop.
+- **Cohort species** come from `spcd_resolved` / `spgrpcd_resolved`: `cohorts_landis`,
+  `cohorts_landis2`, `cohort_tracking`, `build_tree_trajectories`.
+- **Phantom backfill blocks** (`cohorts_landis.apply_backfill_blocks`, used by the tree- and
+  cohort-level passes and by `build_tree_trajectories`). No phantom at prior visit p for a tree
+  debuting at D when:
+  - (a) the tree entered as RC 6/9 (it was outside the sampled population);
+  - (n) the subplot was entirely nonforest at p, or at any visit between p and D: backfill stops
+    at the latest nonforest visit;
+  - (b) the PLOT had a procedural re-tally (`procedural_breaks`) at b with p < b ≤ D. This
+    applies to sapling debuts and to RC8 entries of any size. Unpaired RC8 entries elsewhere
+    (e.g. FL MANUAL 9.0 species-definition additions) create no break;
+  - (c) cohort tables only, not per-tree trajectories: the tree debuted at ≥ 5 in as true
+    ingrowth (RC 1 / null) and p is at or before the latest prior visit with a sampled forest
+    microplot. That sapling class is already represented at TPA ~74.965; scaling the TPA-6.018
+    subplot debut back double counts it. RC2 through-growth (a seedling before) and RC3/7/8
+    entries are exempt.
+  `check_cohort_continuity` therefore reports violations; they are expected and are not errors.
+- **`procedural_break`** (BOOL) is APPENDED as the last column of `curated_cohorts_landis`,
+  `_stdorg` and `_simB`. It is TRUE on rows at a re-tally visit, so consumers can tell a
+  re-tally from cohort death plus establishment. The slim cohort tables therefore gain one
+  appended column; all old columns are unchanged.
+- `cohorts_landis2.py`: MEASDATE replaces MEASYEAR; this script is used with `--attach-only`.
+  The production `curated_cohorts_landis` comes from `cohorts_landis.py` (v1). The v2 full
+  build has no backfill blocks.
+- `build_tree_trajectories`:
+  - terminal fate `censored_<last reason>` (it used to be `disappeared_inferred_removal`);
+  - gap interpolation never spans ANY STATUSCD 0 non-RC7 record (`tree_status0_events`);
+  - dead records with a null TPA end trajectories;
+  - output gains `reconcile_new`, `censor_reason`.
+  `cohort_disturbance` never counts censoring as a disturbance drop.
 - The land-use 2-way change to `build_tree_trajectories.py` in the main checkout is uncommitted
   and is NOT included. It does not affect the slim tables, because `build_stdorg.py` re-derives
   `land_use`.
 
-### Chain (`run_curation_v2.sh`, all paths from env; refuses to overwrite outputs)
-`fia_curation_v3` → `age_imputation` → `cohort_tracking` → `cohorts_landis` →
-`build_tree_trajectories` → `cohorts_landis2 --attach-only` → `build_stdorg` →
-`export_reference_tables` (COND/PLOT of the states + REF_SPECIES/species_longevity_ref/
-data_plot_eco copied into the curated DB, so the slim builder can use it as its `--fiadb`) →
-`cohorts_landis_simB` (side DB) → `attach_disturbance_simB` (side DB) → optional
-`build_slim_db_region.jl --fiadb <curated DB> --simb <simB DB>`.
-`verify_curation_v2.py` compares against raw FIADB and the old tables: coverage, counts, CN
-uniqueness, ≥5 in delta, ages, slim schema. `--counties STATECD:COUNTYCD` gives subset smoke
-runs. Python: the repo `.venv` points at a removed python3.11, so use any env with
-duckdb 1.5.4 / polars 1.41.2 / scikit-learn 1.9.0 (requirements.txt).
+### Chain (`run_curation_v2.sh`, all paths from env)
+1 `fia_curation_v3` → 2 `age_imputation` → 3 `cohort_tracking` → 4 `cohorts_landis` →
+5 `build_tree_trajectories` → 6 `cohorts_landis2 --attach-only` → 7 `build_stdorg` (+ `procedural_break`) →
+8 `export_reference_tables` (COND/PLOT of the states + REF_SPECIES/species_longevity_ref/data_plot_eco
+copied into the curated DB, so the slim builder can use it as its `--fiadb`) → 9 `cohorts_landis_simB` (side DB) →
+10 `attach_disturbance_simB` (side DB; + `procedural_break`) → 11 slim builder (optional).
+- **Overwrites and resume**: a fresh run refuses to overwrite outputs. `FROM_STEP=N` resumes
+  on the partial DBs; every python step rewrites its own tables. Delete a partial `SLIM_OUT`
+  before resuming at step 11.
+- **Slim step**: needs an explicit `JULIA_DEPOT_PATH` (first entry = a writable depot you own).
+  It runs the UNCHANGED `landis_region4/tools/build_slim_db_region.jl` inside `slim_guard.py`
+  pre/post checks: both sources exist, are not FIADB and hold every table; after the build all
+  8 tables exist and are non-empty. This is needed because the builder defaults to the old
+  FIADB and simB and silently skips a missing simB.
+- **dbconn guards**: `--out-db` must not be FIADB or a link to it (`os.path.samefile`), and
+  `--curated-db` must not be FIADB.
+- **Verification**: `verify_curation_v2.py` checks live coverage against an INDEPENDENT raw
+  reference (live, SUBP ≤ 4, TPA > 0, own COND_STATUS 1, PLOT_STATUS < 3, SUBP_STATUS ≠ 3,
+  annual, not P2A, not before an RC7 erroneous tally). It also checks: SUBP > 4 rows, lost
+  dead records, nonforest phantoms, phantoms crossing a re-tally, sapling ages by DIA class,
+  record counts, CN uniqueness, the ≥5 in delta and the slim schema. `--counties
+  STATECD:COUNTYCD` gives subset runs.
+- **Python**: the repo `.venv` points at a removed python3.11, so use any env with duckdb
+  1.5.4 / polars 1.41.2 / scikit-learn 1.9.0 (requirements.txt).
 
-### Subset check (AL county 89; 49 plots in the 14 R4 L3s), old → new
-| Check | Old | New |
-|---|---|---|
-| live TPA coverage of TREE on COND_STATUS 1, saplings | 0.346 | 0.989 |
-| live TPA coverage, ≥5 in | 0.934 | 0.994 |
-| uncovered remainder | — | entirely RC7 erroneous prior tallies (intended) |
+### Subset checks after the audit fixes (one county each: AL 89, GA 145, NC 37, FL 29)
+Live TPA coverage of the independent reference is **1.000 for saplings and ≥5 in in all four**.
+Old coverage, saplings / ≥5 in: AL 0.350 / 0.940 · GA 0.387 / 0.934 · NC 0.341 / 0.942 ·
+FL 0.930 / 0.953.
 
-- CN unique, (tree × MEASDATE) unique.
-- live ≥5 in records +5.9 %.
-- curated_trees +18 %.
-- Sim A cohort table: real rows +17 %, phantom rows 835 → 102 (rule c).
-- Same-tree estage age +4.4 yr mean (median-anchor fix).
-- Slim schema identical for every table except curated_trees (+20 appended columns).
-- cohort_disturbance unchanged (23 = 23).
+The following hold in all four counties:
+- 0 rows on SUBP > 4;
+- 0 dead/cut records lost (the null-TPA ones are kept);
+- 0 phantoms on nonforest subplot-visits;
+- 0 sapling-debut phantoms across a re-tally;
+- CN and tree × MEASDATE unique;
+- slim schema: old columns identical, appended columns only (`curated_trees` +23, cohort
+  tables +`procedural_break`).
+
+| County | Live ≥5 in records | Live sapling age, 1–3 in (old → new) | Saplings with age ≤ 1.5 yr | Sim A phantom rows | Sim A real rows |
+|---|---|---|---|---|---|
+| AL 89 | +5.9 % | median 6.2 → 17.9 yr | 26 % → ~0 % | 835 → 206 | 3,736 → 4,389 |
+| GA 145 | +6.9 % | median 6.4 → 12.9 yr | 33 % → ~0 % | 2,370 → 384 | 7,557 → 9,281 |
+| NC 37 | +5.3 % | median 4.8 → 15.2 yr | 39 % → ~0 % | 1,472 → 402 | 6,081 → 7,829 |
+| FL 29 | +4.8 % | median 6.2 → 17.4 yr | 40 % → ~0 % | 1,968 → 315 | 6,823 → 7,183 |
+
+Sapling ages are now about 98 % model-based. Single-county subsets train the age model on only
+~1k rows: AL 89 shows 3–5 in saplings (median 36.6 yr) older than 5–7 in trees (31.3 yr).
+Check the sapling-age monotonicity on the full run.
 
 ---
 

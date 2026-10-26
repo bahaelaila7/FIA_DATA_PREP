@@ -223,8 +223,7 @@ if __name__ == "__main__":
         con.unregister("_cd"); con.commit()
         print(f"\n[write] cohort_disturbance ← {coh.height:,} rows")
     if attach:
-        has_col = any(c[0] == "disturbance_drop_pct" for c in con.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name='curated_cohorts_landis'").fetchall())
+        has_col = "disturbance_drop_pct" in dbconn.column_names(con, "curated_cohorts_landis")  # not information_schema (M6)
         keep = "c.* EXCLUDE (disturbance_drop_pct)" if has_col else "c.*"   # idempotent re-attach
         con.execute(f"""
             CREATE OR REPLACE TABLE curated_cohorts_landis AS

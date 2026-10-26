@@ -39,6 +39,7 @@ from cohorts_landis import (
     compute_sim_year_ages,
     estimate_sapling_growth_rates,
     _has_column,
+    BF_FLAGS,
     add_backfill_flags,          # curation-fix 2026-10-26: shared phantom-backfill blocks
     apply_backfill_blocks,
     load_backfill_context,
@@ -103,7 +104,9 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
             {cycle_col},
             t.STATUSCD, t.tree_fate, t.AGENTCD, t.RECONCILECD,
             t.reconcile_new::INTEGER AS reconcile_new,          -- curation-fix 2026-10-26
+            t.RECONCILECD::INTEGER   AS rc_obs,
             t.censor_measdate, t.censor_reason,
+            t.censor_last_measdate, t.censor_last_reason,
             t.DIA::DOUBLE  AS dia,
             t.HT::DOUBLE   AS ht,
             t.CR::DOUBLE   AS cr,
@@ -136,7 +139,9 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
         LEFT JOIN COND c
             ON c.STATECD=t.STATECD AND c.UNITCD=t.UNITCD AND c.COUNTYCD=t.COUNTYCD
             AND c.PLOT=t.PLOT AND c.INVYR=t.INVYR AND c.CONDID=t.CONDID
-        WHERE t.TPA_UNADJ > 0 {where_state}
+        -- curation-fix (audit I1): TPA > 0 is a LIVE-record rule; dead/cut records with a
+        -- null TPA are kept so they still end the trajectory as a death/removal
+        WHERE (t.STATUSCD <> 1 OR t.TPA_UNADJ > 0) {where_state}
     """).pl()
 
     # Per-tree basal area (ft²/acre, TPA-expanded — for stand cut-event %) and
@@ -206,7 +211,9 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
     )
     # curation-fix 2026-10-26: no backfill for RC6/8/9 entries, across a procedural/area
     # break, or for >=5in subplot ingrowth where the microplot represents the sapling class
-    prior = apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"])
+    # rule (c) is a stand-expansion (TPA) double-count rule: not applied to per-tree,
+    # unexpanded drybio_g trajectories (audit M3)
+    prior = apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"], rule_c=False)
     existing = (
         live.select(TREE_ID + ["MEASDATE"]).unique()
         .rename({"MEASDATE": "prior_measdate"}).with_columns(pl.lit(True).alias("_e"))
@@ -270,14 +277,15 @@ def build_live_body(df: pl.DataFrame, visits: pl.DataFrame, ctx=None) -> pl.Data
     live = compute_sim_year_ages(live)             # integer sim_year + exact age_calc
     live = add_backfill_flags(live)
     live = backfill_phantom_full(live, visits, ctx)  # full-scaffold backward backfill
-    return live.drop(["_bf_none", "_bf_ge5_ingrowth"])
+    return live.drop(BF_FLAGS)
 
 
 # =============================================================================
 # Step 3: mid-trajectory gap interpolation
 # =============================================================================
 
-def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFrame:
+def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
+                     censor_events: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     For every (tree, subplot-visit) strictly between a tree's first and last
     REAL record where the tree is absent, synthesise a row by linear
@@ -333,10 +341,18 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame) -> pl.DataFrame:
 
     # curation-fix 2026-10-26: never interpolate across a censoring (STATUSCD=0 with
     # RECONCILECD 5/6/8/9 between the bracketing records): the tree was out of the sample.
+    # Uses EVERY STATUSCD=0 non-RC7 record (tree_status0_events), so censor -> live ->
+    # censor histories are handled (audit M8).
     n_g0 = g.height
-    g = g.filter(~(pl.col("censor_measdate").is_not_null() &
-                   (pl.col("censor_measdate") > pl.col("prev_measdate")) &
-                   (pl.col("censor_measdate") <= pl.col("next_measdate"))).fill_null(False))
+    if censor_events is not None and censor_events.height:
+        spans = (g.select(TREE_ID + ["MEASDATE", "prev_measdate", "next_measdate"])
+                 .join(censor_events, on=TREE_ID, how="inner")
+                 .filter((pl.col("_cdate") > pl.col("prev_measdate")) &
+                         (pl.col("_cdate") <= pl.col("next_measdate")))
+                 .select(TREE_ID + ["MEASDATE"]).unique()
+                 .with_columns(pl.lit(True).alias("_span")))
+        g = g.join(spans, on=TREE_ID + ["MEASDATE"], how="left").filter(
+            pl.col("_span").is_null()).drop("_span")
     if n_g0 != g.height:
         print(f"[interp] {n_g0 - g.height:,} gap slots NOT filled (span a censoring interval)")
     n_gaps = g.height
@@ -431,7 +447,7 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame) -> pl.DataF
     last = (
         full.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
         .select(TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "AGENTCD",
-                           "row_disturbed", "censor_measdate", "censor_reason"])
+                           "row_disturbed", "censor_last_measdate", "censor_last_reason"])
         .rename({"MEASDATE": "terminal_measdate"})
     )
     # was the subplot visited strictly after the tree's last record?
@@ -454,9 +470,9 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame) -> pl.DataF
             .then(pl.lit("dead_natural"))
         # curation-fix 2026-10-26: STATUSCD=0 + RECONCILECD 5/6/8/9 after the last live
         # record = CENSORING (shrank / moved / procedural / nonsampled), not a removal
-        .when((pl.col("STATUSCD") == 1) & pl.col("censor_measdate").is_not_null() &
-              (pl.col("censor_measdate") > pl.col("terminal_measdate")))
-            .then(pl.lit("censored_") + pl.col("censor_reason"))
+        .when((pl.col("STATUSCD") == 1) & pl.col("censor_last_measdate").is_not_null() &
+              (pl.col("censor_last_measdate") > pl.col("terminal_measdate")))
+            .then(pl.lit("censored_") + pl.col("censor_last_reason"))
         .when((pl.col("STATUSCD") == 1) & pl.col("_later_visit"))
             .then(pl.lit("disappeared_inferred_removal"))
         .when(pl.col("STATUSCD") == 1)
@@ -644,7 +660,13 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
 
     # trajectory body (live + phantom + interpolated)
     body = build_live_body(full, visits, load_backfill_context(con))
-    body = interpolate_gaps(body, visits)
+    import dbconn
+    dbconn.require_tables(con, "tree_status0_events")
+    ws = f"AND STATECD IN ({','.join(map(str, states))})" if states else ""
+    censor_events = con.execute(f"""
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS _cdate
+        FROM tree_status0_events WHERE RC IS DISTINCT FROM 7 {ws}""").pl()
+    body = interpolate_gaps(body, visits, censor_events)
     body = body.with_columns(pl.col("intro_type").fill_null("real"))
 
     # alternate per-source age axes (TOTAGE / STDAGE / estage / model)

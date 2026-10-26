@@ -33,8 +33,8 @@ con.register("_cd", coh.to_pandas())
 con.execute("CREATE OR REPLACE TABLE cohort_disturbance AS SELECT * FROM _cd")
 con.unregister("_cd")
 
-has_col = "disturbance_drop_pct" in dbconn.column_names(con, TABLE)
-keep = "c.* EXCLUDE (disturbance_drop_pct)" if has_col else "c.*"   # idempotent re-attach
+_ex = [c for c in ("disturbance_drop_pct", "procedural_break") if c in dbconn.column_names(con, TABLE)]
+keep = f"c.* EXCLUDE ({', '.join(_ex)})" if _ex else "c.*"   # idempotent re-attach, column order kept
 con.execute(f"""
     CREATE OR REPLACE TABLE {TABLE} AS
     SELECT {keep}, COALESCE(d.disturbance_drop_pct, 0.0) AS disturbance_drop_pct
@@ -43,6 +43,9 @@ con.execute(f"""
       ON c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
       AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc
 """)
+# curation-fix (audit I4): procedural re-tally flag, appended after disturbance_drop_pct
+from cohorts_landis import add_procedural_break
+add_procedural_break(con, TABLE)
 con.commit()
 tot = con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
 nz = con.execute(f"SELECT COUNT(*) FROM {TABLE} WHERE disturbance_drop_pct>0").fetchone()[0]

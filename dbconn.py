@@ -57,6 +57,14 @@ def add_db_args(ap: argparse.ArgumentParser, curated: bool = False) -> argparse.
     return ap
 
 
+def same_file(p: str, q: str) -> bool:
+    """True if p and q are the same file — resolves symlinks / hard links (os.path.samefile
+    when both exist), else compares fully resolved paths (audit M6)."""
+    if os.path.exists(p) and os.path.exists(q):
+        return os.path.samefile(p, q)
+    return os.path.realpath(p) == os.path.realpath(q)
+
+
 def check_args(a, curated: bool = False):
     miss = [n for n in (["out_db", "fiadb"] + (["curated_db"] if curated else []))
             if not getattr(a, n, None)]
@@ -64,10 +72,13 @@ def check_args(a, curated: bool = False):
         sys.exit(f"missing required path(s): {', '.join('--' + m.replace('_', '-') for m in miss)}")
     if not os.path.exists(a.fiadb):
         sys.exit(f"FIADB not found: {a.fiadb}")
-    if os.path.abspath(a.out_db) == os.path.abspath(a.fiadb):
-        sys.exit("refusing to use FIADB as the output DB")
-    if curated and os.path.abspath(a.out_db) == os.path.abspath(a.curated_db):
-        sys.exit("refusing to use the curated DB as the side-DB output")
+    if same_file(a.out_db, a.fiadb):
+        sys.exit("refusing to use FIADB (or a link to it) as the output DB")
+    if curated:
+        if same_file(a.curated_db, a.fiadb):
+            sys.exit("refusing --curated-db = FIADB: its OLD curated tables would be exposed")
+        if same_file(a.out_db, a.curated_db):
+            sys.exit("refusing to use the curated DB as the side-DB output")
 
 
 def parse_states(s) -> list[int] | None:

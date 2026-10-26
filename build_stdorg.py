@@ -25,6 +25,10 @@ SELECT c.* REPLACE (s.lu AS land_use)
 FROM curated_cohorts_landis c
 JOIN stdorg s ON c.statecd=s.statecd AND c.unitcd=s.unitcd AND c.countycd=s.countycd AND c.plot=s.plot
 """)
+# curation-fix (audit I4): procedural re-tally flag, appended as the LAST column of both tables
+from cohorts_landis import add_procedural_break
+add_procedural_break(con, "curated_cohorts_landis")
+add_procedural_break(con, "curated_cohorts_landis_stdorg")
 r = con.execute("SELECT count(*), count(land_use), count(cycle) FROM curated_cohorts_landis_stdorg").fetchone()
 print("STDORG rows / land_use non-null / cycle non-null:", r)
 print("land_use split (plots):", con.execute(

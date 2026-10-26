@@ -63,7 +63,15 @@ def show(title, sql):
     print(con.execute(sql).df().to_string(index=False))
 
 
-# ---- 1. coverage -------------------------------------------------------------------------
+# ---- 1. coverage (reference built from raw FIADB only, independent of the pipeline) ------
+con.execute(f"""
+CREATE TEMP TABLE rc7 AS
+SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE,
+       MIN(MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6), COALESCE(P.MEASDAY,15))) AS d7
+FROM f.TREE T JOIN f.PLOT P ON P.CN = T.PLT_CN
+WHERE T.STATUSCD = 0 AND T.RECONCILECD = 7 AND {scope('T')}
+GROUP BY ALL
+""")
 con.execute(f"""
 CREATE TEMP TABLE ref AS
 SELECT T.CN, T.STATECD, T.TPA_UNADJ, (T.DIA < 5) AS sapling
@@ -71,12 +79,22 @@ FROM f.TREE T
 JOIN f.PLOT P ON P.CN = T.PLT_CN
 JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
 JOIN f.COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
-WHERE T.STATUSCD = 1 AND T.TPA_UNADJ > 0 AND C.COND_STATUS_CD = 1 AND P.PLOT_STATUS_CD < 3
-  AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y' AND {scope('T')}
+JOIN f.SUBPLOT SU ON SU.PLT_CN = T.PLT_CN AND SU.SUBP = T.SUBP
+LEFT JOIN rc7 ON rc7.STATECD=T.STATECD AND rc7.UNITCD=T.UNITCD AND rc7.COUNTYCD=T.COUNTYCD
+     AND rc7.PLOT=T.PLOT AND rc7.SUBP=T.SUBP AND rc7.TREE=T.TREE
+WHERE T.STATUSCD = 1 AND T.TPA_UNADJ > 0 AND T.SUBP <= 4 AND C.COND_STATUS_CD = 1
+  AND P.PLOT_STATUS_CD < 3 AND COALESCE(SU.SUBP_STATUS_CD, -1) <> 3
+  AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
+  AND NOT (rc7.d7 IS NOT NULL AND MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6),
+                                            COALESCE(P.MEASDAY,15)) < rc7.d7)
+  AND T.SPCD IN (SELECT SPCD FROM f.REF_SPECIES)
+  AND {scope('T')}
 """)
 con.execute(f"CREATE TEMP TABLE newct AS SELECT CN FROM new.curated_trees WHERE STATUSCD=1 AND {scope()}")
 con.execute(f"CREATE TEMP TABLE oldct AS SELECT CN FROM f.main.curated_trees WHERE STATUSCD=1 AND {scope()}")
-show("1. live-tree TPA coverage of FIADB TREE (COND_STATUS_CD=1, annual)", """
+show("1. live-tree TPA coverage of FIADB TREE (independent reference: live, SUBP<=4, TPA>0, own "
+     "COND_STATUS 1, PLOT_STATUS<3, SUBP_STATUS<>3, annual, not P2A, not before an RC7 "
+     "erroneous tally, SPCD in REF_SPECIES)", """
 SELECT r.STATECD, CASE WHEN sapling THEN 'sapling' ELSE 'ge5in' END AS size,
        count(*) AS ref_records,
        round(sum(TPA_UNADJ) FILTER (WHERE o.CN IS NOT NULL) / sum(TPA_UNADJ), 4) AS old_tpa_share,
@@ -86,24 +104,49 @@ FROM ref r LEFT JOIN oldct o ON o.CN = r.CN LEFT JOIN newct n ON n.CN = r.CN
 GROUP BY ALL ORDER BY 1, 2""")
 show("1b. new live records NOT in the coverage reference (should be ~0)", """
 SELECT count(*) AS n FROM newct n ANTI JOIN ref r ON r.CN = n.CN""")
-show("1c. uncovered reference records by cause (new)", """
-WITH miss AS (
-  SELECT r.CN, r.TPA_UNADJ, T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, T.INVYR, T.SPCD,
-         MAKE_DATE(P.MEASYEAR, COALESCE(CAST(P.MEASMON AS INTEGER),6), COALESCE(P.MEASDAY,15)) AS md
-  FROM ref r ANTI JOIN newct n ON n.CN = r.CN
-  JOIN f.TREE T ON T.CN = r.CN JOIN f.PLOT P ON P.CN = T.PLT_CN)
-SELECT CASE WHEN rs.SPCD IS NULL THEN 'spcd_not_in_REF_SPECIES'
-            WHEN e.rc7_erroneous_measdate IS NOT NULL AND m.md < e.rc7_erroneous_measdate
-                 THEN 'rc7_erroneous_prior_tally (intended drop)'
-            WHEN csy.SUBP IS NULL THEN 'subplot_visit_not_in_scaffold (SUBP_STATUS_CD=3 / no SUBP_COND)'
-            ELSE 'other' END AS cause, count(*) n, round(sum(m.TPA_UNADJ),1) tpa
-FROM miss m
-LEFT JOIN f.REF_SPECIES rs ON rs.SPCD = m.SPCD
-LEFT JOIN new.excluded_tree_ids e ON e.STATECD=m.STATECD AND e.UNITCD=m.UNITCD AND e.COUNTYCD=m.COUNTYCD
-     AND e.PLOT=m.PLOT AND e.SUBP=m.SUBP AND e.TREE=m.TREE
-LEFT JOIN new.clean_subplot_years csy ON csy.STATECD=m.STATECD AND csy.UNITCD=m.UNITCD
-     AND csy.COUNTYCD=m.COUNTYCD AND csy.PLOT=m.PLOT AND csy.INVYR=m.INVYR AND csy.SUBP=m.SUBP
-GROUP BY 1 ORDER BY 2 DESC""")
+show("1c. reference records not in new curated (should be 0)", """
+SELECT count(*) n, round(sum(TPA_UNADJ),1) tpa FROM ref r ANTI JOIN newct n ON n.CN = r.CN""")
+show("1d. curated rows on SUBP > 4 (auxiliary points; should be 0)", f"""
+SELECT count(*) n FROM new.curated_trees WHERE SUBP > 4 AND {scope()}""")
+show("1e. dead/cut records lost: raw STATUSCD 2/3 (annual, SUBP<=4, not P2A, COND_STATUS 1/2) of "
+     "trees present in new curated, missing from it (should be ~0)", f"""
+WITH tr AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE FROM new.curated_trees WHERE {scope()}),
+raw AS (
+  SELECT T.CN, T.STATUSCD, T.TPA_UNADJ IS NULL AS tpa_null
+  FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y'
+  JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
+  JOIN tr ON tr.STATECD=T.STATECD AND tr.UNITCD=T.UNITCD AND tr.COUNTYCD=T.COUNTYCD AND tr.PLOT=T.PLOT
+         AND tr.SUBP=T.SUBP AND tr.TREE=T.TREE
+  WHERE T.STATUSCD IN (2,3) AND T.SUBP<=4 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y' AND C.COND_STATUS_CD IN (1,2)
+    AND {scope('T')})
+SELECT raw.STATUSCD, raw.tpa_null, count(*) raw_n, count(n.CN) in_curated
+FROM raw LEFT JOIN new.curated_trees n ON n.CN = raw.CN GROUP BY ALL ORDER BY ALL""")
+show("1f. phantom rows on entirely nonforest subplot-visits (should be 0)", """
+SELECT 'curated_cohorts_landis' t, count(*) phantoms,
+       count(*) FILTER (WHERE COALESCE(s.forest_subpcond_prop,0)+COALESCE(s.forest_micrcond_prop,0)=0) nonforest
+FROM new.curated_cohorts_landis c JOIN new.clean_subplot_years s ON s.STATECD=c.statecd AND s.UNITCD=c.unitcd
+  AND s.COUNTYCD=c.countycd AND s.PLOT=c.plot AND s.SUBP=c.subp AND s.MEASDATE=c.measdate
+WHERE c.intro_type='phantom_backfill'
+UNION ALL
+SELECT 'tree_trajectories', count(*),
+       count(*) FILTER (WHERE COALESCE(s.forest_subpcond_prop,0)+COALESCE(s.forest_micrcond_prop,0)=0)
+FROM new.tree_trajectories c JOIN new.clean_subplot_years s ON s.STATECD=c.statecd AND s.UNITCD=c.unitcd
+  AND s.COUNTYCD=c.countycd AND s.PLOT=c.plot AND s.SUBP=c.subp AND s.MEASDATE=c.measdate
+WHERE c.intro_type='phantom_backfill'""")
+show("1g. phantom rows at a procedural re-tally (break) visit's PRIOR visit, by source tree entry "
+     "class: double-count risk (sapling debuts should be 0)", """
+WITH ph AS (SELECT * FROM new.tree_trajectories WHERE intro_type='phantom_backfill'),
+deb AS (SELECT statecd,unitcd,countycd,plot,subp,tree, min(measdate) d FROM new.tree_trajectories
+        WHERE intro_type='real' GROUP BY ALL),
+ddia AS (SELECT t.statecd,t.unitcd,t.countycd,t.plot,t.subp,t.tree, t.dia FROM new.tree_trajectories t
+         JOIN deb USING (statecd,unitcd,countycd,plot,subp,tree) WHERE t.measdate=deb.d AND t.intro_type='real')
+SELECT COALESCE(CAST(ph.reconcile_new AS VARCHAR),'rc1/2/null') entry, ddia.dia < 5 AS sap_debut,
+       count(*) phantom_rows,
+       count(*) FILTER (WHERE EXISTS (SELECT 1 FROM new.procedural_breaks b WHERE b.STATECD=ph.statecd
+            AND b.UNITCD=ph.unitcd AND b.COUNTYCD=ph.countycd AND b.PLOT=ph.plot
+            AND b.MEASDATE > ph.measdate AND b.MEASDATE <= deb.d)) crossing_a_break
+FROM ph JOIN deb USING (statecd,unitcd,countycd,plot,subp,tree) JOIN ddia USING (statecd,unitcd,countycd,plot,subp,tree)
+GROUP BY ALL ORDER BY ALL""")
 
 # ---- 2. record counts ---------------------------------------------------------------------
 rows = []
@@ -181,6 +224,21 @@ SELECT count(*) FILTER (WHERE not_ingrowth) reconcile_new_rows,
        count(*) FILTER (WHERE n_clean_visits=1) single_visit_rows,
        count(*) FILTER (WHERE subp_has_cond_status3) cs3_subplot_rows
 FROM new.curated_trees WHERE {scope()}""")
+
+show("5e. sapling ages: live records by DIA class — estimated_age quantiles, share <= 1.5 yr, "
+     "age_source mix (new; old for comparison)", f"""
+SELECT db, dcls, count(*) n, round(quantile_cont(estimated_age,0.1),1) p10, round(median(estimated_age),1) p50,
+       round(quantile_cont(estimated_age,0.9),1) p90,
+       round(avg((estimated_age <= 1.5)::INT),3) share_le_1_5yr,
+       round(avg((age_source='estage')::INT),3) share_estage, round(avg((age_source='model')::INT),3) share_model
+FROM (SELECT 'new' db, estimated_age, age_source, DIA FROM new.curated_trees WHERE STATUSCD=1 AND {scope()}
+      UNION ALL SELECT 'old', estimated_age, age_source, DIA FROM f.main.curated_trees WHERE STATUSCD=1 AND {scope()})
+CROSS JOIN LATERAL (SELECT CASE WHEN DIA<1 THEN 'a <1' WHEN DIA<3 THEN 'b 1-3' WHEN DIA<5 THEN 'c 3-5'
+                                WHEN DIA<7 THEN 'd 5-7' WHEN DIA<10 THEN 'e 7-10' ELSE 'f 10+' END dcls)
+GROUP BY ALL ORDER BY 2, 1""")
+show("5f. procedural_break flag on cohort tables", """
+SELECT 'stdorg' t, count(*) FILTER (WHERE procedural_break) n_break, count(*) n FROM new.curated_cohorts_landis_stdorg""" +
+     (""" UNION ALL SELECT 'simB', count(*) FILTER (WHERE procedural_break), count(*) FROM newsimb.curated_cohorts_landis_simB""" if a.simb_db else ""))
 
 # ---- 6. slim schema -----------------------------------------------------------------------
 if a.old_slim and a.new_slim:

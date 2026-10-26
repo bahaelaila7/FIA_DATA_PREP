@@ -109,6 +109,7 @@ def load_base_data(con) -> pl.DataFrame:
             t.DIA::DOUBLE                          AS dia,
             t.TPA_UNADJ::DOUBLE                    AS tpa,
             t.reconcile_new::INTEGER               AS reconcile_new,
+            t.RECONCILECD::INTEGER                 AS rc_obs,
             ROUND(t.estimated_age)::INTEGER        AS age_calc,
             (t.DRYBIO_AG * t.TPA_UNADJ
              * {LBS_ACRE_TO_G_M2})::DOUBLE         AS agb,
@@ -474,94 +475,137 @@ def print_mid_measurement_gaps(df: pl.DataFrame) -> None:
 # curation-fix 2026-10-26: phantom-backfill blocking rules
 # -----------------------------------------------------------------------------
 # A phantom pre-debut row at prior subplot visit p for a tree debuting at D is NOT made when
-#   (a) the tree entered for a non-growth reason that means it was NOT in the sampled
-#       population before: RECONCILECD 6 (moved in), 8 (procedural change: newly tallied by
-#       a new procedure — the previous visit's own tallies represent that stratum), 9
-#       (previously nonsampled area);
-#   (b) the subplot had a PROCEDURAL BREAK b with p < b <= D: a STATUSCD=0 censoring with
-#       RECONCILECD 8 (tallies dropped by a procedure change) or a new-tree entry with
-#       RECONCILECD 8 on the same subplot at b — backfill must not span that interval
-#       (the pre-break tallies already represent the re-tallied stratum). STATUSCD=0/RC9
-#       (part of the subplot became nonsampled) is NOT a break for trees in the
-#       still-sampled part; RC9 new trees are covered by (a);
-#   (c) the tree debuted on the SUBPLOT (DIA >= 5 in, TPA ~6.018) as true ingrowth (not a
-#       missed tree RC3/RC7): at the earlier visits it was sapling-sized and that size class
-#       is represented by the microplot saplings (TPA ~74.965) wherever the microplot was
-#       sampled on forest (forest MICRCOND_PROP > 0) — scaling the subplot debut back at TPA
-#       6.018 double counts it. Backfill therefore stops at the latest prior visit with a
-#       sampled forest microplot (only visits after it keep phantoms, so trajectories stay
-#       contiguous).
-# Trees entering as RC3 / RC7 ("missed": present but not tallied) keep their backfill.
-BF_NONE_CODES  = (6, 8, 9)
-BF_MISSED_CODES = (3, 7)
-BREAK_CODES    = (8,)
+#   (a) the tree entered as RECONCILECD 6 (moved in) or 9 (previously nonsampled area): it
+#       was not in the sampled population before;
+#   (n) the subplot was entirely NONFOREST at p (forest SUBPCOND_PROP and MICRCOND_PROP
+#       both 0 — COND_STATUS 2 / SUBP_STATUS 2 visits; audit I2) — or at any visit between
+#       p and D: backfill stops at the latest nonforest prior visit, so it stays contiguous;
+#   (b) a PROCEDURAL BREAK lies in p < b <= D: the PLOT had STATUSCD=0 + RECONCILECD=8
+#       closures at b (table procedural_breaks). Keyed per plot (audit B2): the AL/GA
+#       MANUAL 1.5-2.0 sapling re-tally closed the old saplings RC8 on one subplot and
+#       re-tallied them as RC3/RC8 on others. Applies to SAPLING debuts (DIA < 5 in) and to
+#       RC8 entries of any size (audit M1: a RC8 entry is a re-tally only where it pairs with
+#       closures; unpaired RC8 entries — e.g. FL MANUAL 9.0 species-definition additions —
+#       were present but untallied and keep their backfill, like missed trees);
+#   (c) [cohort tables only — not per-tree trajectories, audit M3] the tree debuted on the
+#       SUBPLOT (DIA >= 5 in, TPA ~6.018) as true ingrowth (RECONCILECD 1 / null), so at the
+#       earlier visits it was sapling-sized and that class is represented by the microplot
+#       saplings (TPA ~74.965) wherever the microplot was sampled on forest — scaling the
+#       subplot debut back at TPA 6.018 double counts it. Backfill stops at the latest prior
+#       visit with a sampled forest microplot. Exempt: RC2 through-growth (a seedling at the
+#       previous visit, which the microplot tree tally does not represent; audit M2) and
+#       RC3/RC7/RC8 entries (present but untallied).
+BF_NONE_CODES   = (6, 9)
+BF_C_EXEMPT     = (2, 3, 7, 8)      # first-record RECONCILECD exempt from rule (c)
 
 
 def load_backfill_context(con) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """(breaks, micro): subplot procedural/area break dates and the per-visit forest
-    microplot proportion, both from the curated DB."""
-    _codes = ",".join(map(str, BREAK_CODES))
-    breaks = con.execute(f"""
-        SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, censor_measdate AS break_date
-        FROM curated_trees WHERE censor_reconcilecd IN ({_codes})
-        UNION
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MIN(MEASDATE) AS break_date
-        FROM curated_trees WHERE reconcile_new IN ({_codes})
-        GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
-    """).pl().unique()
-    micro = con.execute("""
+    """(breaks, visit): plot-level procedural-break dates (procedural_breaks, from v3) and
+    the per-subplot-visit forest subplot / microplot proportions (clean_subplot_years)."""
+    import dbconn
+    dbconn.require_tables(con, "procedural_breaks", "clean_subplot_years")
+    breaks = con.execute("""
+        SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS break_date
+        FROM procedural_breaks
+    """).pl()
+    visit = con.execute("""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE AS prior_measdate,
-               MAX(forest_micrcond_prop) AS _micro_prop
+               MAX(COALESCE(forest_micrcond_prop, 0)) AS _micro_prop,
+               MAX(COALESCE(forest_subpcond_prop, 0) + COALESCE(forest_micrcond_prop, 0)) AS _forest_prop
         FROM clean_subplot_years GROUP BY ALL
     """).pl()
-    print(f"[backfill ctx] {breaks.height:,} subplot procedural-break dates")
-    return breaks, micro
+    print(f"[backfill ctx] {breaks.height:,} plot-visit procedural-break dates")
+    return breaks, visit
 
 
 def add_backfill_flags(df: pl.DataFrame) -> pl.DataFrame:
-    """Per-row tree-level flags used by the blocking rules (debut = first row of the tree)."""
+    """Per-row tree-level flags used by the blocking rules (debut = first row of the tree).
+    Needs dia, reconcile_new and rc_first (RECONCILECD of the tree's first record)."""
     debut = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
-             .select(TREE_ID + [pl.col("dia").alias("_debut_dia")]))
+             .select(TREE_ID + [pl.col("dia").alias("_debut_dia"),
+                                pl.col("rc_obs").alias("_debut_rc")]))
     df = df.join(debut, on=TREE_ID, how="left")
     rn = pl.col("reconcile_new")
     return df.with_columns([
         rn.is_in(list(BF_NONE_CODES)).fill_null(False).alias("_bf_none"),
+        (rn == 8).fill_null(False).alias("_bf_rc8"),
+        (pl.col("_debut_dia") < SAPLING_DIA_MAX).fill_null(False).alias("_bf_sap"),
         ((pl.col("_debut_dia") >= SAPLING_DIA_MAX) &
-         ~rn.is_in(list(BF_MISSED_CODES)).fill_null(False)).fill_null(False).alias("_bf_ge5_ingrowth"),
-    ]).drop("_debut_dia")
+         ~pl.col("_debut_rc").is_in(list(BF_C_EXEMPT)).fill_null(False)).fill_null(False)
+        .alias("_bf_ge5_ingrowth"),
+    ]).drop(["_debut_dia", "_debut_rc"])
 
 
-def apply_backfill_blocks(prior: pl.DataFrame, ctx, key) -> pl.DataFrame:
+BF_FLAGS = ["_bf_none", "_bf_rc8", "_bf_sap", "_bf_ge5_ingrowth"]
+
+
+def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) -> pl.DataFrame:
     """Drop candidate phantom slots per the rules above. `prior` carries SUBPLOT_ID, the
-    debut MEASDATE, prior_measdate, _bf_none, _bf_ge5_ingrowth; `key` identifies a slot."""
+    debut MEASDATE, prior_measdate and the BF_FLAGS; `key` identifies a slot."""
     if ctx is None:
         return prior
-    breaks, micro = ctx
+    breaks, visit = ctx
+    owner = [k for k in key if k != "prior_measdate"]
     n0 = prior.height
     prior = prior.filter(~pl.col("_bf_none"))
     n_none = n0 - prior.height
+
+    # (n) nonforest prior visits: stop at the latest one
+    prior = prior.join(visit, on=SUBPLOT_ID + ["prior_measdate"], how="left").with_columns(
+        pl.when(pl.col("_forest_prop").fill_null(0) <= 0).then(pl.col("prior_measdate"))
+        .otherwise(pl.lit(None, dtype=pl.Date)).max().over(owner).alias("_last_nf"))
+    n1 = prior.height
+    prior = prior.filter(pl.col("_last_nf").is_null() | (pl.col("prior_measdate") > pl.col("_last_nf")))
+    n_nf = n1 - prior.height
+
+    # (b) plot-level procedural break in (p, D] — sapling debuts and RC8 entries
+    applies = pl.col("_bf_sap") | pl.col("_bf_rc8")
     crossed = (
-        prior.select(list(dict.fromkeys(key + ["MEASDATE"]))).unique()
-        .join(breaks, on=SUBPLOT_ID, how="inner")
+        prior.filter(applies).select(list(dict.fromkeys(key + ["MEASDATE"]))).unique()
+        .join(breaks, on=PLOT_KEY, how="inner")
         .filter((pl.col("break_date") > pl.col("prior_measdate")) &
                 (pl.col("break_date") <= pl.col("MEASDATE")))
         .select(key).unique().with_columns(pl.lit(True).alias("_crossed"))
     )
+    n2 = prior.height
     prior = prior.join(crossed, on=key, how="left").filter(pl.col("_crossed").is_null()).drop("_crossed")
-    n_break = n0 - n_none - prior.height
-    prior = prior.join(micro, on=SUBPLOT_ID + ["prior_measdate"], how="left")
-    owner = [k for k in key if k != "prior_measdate"]
-    prior = prior.with_columns(
-        pl.when(pl.col("_bf_ge5_ingrowth") & (pl.col("_micro_prop").fill_null(0) > 0))
-        .then(pl.col("prior_measdate")).otherwise(pl.lit(None, dtype=pl.Date))
-        .max().over(owner).alias("_last_micro"))
-    n1 = prior.height
-    prior = prior.filter(pl.col("_last_micro").is_null() |
-                         (pl.col("prior_measdate") > pl.col("_last_micro")))
-    print(f"[backfill blocks] dropped {n_none:,} (RC6/8/9 entry), {n_break:,} (across a "
-          f"procedural break), {n1 - prior.height:,} (>=5in ingrowth, microplot represents)"
-          f" of {n0:,} candidate slots")
-    return prior.drop(["_micro_prop", "_last_micro"])
+    n_break = n2 - prior.height
+
+    # (c) >= 5 in subplot ingrowth where the microplot represents the sapling class
+    n_c = 0
+    if rule_c:
+        prior = prior.with_columns(
+            pl.when(pl.col("_bf_ge5_ingrowth") & (pl.col("_micro_prop").fill_null(0) > 0))
+            .then(pl.col("prior_measdate")).otherwise(pl.lit(None, dtype=pl.Date))
+            .max().over(owner).alias("_last_micro"))
+        n3 = prior.height
+        prior = prior.filter(pl.col("_last_micro").is_null() |
+                             (pl.col("prior_measdate") > pl.col("_last_micro"))).drop("_last_micro")
+        n_c = n3 - prior.height
+    print(f"[backfill blocks] of {n0:,} candidate slots dropped: {n_none:,} RC6/9 entry, "
+          f"{n_nf:,} nonforest prior visit, {n_break:,} across a plot procedural break, "
+          f"{n_c:,} >=5in ingrowth/microplot" + ("" if rule_c else " (rule c off)"))
+    return prior.drop(["_micro_prop", "_forest_prop", "_last_nf"])
+
+
+def add_procedural_break(con, table: str) -> None:
+    """Append `procedural_break` (BOOL) to a cohort table: TRUE on rows whose (plot,
+    measdate) is a procedural re-tally visit (STATUSCD=0 + RC8 closures on the plot), so
+    consumers can tell a re-tally from cohort death + establishment (audit I4). Appended
+    as the LAST column (idempotent), so readers of the old schema are unaffected."""
+    import dbconn
+    dbconn.require_tables(con, "procedural_breaks", table)
+    keep = "c.* EXCLUDE (procedural_break)" if "procedural_break" in dbconn.column_names(con, table) else "c.*"
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {table} AS
+        SELECT {keep}, (b.PLOT IS NOT NULL) AS procedural_break
+        FROM {table} c
+        LEFT JOIN (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM procedural_breaks) b
+          ON b.STATECD=c.statecd AND b.UNITCD=c.unitcd AND b.COUNTYCD=c.countycd
+         AND b.PLOT=c.plot AND b.MEASDATE=c.measdate
+    """)
+    n = con.execute(f"SELECT count(*) FILTER (WHERE procedural_break), count(*) FROM {table}").fetchone()
+    print(f"[procedural_break] {table}: {n[0]:,}/{n[1]:,} rows at a procedural re-tally visit")
 
 
 def backfill_phantom_trees(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
@@ -690,8 +734,8 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
     )
     if ctx is not None:
         # a cohort slot is blocked only if EVERY member row is blocked by the same rule
-        flags = df.group_by(ckey).agg(pl.col("_bf_none").all(), pl.col("_bf_ge5_ingrowth").all())
-        cohort_debut = cohort_debut.drop(["_bf_none", "_bf_ge5_ingrowth"]).join(flags, on=ckey, how="left")
+        flags = df.group_by(ckey).agg([pl.col(f).all() for f in BF_FLAGS])
+        cohort_debut = cohort_debut.drop(BF_FLAGS).join(flags, on=ckey, how="left")
 
     subp_visits = (
         df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
