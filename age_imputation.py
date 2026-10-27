@@ -3,7 +3,8 @@ age_imputation.py — step 2 of the curation chain (run_curation_v2.sh).
 
 1. TreeAge -> field-age mapping (calibrate_estage, D2 / D5 / D40): isotonic in log1p per species
    group, fitted and selected on PLANTED calibration rows only (it is applied to planted rows
-   only; natural rows keep raw TreeAge). With fewer than CAL_MIN_N planted calibration rows
+   only; natural rows keep raw TreeAge). Each curve is applied only where it beats raw TreeAge
+   out of fold on the planted rows reaching it (D46). With fewer than CAL_MIN_N planted calibration rows
    nothing is mapped and planted estage ages carry age_domain = 'unmapped_estage'.
 2. Age model (build_training_set / fit_age_model): a BAG of BAG_SEEDS HistGradientBoosting
    regressors (mean of the members' log1p predictions) on
@@ -136,6 +137,10 @@ def attach_modeling_context(con, df: pl.DataFrame) -> pl.DataFrame:
 #     factor on (1 + age) removes the log back-transform bias (still monotone);
 #   * fitted once over the whole DB; plot-grouped 5-fold CV reports out-of-fold MAE / bias of
 #     mapped vs raw Tree_Age against the field age (planted rows);
+#   * D46 acceptance: a curve is applied only if its out-of-fold MAE on the planted
+#     calibration rows that reach it is strictly below raw TreeAge's; otherwise those rows fall
+#     through to the next level (same test), and rows no accepted curve covers keep the raw
+#     TreeAge (identity). Decisions per curve in estage_calibration (applied, n, MAE, bias);
 #   * fewer than CAL_MIN_N planted calibration rows in the DB: nothing is mapped (identity),
 #     and planted estage ages are flagged age_domain = 'unmapped_estage' (D40, M-6).
 CAL_MIN_N = 200
@@ -210,11 +215,9 @@ def _group_keys(spgrp, major):
     return [("spgrpcd", spgrp), ("major_spgrpcd", major), ("global", None)]
 
 
-def fit_estage_mapping(cal: pl.DataFrame) -> dict | None:
-    """{(level, value): curve} fitted on the (planted) calibration rows `cal`. A group gets a
-    curve when it has >= CAL_MIN_N records; None when the whole set has fewer."""
-    if cal.height < CAL_MIN_N:
-        return None
+def _fit_curves(cal: pl.DataFrame) -> dict:
+    """{(level, value): curve} for every group of `cal` with >= CAL_MIN_N records, plus the
+    global curve (no acceptance test)."""
     models = {}
     x_all, y_all = cal["estage_raw"].to_numpy().astype(float), cal["field_age"].to_numpy().astype(float)
     models[("global", None)] = _fit_curve(x_all, y_all)
@@ -227,10 +230,73 @@ def fit_estage_mapping(cal: pl.DataFrame) -> dict | None:
     return models
 
 
+_LEVEL_COL = {"spgrpcd": "spgrpcd_resolved", "major_spgrpcd": "major_spgrpcd"}
+
+
+def _fit_mapping_tested(cal: pl.DataFrame) -> tuple[dict, list, dict]:
+    """D46: fit the curves on `cal`, then accept each one only if its out-of-fold MAE on the
+    planted calibration rows that REACH it is strictly below raw TreeAge's on the same rows.
+    Levels are decided in order spgrpcd -> major_spgrpcd -> global: a row reaches a curve when
+    no curve of an earlier level was accepted for it; rows of a rejected curve fall through to
+    the next level, which takes the same test; rows no accepted curve covers keep the identity.
+    The out-of-fold predictions come from the same curve (same level and group) refitted
+    without each of the plot folds present in `cal` (the shared crc32 folds), so the decision
+    uses only `cal` — inside the CV it is therefore nested. Nothing is tuned: a curve is either
+    used as fitted or not at all. Returns (accepted curves, per-curve test records)."""
+    curves = _fit_curves(cal)
+    y = cal["field_age"].to_numpy().astype(float)
+    raw = cal["estage_raw"].to_numpy().astype(float)
+    folds = cal["_fold"].to_numpy()
+    member = {}
+    for k in curves:
+        member[k] = (np.ones(cal.height, dtype=bool) if k[0] == "global"
+                     else (cal[_LEVEL_COL[k[0]]] == k[1]).fill_null(False).to_numpy())
+    oof = {k: np.full(cal.height, np.nan) for k in curves}
+    for f in sorted(set(folds.tolist())):
+        te = folds == f
+        if (~te).sum() < CAL_MIN_N:
+            continue
+        cf = _fit_curves(cal.filter(pl.Series(~te)))
+        for k in curves:
+            m = te & member[k]
+            if k in cf and m.any():
+                oof[k][m] = _apply_curve(cf[k], raw[m])
+    accepted, tests = {}, []
+    reach = np.ones(cal.height, dtype=bool)
+    for level in ("spgrpcd", "major_spgrpcd", "global"):
+        covered = np.zeros(cal.height, dtype=bool)
+        for k in [k for k in curves if k[0] == level]:
+            rows = reach & member[k]
+            t = rows & np.isfinite(oof[k])
+            mae_m = float(np.mean(np.abs(oof[k][t] - y[t]))) if t.any() else None
+            mae_r = float(np.mean(np.abs(raw[t] - y[t]))) if t.any() else None
+            ok = mae_m is not None and mae_m < mae_r
+            tests.append({"key": k, "n_reach": int(rows.sum()), "n_test": int(t.sum()),
+                          "oof_mae_mapped": mae_m, "mae_raw": mae_r,
+                          "oof_bias_mapped": float(np.mean(oof[k][t] - y[t])) if t.any() else None,
+                          "bias_raw": float(np.mean(raw[t] - y[t])) if t.any() else None, "applied": ok})
+            if ok:
+                accepted[k] = curves[k]
+                covered |= rows
+        reach &= ~covered
+    return accepted, tests, curves
+
+
+def fit_estage_mapping(cal: pl.DataFrame) -> dict | None:
+    """{(level, value): curve} of the ACCEPTED curves (D46) fitted on the (planted) calibration
+    rows `cal`; None when the whole set has fewer than CAL_MIN_N records. Records whose groups
+    have no accepted curve keep the raw TreeAge (map_estage's identity)."""
+    if cal.height < CAL_MIN_N:
+        return None
+    return _fit_mapping_tested(cal)[0]
+
+
 def map_estage(models: dict, raw, spgrp, major) -> tuple[np.ndarray, list]:
-    """Mapped field-scale age + the curve key used, record by record (vectorised per key)."""
+    """Mapped field-scale age + the curve key used, record by record (vectorised per key).
+    `models` holds the accepted curves only: a record takes the first of its spgrpcd ->
+    major_spgrpcd -> global curves that exists, else the IDENTITY (raw TreeAge, key None)."""
     raw = np.asarray(raw, dtype=float)
-    out = np.full(raw.shape, np.nan)
+    out = raw.copy()
     used = [None] * raw.size
     keys = {}
     for i, (sg, mj) in enumerate(zip(spgrp, major)):
@@ -303,22 +369,32 @@ def calibrate_estage(con):
     cv = cv_estage_mapping(cal)
     print(f"[estage-cal] plot-grouped {N_FOLDS}-fold CV vs field age, planted rows (n={cv['n']:,}):")
     print(f"             raw Tree_Age  MAE {cv['mae_raw']:6.2f} yr  bias {cv['bias_raw']:+6.2f} yr")
-    print(f"             mapped        MAE {cv['mae_mapped']:6.2f} yr  bias {cv['bias_mapped']:+6.2f} yr")
-    models = fit_estage_mapping(cal)
-    # per-curve out-of-fold diagnostics + knots table
-    _, used = _map_frame(models, cal)
-    y, raw = cal["field_age"].to_numpy().astype(float), cal["estage_raw"].to_numpy().astype(float)
+    print(f"             mapped        MAE {cv['mae_mapped']:6.2f} yr  bias {cv['bias_mapped']:+6.2f} yr  "
+          f"(nested: each fold's mapping makes its own D46 acceptance on the other folds)")
+    _dia = cal["DIA"].to_numpy().astype(float)
+    _y, _raw = cal["field_age"].to_numpy().astype(float), cal["estage_raw"].to_numpy().astype(float)
+    for lo, hi, lab in ((5, 7, "5-7"), (7, 9, "7-9"), (9, 1e9, "9+")):
+        m = (_dia >= lo) & (_dia < hi) & np.isfinite(cv["pred"])
+        if m.any():
+            print(f"             DIA {lab:4s} n {m.sum():>7,}  mapped MAE {np.mean(np.abs(cv['pred'][m] - _y[m])):6.2f} "
+                  f"bias {np.mean(cv['pred'][m] - _y[m]):+6.2f} | raw MAE {np.mean(np.abs(_raw[m] - _y[m])):6.2f} "
+                  f"bias {np.mean(_raw[m] - _y[m]):+6.2f}")
+    models, tests, curves = _fit_mapping_tested(cal)
+    print("[estage-cal] D46 per-curve acceptance (out-of-fold MAE on the planted rows reaching the curve "
+          "must be strictly below raw TreeAge's):")
     rows = []
-    used_arr = np.array([str(u) for u in used])
-    for k, c in models.items():
-        m = used_arr == str(k)
+    for t in tests:
+        k, c = t["key"], curves[t["key"]]
+        print(f"             {k[0]:13s} {'' if k[1] is None else int(k[1]):>4}  n {t['n_test']:>7,}  mapped "
+              f"{t['oof_mae_mapped'] if t['oof_mae_mapped'] is not None else float('nan'):6.2f}  raw "
+              f"{t['mae_raw'] if t['mae_raw'] is not None else float('nan'):6.2f}  -> "
+              f"{'APPLIED' if t['applied'] else 'identity'}")
         rows.append({
             "level": k[0], "group": None if k[1] is None else str(int(k[1])), "stratum": "planted",
-            "n_fit": c["n"], "n_applied_cal": int(m.sum()),
-            "oof_mae_mapped": float(np.nanmean(np.abs(cv["pred"][m] - y[m]))) if m.any() else None,
-            "oof_bias_mapped": float(np.nanmean(cv["pred"][m] - y[m])) if m.any() else None,
-            "mae_raw": float(np.mean(np.abs(raw[m] - y[m]))) if m.any() else None,
-            "bias_raw": float(np.mean(raw[m] - y[m])) if m.any() else None,
+            "n_fit": c["n"], "n_reach_cal": t["n_reach"], "n_test": t["n_test"],
+            "n_applied_cal": t["n_reach"] if t["applied"] else 0,
+            "oof_mae_mapped": t["oof_mae_mapped"], "oof_bias_mapped": t["oof_bias_mapped"],
+            "mae_raw": t["mae_raw"], "bias_raw": t["bias_raw"], "applied": t["applied"],
             "ext_slope": c["slope"], "smearing_factor": c["smear"],
             "knots_tree_age": [round(float(v), 3) for v in np.expm1(c["kx"])],
             "knots_field_age": [round(float(v), 3) for v in np.exp(c["ky"]) * c["smear"] - 1.0],
@@ -330,7 +406,10 @@ def calibrate_estage(con):
         pl.lit(cv["bias_mapped"]).alias("cv_bias_mapped_overall"),
         pl.lit(cv["mae_raw"]).alias("mae_raw_overall"),
         pl.lit(cv["bias_raw"]).alias("bias_raw_overall"),
-        pl.lit("planted rows only (fitted on planted rows only, D40)").alias("applied_to"),
+        pl.lit("planted rows only (fitted on planted rows only, D40); applied only where accepted (D46)")
+        .alias("applied_to"),
+        pl.lit("D46: applied iff out-of-fold MAE on the planted calibration rows reaching the curve "
+               "(spgrpcd -> major_spgrpcd -> global) < raw TreeAge MAE; else identity / next level").alias("acceptance_rule"),
     ])
     # r4: the stratum rule — natural rows use the identity (raw Tree_Age)
     tab = pl.concat([tab, rule], how="diagonal_relaxed")
@@ -338,13 +417,13 @@ def calibrate_estage(con):
     con.execute("CREATE OR REPLACE TABLE estage_calibration AS SELECT * FROM _cal")
     con.unregister("_cal")
     con.commit()
-    print(f"[estage-cal] {len(models)} curves → estage_calibration")
+    print(f"[estage-cal] {len(curves)} curves ({len(models)} applied) → estage_calibration")
     return {"models": models, "cal": cal}
 
 
 def remap_estage(df: pl.DataFrame, est, tree_bounds: pl.DataFrame) -> pl.DataFrame:
-    """Re-anchor estage: estage_mapped = f_g(Tree_Age) (field scale) on valid PLANTED
-    candidates and = raw Tree_Age on valid NATURAL candidates (DIA >= 5, Tree_Age > 1), then
+    """Re-anchor estage: estage_mapped = f_g(Tree_Age) (field scale; raw where the curve
+    reaching the record was not accepted, D46) on valid PLANTED candidates and = raw Tree_Age on valid NATURAL candidates (DIA >= 5, Tree_Age > 1), then
     the usual median anchor + propagation, and the age-discrepancy flags. With no mapping
     (est None, D40) planted candidates keep the raw value too; it is still recomputed here so a
     resumed step 2 never keeps a previous run's mapped values (M-12). Column order is
