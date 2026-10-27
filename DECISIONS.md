@@ -281,3 +281,14 @@ decided and how to reverse it.
   - Pan (landis_region4 src/data/utils.jl:371-372) recomputes its own sim_year and must use the curated axis.
   - Pan's drop consumer (utils.jl:398) defines the drop semantics the curated table must match (audit R6).
   - Both are recorded for the Pan rebuild phase.
+
+## D31 — Generalisation beyond Region 4 (2026-10-27, agent; recorded for the expansion phase)
+- **Evidence (FIADB annual live trees since 2000, by TPA_UNADJ):**
+  - Interior West, North Central, Northeast and the other southern states use only 6.018 (subplot) and 74.965 (microplot), as R4 does.
+  - PNW / CA also have **0.999 (macroplot) on 16.6 % of live trees**.
+- **Generic, carries over:** the RC / STATUS semantics, censoring, re-records, resurrected trees, renumber links, date guards, silent re-tally detection (learned per state × MANUAL), the time axis, determinism, and the verifier.
+- **Must be re-derived per region:**
+  - rule (c) and every two-tier (subplot / microplot) assumption, before PNW / CA;
+  - the D5 age-scale split and the natural-stand TreeAge bias pattern (measured in SE states);
+  - the KNOWN exceptions, which are fit-scope keyed anyway.
+- **First step of any expansion:** whole-state chain + verifier on one state per new region (e.g. OR, CO, MN, PA) before modelling.
