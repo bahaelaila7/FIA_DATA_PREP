@@ -266,3 +266,18 @@ decided and how to reverse it.
   - Same nature as D6: regression to the mean, which only reaches trees without a TreeAge record.
   - A scope with no recorded entries is fully strict: a Region-4 fit must re-measure these cells and record its own values, which is the point of D14.
 - **Reverse:** delete the scope entries from `KNOWN_EXCEPTIONS` and `KNOWN_BIAS_FLAGS`.
+
+## D25–D30 — Round-6 audit (2026-10-27, agent; the implementer records the details and outcomes)
+- **D25, DAMSEV damaged-alive drop branch:** removed as dead code. DAMSEV is a 0–9 class code, never > 40 in R4. D19's rationale is corrected.
+  - Options rejected: inventing damage biomass from damage codes; keeping the dead code.
+- **D26, resurrected trees:** a dead / cut record followed by a PREV_TRE_CN-linked live record is a misrecorded death. It is excluded from fates and events, and the tree continues.
+  - Options rejected: end the tree at the death; leave as is.
+- **D27, gap interpolation:** kept. Check (n3) is INFO when it has no candidates, and a synthetic fixture test exercises the code.
+- **D28, plot location:** the most recent visit's coordinates / county / ecoregion. The key stays the first-visit key.
+  - Options rejected: the first-visit location; per-visit locations.
+- **D29, renumbers without a PREV_PLT_CN link:** linked only on identical coordinates plus ≥ 30 % tree continuity.
+  - Options rejected: ignore them; coordinates alone.
+- **D30, consumer requirement (not a curation change):**
+  - Pan (landis_region4 src/data/utils.jl:371-372) recomputes its own sim_year and must use the curated axis.
+  - Pan's drop consumer (utils.jl:398) defines the drop semantics the curated table must match (audit R6).
+  - Both are recorded for the Pan rebuild phase.
