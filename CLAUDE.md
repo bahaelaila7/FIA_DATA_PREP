@@ -811,6 +811,35 @@ bound is 4.8).
   `plot_key_remap`, `plot_key_coord_links`, `plot_location`, `sapling_growth_rates_simA` /
   `_traj`. `tree_landuse_exits` gains `linked_live_after_dead_md`.
 
+### Round-7 (2026-10-27; audit r7, 6 slices; DECISIONS.md D36–D46)
+Trees (D36–D39) and ages (D40, D46) are committed separately (dfc92cf, f76c872, 1c7fc9f, b7572de).
+The cohort, chain and verifier work:
+- **D41, one disturbance definition** (`cohorts_landis.disturbance_events`): a cut, a death with
+  AGENTCD 10–50 or a DSTRBCD1–3 other than 0 / 60, or an inferred removal, at the tree's FIRST
+  dead / cut record (re-records and misrecorded deaths never). It drives `subp_has_dstrb`
+  (Sim A / Sim B / trajectories; trees without a cohort count too), cohort_tracking and the Sim B
+  drops, which count a removal only AT its event visit. D38: `first_record_dead` removals are not
+  drops.
+- **D42, full removals:** `cohort_disturbance` emits `full_removal = TRUE` rows (drop 1.0). The
+  visit axis of the drop computation is the full scaffold (`load_scaffold`), so a visit at which
+  every tree was removed (cut records without TPA, no trajectory row) is still paired: GA 87,
+  449 → 570 full removals.
+- **D43:** `export_reference_tables` copies PLOT / COND rows of product visits plus the remap's raw
+  visits of the product's plots only (a county subset no longer exports other counties' remapped
+  plots); n25 / `slim_guard post` check for foreign PLT_CNs.
+- **D44:** the hardening list (synthetic-row stratifiers, microplot test for sapling phantoms,
+  per-table phantom floors, ecosubcd from data_plot_eco, 2-way `land_use` + `land_use_4way`,
+  stale paths refusing to run, chain checks and the run id / `run_steps` provenance checked by
+  slim_guard, column order kept on step-6 reruns).
+- **D45 verifier:** independent re-derivation (n14–n26), exits 1 on any FAIL, and the subset
+  determinism check (`--determinism-subset`: steps 1–10 twice at two thread counts). The GRM
+  read is state-scoped (TREE_GRM_COMPONENT has no COUNTYCD), and n6 compares D37 duplicates in the
+  run's scope (plot_key_remap is national).
+- **One-county check (GA 13:87, threads 2 vs 1):** `selftest_fixtures` 9 / 9 PASS. Verifier
+  149 PASS / 15 INFO / 1 FAIL: (d) planted is EMPTY (no planted species with ≥ 50 records per
+  DIA class in one county), an artefact of the subset. Steps 1–10 are EXCEPT-identical at the two
+  thread counts (35 curated + 3 Sim B tables). The 8-state validation is still to run.
+
 ---
 
 ## FIA data model — critical invariants
