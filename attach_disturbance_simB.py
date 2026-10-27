@@ -46,6 +46,20 @@ con.execute("""DELETE FROM cohort_disturbance d USING _first_rows f
     WHERE d.statecd=f.statecd AND d.unitcd=f.unitcd AND d.countycd=f.countycd AND d.plot=f.plot AND d.subp=f.subp
       AND d.species_symbol=f.species_symbol AND d.measdate=f.measdate AND d.age_calc=f.age_calc""")
 print(f"[I-1] {n_first:,} drops on a cohort's first Sim B row removed")
+# r6 R6: Pan's consumer (landis_region4 src/data/utils.jl _weighted_cohort_drop) reconstructs the
+# pre-drop biomass of a row as would_be = agb / (1 - drop), i.e. it reads drop as
+#     drop = dropped / (row agb + dropped)
+# with both in the row's AGB units (g/m2). The drop model's `dropped` is in drybio_g x TPA
+# (g/acre) = g/m2 x ACRE_M2, and its `would_be` is the previous visit's timber members only, so a
+# row with ingrowth (AGB above that base) was over-dropped. The stored drop now means exactly what
+# Pan assumes; `dropped` / `would_be` keep the drop model's own quantities.
+ACRE_M2 = 4046.8564224
+con.execute(f"""
+    UPDATE cohort_disturbance d
+    SET disturbance_drop_pct = round((d.dropped / {ACRE_M2}) / (c.agb + d.dropped / {ACRE_M2}), 9)
+    FROM {TABLE} c
+    WHERE c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
+      AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc""")
 
 _meta = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
         "n_trees_known_bias", "share_known_bias"]

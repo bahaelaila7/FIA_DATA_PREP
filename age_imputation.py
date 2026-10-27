@@ -793,6 +793,11 @@ if __name__ == "__main__":
     states = [r[0] for r in con.execute(
         "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]
     FIT_SCOPE = ",".join(str(int(x)) for x in states)
+    # r6 S2: a county-subset run has its own scope (never inherits whole-state KNOWN entries / flags)
+    if dbconn.table_exists(con, "run_scope"):
+        _cty = con.execute("SELECT counties FROM run_scope").fetchone()[0]
+        if _cty:
+            FIT_SCOPE += f"|counties={_cty}"
     print(f"[step2] fit scope (states fitted together): {FIT_SCOPE}")
     parts_t, parts_s = [], []
     for st in states:

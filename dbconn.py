@@ -89,42 +89,114 @@ def parse_states(s) -> list[int] | None:
     return [int(x) for x in str(s).replace(" ", "").split(",") if x]
 
 
+COORD_LINK_MIN_SHARE = 0.30   # D29: share of the earlier chain end's live trees matched at the start
+
+
 def build_plot_canon_map(con, max_iter: int = 50) -> int:
     """r5 M-2: a few FIA plots change their (UNITCD, COUNTYCD, PLOT) key between annual visits
     (e.g. GA 13/2/87 146 -> 45 -> 146; most are county corrections). The PREV_PLT_CN chain links
     the visits. Each annual plot visit is mapped to the CANONICAL key = the key at its chain's
-    FIRST ANNUAL visit (the chain is followed only through annual-inventory plots). The TEMP
-    table plot_canon_map holds ONLY the visits whose key changes:
+    FIRST ANNUAL visit (the chain is followed only through annual-inventory plots).
+
+    r6 S1 (D29): a chain START (no annual PREV_PLT_CN) is also linked to an earlier chain END
+    when the two visits have IDENTICAL LAT/LON (same state, earlier date, different key) AND >=
+    COORD_LINK_MIN_SHARE of the end's live trees reappear at the start with the same SUBP, TREE
+    and SPCD and a non-decreasing DIA; each start takes its best end and each end is used once.
+    TEMP plot_coord_links lists them.
+
+    r6 R7 (D28): the plot's LOCATION comes from its MOST RECENT annual visit (later records carry
+    FIA's coordinate / county corrections; Pan uses one location per plot). TEMP plot_loc_visit
+    gives, for every visit of a chain that contains a remapped visit, that latest visit's
+    LAT/LON/ELEV and raw key (the PLOT view and data_plot_eco use it). Identity stays the
+    first-visit key.
+
+    TEMP plot_canon_map holds ONLY the visits whose key changes:
       CN (PLOT.CN = PLT_CN elsewhere), UNITCD/COUNTYCD/PLOT (canonical), *_RAW (as recorded).
-    Every plot-keyed raw view (PLOT by CN, the rest by PLT_CN) then carries the canonical key,
-    so all stages see one key per physical plot before anything else. Returns the row count."""
+    Returns the plot_canon_map row count."""
     con.execute("""CREATE OR REPLACE TEMP TABLE _canon_ap AS
-        SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT
+        SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.LAT, P.LON, P.ELEV,
+               MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON, 0), 6) AS BIGINT),
+                         CAST(COALESCE(NULLIF(P.MEASDAY, 0), 15) AS BIGINT)) AS md
         FROM fia.main.PLOT P JOIN fia.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'""")
-    con.execute("""CREATE OR REPLACE TEMP TABLE _canon_root AS
-        SELECT a.CN, a.CN AS root FROM _canon_ap a""")
-    for _ in range(max_iter):
-        n = con.execute("""SELECT count(*) FROM _canon_root r JOIN _canon_ap a ON a.CN = r.root
-                           JOIN _canon_ap p ON p.CN = a.PREV_PLT_CN""").fetchone()[0]
-        if n == 0:
-            break
-        con.execute("""CREATE OR REPLACE TEMP TABLE _canon_root AS
-            SELECT r.CN, COALESCE(p.CN, r.root) AS root FROM _canon_root r JOIN _canon_ap a ON a.CN = r.root
-            LEFT JOIN _canon_ap p ON p.CN = a.PREV_PLT_CN""")
-    else:
+    # D29: coordinate + tree-continuity links of chain starts to earlier chain ends
+    con.execute("""CREATE OR REPLACE TEMP TABLE plot_coord_links AS
+        WITH ends AS (SELECT a.* FROM _canon_ap a WHERE NOT EXISTS (SELECT 1 FROM _canon_ap b WHERE b.PREV_PLT_CN = a.CN)),
+        starts AS (SELECT a.* FROM _canon_ap a WHERE a.PREV_PLT_CN IS NULL
+                   OR NOT EXISTS (SELECT 1 FROM _canon_ap b WHERE b.CN = a.PREV_PLT_CN)),
+        pr AS (SELECT s.CN start_cn, e.CN end_cn, s.STATECD, e.md end_md
+               FROM starts s JOIN ends e ON e.STATECD = s.STATECD AND e.LAT = s.LAT AND e.LON = s.LON
+               WHERE e.md < s.md AND e.CN <> s.CN
+                 AND (s.UNITCD, s.COUNTYCD, s.PLOT) IS DISTINCT FROM (e.UNITCD, e.COUNTYCD, e.PLOT)),
+        el AS (SELECT pr.start_cn, pr.end_cn, count(*) n_live FROM pr JOIN fia.main.TREE t ON t.PLT_CN = pr.end_cn
+               WHERE t.STATUSCD = 1 GROUP BY ALL),
+        em AS (SELECT pr.start_cn, pr.end_cn, count(DISTINCT t.CN) n_match FROM pr
+               JOIN fia.main.TREE t ON t.PLT_CN = pr.end_cn AND t.STATUSCD = 1
+               JOIN fia.main.TREE u ON u.PLT_CN = pr.start_cn AND u.SUBP = t.SUBP AND u.TREE = t.TREE
+                                   AND u.SPCD = t.SPCD AND u.DIA >= t.DIA
+               GROUP BY ALL),
+        sc AS (SELECT pr.*, el.n_live, COALESCE(em.n_match, 0) n_match, COALESCE(em.n_match, 0) / el.n_live AS match_share
+               FROM pr JOIN el USING (start_cn, end_cn) LEFT JOIN em USING (start_cn, end_cn)
+               WHERE COALESCE(em.n_match, 0) >= """ + str(COORD_LINK_MIN_SHARE) + """ * el.n_live),
+        b1 AS (SELECT * FROM sc QUALIFY row_number() OVER (PARTITION BY start_cn ORDER BY match_share DESC, end_md DESC, end_cn) = 1)
+        SELECT * FROM b1 QUALIFY row_number() OVER (PARTITION BY end_cn ORDER BY match_share DESC, start_cn) = 1""")
+    def _roots(with_links: bool, tab: str):
+        lk = "LEFT JOIN plot_coord_links l ON l.start_cn = a.CN" if with_links else \
+             "LEFT JOIN (SELECT NULL::VARCHAR AS start_cn, NULL::VARCHAR AS end_cn) l ON FALSE"
+        con.execute(f"""CREATE OR REPLACE TEMP TABLE _canon_prev AS
+            SELECT a.CN, COALESCE(l.end_cn, CASE WHEN EXISTS (SELECT 1 FROM _canon_ap b WHERE b.CN = a.PREV_PLT_CN)
+                                                 THEN a.PREV_PLT_CN END) AS prev
+            FROM _canon_ap a {lk}""")
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {tab} AS SELECT a.CN, a.CN AS root FROM _canon_ap a")
+        for _ in range(max_iter):
+            n = con.execute(f"""SELECT count(*) FROM {tab} r JOIN _canon_prev p ON p.CN = r.root
+                                WHERE p.prev IS NOT NULL""").fetchone()[0]
+            if n == 0:
+                return
+            con.execute(f"""CREATE OR REPLACE TEMP TABLE {tab} AS
+                SELECT r.CN, COALESCE(p.prev, r.root) AS root FROM {tab} r JOIN _canon_prev p ON p.CN = r.root""")
         sys.exit("[dbconn] PREV_PLT_CN chain did not terminate (cycle?)")
+
+    _roots(False, "_canon_root0")          # chains by PREV_PLT_CN only
+    n_drop = 0
+    for _ in range(10):
+        _roots(True, "_canon_root")
+        # a coordinate link whose re-keyed chain collides with another visit of the same
+        # canonical key and INVYR is dropped (the chains are then different plots)
+        bad = con.execute("""
+            WITH k AS (SELECT r.CN, r.root, r0.root AS root0, o.UNITCD, o.COUNTYCD, o.PLOT, a.STATECD, a.INVYR
+                       FROM _canon_root r JOIN _canon_root0 r0 USING (CN) JOIN _canon_ap a ON a.CN = r.CN
+                       JOIN _canon_ap o ON o.CN = r.root),
+            d AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM k GROUP BY ALL HAVING count(*) > 1)
+            SELECT DISTINCT k.root0 FROM k JOIN d USING (STATECD, UNITCD, COUNTYCD, PLOT, INVYR)
+            WHERE k.root <> k.root0""").fetchall()
+        if not bad:
+            break
+        n_drop += len(bad)
+        con.executemany("DELETE FROM plot_coord_links WHERE start_cn = ?", bad)
+    if n_drop:
+        print(f"[dbconn] {n_drop} coordinate link(s) dropped: the re-keyed chain would collide on a plot-INVYR")
+    con.execute("DROP TABLE _canon_root0")
     con.execute("""CREATE OR REPLACE TEMP TABLE plot_canon_map AS
         SELECT a.CN, a.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
                a.UNITCD AS UNITCD_RAW, a.COUNTYCD AS COUNTYCD_RAW, a.PLOT AS PLOT_RAW
         FROM _canon_root r JOIN _canon_ap a ON a.CN = r.CN JOIN _canon_ap o ON o.CN = r.root
         WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS DISTINCT FROM (o.UNITCD, o.COUNTYCD, o.PLOT)""")
+    # D28: one location per plot = its most recent annual visit (chains with a remapped visit)
+    con.execute("""CREATE OR REPLACE TEMP TABLE plot_loc_visit AS
+        WITH rc AS (SELECT r.root FROM _canon_root r JOIN plot_canon_map m ON m.CN = r.CN GROUP BY 1),
+        last AS (SELECT r.root, arg_max(a.CN, a.md) lcn FROM _canon_root r JOIN rc USING (root)
+                 JOIN _canon_ap a ON a.CN = r.CN GROUP BY 1)
+        SELECT r.CN, o.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
+               l.UNITCD AS LOC_UNITCD, l.COUNTYCD AS LOC_COUNTYCD, l.PLOT AS LOC_PLOT, l.LAT, l.LON, l.ELEV
+        FROM _canon_root r JOIN last USING (root) JOIN _canon_ap l ON l.CN = last.lcn
+        JOIN _canon_ap o ON o.CN = r.root""")
     dup = con.execute("""SELECT count(*) FROM (SELECT P.STATECD, COALESCE(m.UNITCD, P.UNITCD), COALESCE(m.COUNTYCD, P.COUNTYCD),
                              COALESCE(m.PLOT, P.PLOT), P.INVYR FROM fia.main.PLOT P
                              JOIN fia.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
                              LEFT JOIN plot_canon_map m ON m.CN = P.CN GROUP BY ALL HAVING count(*) > 1)""").fetchone()[0]
     if dup:
         sys.exit(f"[dbconn] canonical plot keys collide on {dup} plot-INVYRs")
-    con.execute("DROP TABLE _canon_ap; DROP TABLE _canon_root")
+    con.execute("DROP TABLE _canon_ap; DROP TABLE _canon_root; DROP TABLE _canon_prev")
     return con.execute("SELECT count(*) FROM plot_canon_map").fetchone()[0]
 
 
@@ -162,8 +234,29 @@ def connect(out_db: str, fiadb: str, curated_db: str | None = None) -> duckdb.Du
         if t in keyed and on:
             rep = ", ".join(f"CASE WHEN m.CN IS NULL THEN t.{k} ELSE CAST(m.{k} AS {ktype[t][k]}) END AS {k}"
                             for k in ("UNITCD", "COUNTYCD", "PLOT"))
+            loc = ""
+            if t == "PLOT":   # D28: one location per plot (its most recent visit)
+                rep += ", " + ", ".join(f"CASE WHEN lv.CN IS NULL THEN t.{k} ELSE lv.{k} END AS {k}"
+                                        for k in ("LAT", "LON", "ELEV"))
+                loc = "LEFT JOIN plot_loc_visit lv ON lv.CN = CAST(t.CN AS VARCHAR)"
             con.execute(f"""CREATE TEMP VIEW "{t}" AS SELECT t.* REPLACE ({rep})
-                FROM fia.main."{t}" t LEFT JOIN plot_canon_map m ON m.CN = CAST({on} AS VARCHAR)""")
+                FROM fia.main."{t}" t LEFT JOIN plot_canon_map m ON m.CN = CAST({on} AS VARCHAR) {loc}""")
+        elif t == "data_plot_eco":
+            # D28: a canonical plot whose chain has a remapped visit takes the eco / location row
+            # of its most recent visit's raw key (falls back to its own row if that is missing)
+            con.execute("""CREATE TEMP VIEW data_plot_eco AS
+                WITH loc AS (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, LOC_UNITCD, LOC_COUNTYCD, LOC_PLOT
+                             FROM plot_loc_visit),
+                rep AS (SELECT e.* REPLACE (loc.UNITCD AS unitcd, loc.COUNTYCD AS countycd, loc.PLOT AS plot)
+                        FROM loc JOIN fia.main.data_plot_eco e ON e.statecd = loc.STATECD AND e.unitcd = loc.LOC_UNITCD
+                         AND e.countycd = loc.LOC_COUNTYCD AND e.plot = loc.LOC_PLOT
+                        QUALIFY row_number() OVER (PARTITION BY loc.STATECD, loc.UNITCD, loc.COUNTYCD, loc.PLOT
+                                                   ORDER BY loc.LOC_UNITCD, loc.LOC_COUNTYCD, loc.LOC_PLOT) = 1)
+                SELECT * FROM rep
+                UNION ALL
+                SELECT e.* FROM fia.main.data_plot_eco e
+                WHERE NOT EXISTS (SELECT 1 FROM rep WHERE rep.statecd = e.statecd AND rep.unitcd = e.unitcd
+                                  AND rep.countycd = e.countycd AND rep.plot = e.plot)""")
         else:
             con.execute(f'CREATE TEMP VIEW "{t}" AS SELECT * FROM fia.main."{t}"')
 

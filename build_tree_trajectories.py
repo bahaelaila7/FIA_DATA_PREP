@@ -145,6 +145,7 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
         -- curation-fix (audit I1): TPA > 0 is a LIVE-record rule; dead/cut records with a
         -- null TPA are kept so they still end the trajectory as a death/removal
         WHERE (t.STATUSCD <> 1 OR t.TPA_UNADJ > 0) {where_state}
+          AND NOT COALESCE(t.misrecorded_death, FALSE)   -- r6 R4: a misrecorded death is not a slot / fate
     """).pl()
 
     # Per-tree basal area (ft²/acre, TPA-expanded — for stand cut-event %) and
@@ -233,7 +234,8 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
     if n == 0:
         return live.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
 
-    sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(live)
+    # r6 R1: trajectory agb is PER-TREE biomass (drybio_g), stated explicitly
+    sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(live, basis="per_tree", tag="traj")
     missing = (
         missing
         .join(sp_rates.rename({"rate": "_rs"}),  on=["species_symbol", "epa_l3"], how="left")
@@ -712,7 +714,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
         FROM tree_censor_events WHERE TRUE {ws}
         UNION ALL   -- r3: never interpolate a 'live' slot across / at a dead record (data errors)
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE
-        FROM curated_trees WHERE STATUSCD IN (2, 3) {ws}""").pl()
+        FROM curated_trees WHERE STATUSCD IN (2, 3) AND NOT COALESCE(misrecorded_death, FALSE) {ws}""").pl()
     body = interpolate_gaps(body, visits, censor_events)
     body = body.with_columns(pl.col("intro_type").fill_null("real"))
 
@@ -827,6 +829,11 @@ if __name__ == "__main__":
 
     con.register("_traj_view", traj)
     con.execute("CREATE OR REPLACE TABLE tree_trajectories AS SELECT * FROM _traj_view")
+    import cohorts_landis as _c1
+    if "traj" in _c1.RATE_TABLES:   # r6 R1: the trajectory sapling growth rates (per-tree basis)
+        con.register("_rate_view", _c1.RATE_TABLES["traj"])
+        con.execute("CREATE OR REPLACE TABLE sapling_growth_rates_traj AS SELECT * FROM _rate_view")
+        con.unregister("_rate_view")
     con.unregister("_traj_view")
     con.commit()
     print(f"[save] tree_trajectories written ({traj.height:,} rows)")

@@ -292,3 +292,139 @@ decided and how to reverse it.
   - the D5 age-scale split and the natural-stand TreeAge bias pattern (measured in SE states);
   - the KNOWN exceptions, which are fit-scope keyed anyway.
 - **First step of any expansion:** whole-state chain + verifier on one state per new region (e.g. OR, CO, MN, PA) before modelling.
+
+## D25 — The damaged-alive drop branch (audit r5 R3; 2026-10-27, coordinator option (a))
+- **Evidence:** DAMSEV is a 0–9 class code (10 % classes), recorded only under MANUAL 1.0–1.6; the R4 maximum is 9. The `DAMSEV > 40` branch could therefore never fire, and FIA does not quantify the biomass lost to damage.
+- **Options:**
+  - (a) **remove the branch and correct D19's rationale**;
+  - (b) re-define damage from the DAMSEV classes or DAMAGE_AGENT_CD, which would invent a biomass loss;
+  - (c) keep the dead code.
+- **Chosen:** (a). Drops come from removals only; `compute()` treats every live tree at the visit as a survivor.
+  - **D19 correction:** its "damaged-alive backing" option was moot. No drop ever came from that branch (n2 "0 backed only by damaged-alive members" in r5).
+- **Reverse:** restore the `counted` / `severe_dmg` expressions in `cohort_disturbance.compute`.
+
+## D26 — Resurrected trees (audit r5 R4; 2026-10-27, coordinator option (a))
+- **Evidence:** some trees have a live record after their first dead / cut record, linked back by PREV_TRE_CN with raw PREV_STATUS_CD = 2. These create false deaths and false Sim B drops (GA 3, NC 3, KY 2).
+- **Options:**
+  - (a) **the dead / cut record is a misrecorded death: excluded from fates and events, and the tree continues**;
+  - (b) end the tree at the death and drop the later records;
+  - (c) keep it as is.
+- **Chosen:** (a). FIA's later live record with an explicit link is the stronger evidence.
+- **Implementation:**
+  - New FIX column `misrecorded_death`: a dead / cut record dated before the tree's last live record that has PREV_STATUS_CD = 2 and a PREV_TRE_CN. Such a record gets `tree_fate = 'misrecorded_death'`.
+  - It is excluded from: the re-record count, `final_tree_fate`, `dead_at_first_visit`, snapshots, cohort_tracking events (by tree_fate), the trajectory record set, the interpolation / zombie dead-record sets, and cohort_disturbance.
+  - That visit then becomes an ordinary gap, which can be interpolated live: GA 64 of 88 such visits.
+  - The verifier re-derives the rule from raw (c1). Raw records that the curation itself drops (RC7) are out of scope there.
+  - **Found by the first r7 run, then fixed:**
+    - (a) The later linked live record can sit on a now-NONFOREST condition. The live rule keeps it out of curated_trees, so `tree_landuse_exits` now carries `linked_live_after_dead_md`, and it counts as resurrection evidence too (NC 4, TN 1, FL 1, pool 1 trees). For the final fate a misrecorded death counts as alive at its visit, so such trees end `diverted_landuse`.
+    - (b) cohort_disturbance joined the trajectories' gap slot at a misrecorded visit to that dead record, read STATUSCD 2 and counted a false removal (AL 1, SC 3, TN 2, KY 2 drops). Phantom / gap slots are now alive by construction, and misrecorded records are never a status source.
+- **Reverse:** set `res_md` to null in `classify_tree_fate`.
+
+## D27 — Gap interpolation that never fires (audit r5 R5; 2026-10-27, coordinator)
+- **Evidence:** in R4 every candidate gap spanned a censoring event, so (n3) read "0 of 0".
+- **Chosen:**
+  - The code is kept.
+  - (n3) prints INFO "no candidates" when there are none.
+  - New `selftest_fixtures.py` (run by the verifier as n9) exercises interpolation (basic / nonforest / censoring) and the timber-only drop branch (removal, shrink to 4.9 in, gap-only slot, sapling).
+  - With D26 the data now does produce gap slots (GA 67), and (n3) checks them.
+- **Reverse:** n/a.
+
+## D28 — Plot location of a renumbered plot (audit r5 R7; 2026-10-27, coordinator option (b))
+- **Evidence:** for remapped visits the coordinates are 10–60 km away, and the L4 ecoregion differs in 20 of 54.
+  - For plots whose chain contains a remapped visit, the latest visit differs from the first visit in these attributes (plots: LAT/LON / county / L3 / L4 / ECOSUBCD):
+
+    | State | Plots | LAT/LON | County | L3 | L4 | ECOSUBCD |
+    |---|---|---|---|---|---|---|
+    | AL | 3 | 3 | 3 | 0 | 2 | 0 |
+    | FL | 4 | 2 | 4 | 0 | 1 | 0 |
+    | GA | 4 | 3 | 3 | 0 | 1 | 3 |
+    | KY | 5 | 5 | 5 | 0 | 1 | 2 |
+    | MS | 1 | 0 | 0 | 0 | 0 | 0 |
+    | NC | 11 | 11 | 11 | 0 | 6 | 3 |
+    | SC | 4 | 2 | 2 | 0 | 1 | 1 |
+    | TN | 4 | 4 | 4 | 1 | 1 | 3 |
+
+  - Pan places a plot with `ANY_VALUE(LAT/LON)` over its PLOT rows, so the location it uses was arbitrary.
+- **Options:**
+  - (a) keep the first-visit location;
+  - (b) **use the most recent visit's coordinates / ecoregion for the plot's location attributes, and keep the first-visit key for identity**;
+  - (c) per-visit locations.
+- **Chosen:** (b).
+  - The dbconn PLOT view gives every visit of such a chain the latest visit's LAT / LON / ELEV (TEMP `plot_loc_visit`; the curated table is `plot_location`).
+  - The data_plot_eco view gives the canonical key the latest raw key's eco row (L3 / L4 / ECOSUBCD / lat / lon), so the cohort tables' epa_l3 / l4 and the exported copies follow it.
+  - COUNTYCD stays part of the identity key and is not changed.
+  - Check (n12).
+- **Reverse:** drop the LAT/LON/ELEV replacement and the data_plot_eco view branch in `dbconn.connect`.
+
+## D29 — Renumbers without a PREV_PLT_CN link (audit r5 S1; 2026-10-27, coordinator option (b))
+- **Evidence:** 42 R4 chain starts sit at an earlier chain end's exact coordinates, some with tree continuity (GA 87/45 → 87/146: 29 of 68 trees match).
+- **Options:**
+  - (a) ignore them;
+  - (b) **link a start to an earlier end when the coordinates are identical AND ≥ 30 % of the end's live trees match on SUBP / TREE / SPCD with non-decreasing DIA**;
+  - (c) coordinates alone.
+- **Chosen:** (b), plus these agent rules:
+  - DIA must be strictly non-decreasing (`u.DIA >= t.DIA`; the auditor's c07 allowed −0.3 in).
+  - Each start takes its best end (match share, then latest end), and each end is used once.
+  - A link whose re-keyed chain would collide with another visit on a plot-INVYR is dropped. FIADB-wide: 1 dropped, 18 kept.
+  - At a linked chain start FIA has no PREV_TRE_CN, so a same-number record whose predecessor is live starts a NEW tree when its SPCD differs or its DIA decreased (the evidence rule in `split_reused_tree_numbers`).
+- **R4 links (end → start, trees matched):** GA 13/87/45 → 87/146 (29/68 = 0.43), MS 28/163/84 → 163/101 (30/81 = 0.37), SC 45/19/74 → 19/279 (31/49 = 0.63), SC 45/19/101 → 19/280 (4/4 = 1.00).
+  - The auditor's AL 61/71 → 87 (17/37 with −0.3 in tolerance) fails the strict rule or the collision guard.
+- The verifier rebuilds the links independently, and its map equals dbconn's (117 remapped visits, 18 links).
+- **Reverse:** set `COORD_LINK_MIN_SHARE` > 1 (no links).
+
+## D30 — Sapling growth-rate basis (audit r5 R1; 2026-10-27, agent)
+- **Evidence:** r5 inferred the biomass basis from the presence of a `tpa` column. The trajectories carry `tpa` too, so their per-tree drybio_g was divided by TPA a second time, and trajectory phantoms came out 4.4 % (KY) to 7.8 % (NC) too low.
+- **Chosen:** `estimate_sapling_growth_rates(df, basis=...)` takes an EXPLICIT basis: `tpa_expanded` (Sim A, agb / tpa) or `per_tree` (trajectories). Anything else raises an error.
+  - The rates are written as `sapling_growth_rates_simA` / `_traj`.
+  - Check (n11): per species group with ≥ 50 training trees, the two agree within 10 % or 0.002 / yr.
+- **D20 correction:** D20's "per-tree biomass (… the trajectories' agb is per tree already)" described the intent, not the r5 code. In r5 only Sim A used per-tree rates. D20's NC numbers (5,298 → 2,485 negative rates) are Sim A's. The r5 trajectory phantom shares in CLAUDE.md were biased low; r6 numbers replace them.
+- **Reverse:** n/a (bug fix).
+
+## D31 — Meaning of the stored Sim B drop (audit r5 R6; 2026-10-27, agent)
+- **Evidence:** Pan's `_weighted_cohort_drop` (landis_region4 src/data/utils.jl) reconstructs a row's pre-drop biomass as `agb / (1 − drop)`, so it reads drop = dropped / (row agb + dropped). The stored drop was dropped / (the previous visit's timber members grown on). Rows with ingrowth carry more AGB than that base (GA 135 rows, up to 4.8×) and were over-dropped.
+- **Options:**
+  - (a) **store drop = (dropped / 4046.8564224) / (agb + dropped / 4046.8564224)**, with `dropped` in drybio_g × TPA (g / acre) and agb in g / m²;
+  - (b) change Pan (not allowed: read-only).
+- **Chosen:** (a), applied in attach_disturbance_simB to `cohort_disturbance` and to the attached column. `dropped` / `would_be` keep the drop model's quantities.
+  - Check (n8): Pan's formula reconstructs `dropped` on every drop row (max relative error 1.5e−8 in GA).
+- **Reverse:** remove the UPDATE in attach_disturbance_simB.
+
+## D32 — Pan recomputes its own time axis (audit r5 R8; consumer issue, Pan not modified)
+- **Evidence:** landis_region4 src/data/utils.jl:371–372 sets `sim_year = round(days(measdate − first measdate of id_cols) / 365.25)` per plot (or subplot), ignoring the curated `sim_year`, which is the strict per-subplot axis from the first scaffold visit (M-1 / D18).
+- **Auditor's c08 counts** on the r5 slim: steps where Pan's step ≠ the curated step / visits whose levels differ / steps.
+
+  | State | Sim A (stdorg) | Sim B | Old r4 slim, stdorg |
+  |---|---|---|---|
+  | GA | 408 / 2,149 / 76,835 | 947 / 5,563 / 68,093 | 1,154 / 6,361 |
+  | NC | 223 / 1,074 / 40,865 | 448 / 2,675 / 36,455 | – |
+  | AL | 260 / 1,568 / 50,590 | 582 / 3,675 / 44,180 | – |
+  | KY | 135 / 960 / 24,988 | 147 / 1,010 / 23,934 | – |
+
+- **Required change for the Pan rebuild phase:** read `sim_year` from the curated tables (per subplot) instead of recomputing it. Otherwise two visits that round to the same year (or a subplot whose first scaffold visit has no live tree) get steps that disagree with the cohort ages' integer offsets.
+- **Reverse:** n/a (documentation).
+
+## D33 — Fit scope of a county-subset run (audit r5 S2; 2026-10-27, agent)
+- **Chosen:** v3 writes `run_scope(states, counties)`. The fit scope used by `KNOWN_BIAS_FLAGS` and `KNOWN_EXCEPTIONS` is `<states>` or `<states>|counties=<s:c,…>`, so a subset run never inherits pooled entries or flags.
+- **Reverse:** drop the `|counties=` suffix.
+
+## D34 — FIADB live-tree plots absent from the curated product (genveg T1m finding; 2026-10-27, agent)
+- **Evidence:** of the FIADB plots with live trees inside the R4 L3 scope, the OLD slim_r4 product lacked GA 2,507 of 8,388, FL 250 of 3,662 and KY 79 of 2,650 (the T1m count of 337 used a narrower scope).
+  - The curation-fix chain keeps all but GA 4, FL 5 and KY 10.
+  - Each of those residual plots is an annual, forest, sampled plot ALL of whose live trees are recorded at the next visit as STATUSCD 0 + RECONCILECD 7, "erroneously tallied previously" (e.g. GA 13/4/151/7: 7 live trees in 1997, all RC7 in 1999). The documented RC7 rule drops the erroneous earlier records.
+  - None is periodic-only, and none is lost to DESIGNCD or a visit-count rule.
+  - The slim universe equals the curated plots with Sim A rows. Curated plots without Sim A rows have no live trees.
+- **Options:**
+  - (a) **intended: keep the RC7 rule; add check (n13)** (every FIADB live-tree plot in the state is in curated_trees, or all its live trees precede an RC7 record; unexplained = 0, absent share reported);
+  - (b) keep RC7-erroneous plots, which re-introduces trees FIA withdrew.
+- **Chosen:** (a). The old product's gap was the old curation's exclusions, which the curation fix already removed.
+- **Reverse:** n/a.
+
+## D35 — A coordinate-linked chain start is a procedural re-tally (2026-10-27, agent; follows D29)
+- **Evidence:** with the D29 links alone, the earlier chain end's live trees that were not continued at the linked start (renumbered, or not re-found) became `disappeared_inferred_removal`: GA 15 → 42, SC 2 → 18, MS 0 → 33 trees in the first r6 run. The start's new numbers would also be backfilled as if they were ingrowth.
+- **Options:**
+  - (a) **treat the link visit like a procedural re-tally**: censor the end's live trees that are not continued (same SUBP / TREE / SPCD, DIA not decreasing — the D29 match) as `procedural_relink` at the start visit, and add a `procedural_breaks` row (`break_kind = 'coord_link'`) that blocks every tree's backfill across it;
+  - (b) accept the false removals and false ingrowth;
+  - (c) drop the links again (D29 (a)).
+- **Chosen:** (a). It is the same treatment FIA's own re-tallies get (RC8 / silent re-tally), and the matched trees keep their continuity.
+  - The verifier re-derives both parts independently: link breaks in rule (b), and check (n14) "every end tree is continued or censored". `procedural_relink` also counts as censoring in the (b) sapling census.
+- **Reverse:** remove the `_relink` block in `sql_excluded_trees` and `_brk_link` in cohorts_landis.

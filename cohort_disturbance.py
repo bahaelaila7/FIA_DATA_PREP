@@ -8,13 +8,13 @@ disturbance is applied as a known shock instead of biasing growth/decay).
 Idea (per user spec):
   A cohort = (subplot, species, birth_sim_year = sim_year - age_calc) — Pan's cohort identity.
   At each measurement T (subplot visit), some member trees are removed (cut / disturbance death)
-  or are alive-but-severely-damaged (DAMSEV>40). For each such DISTURBED tree we estimate the
+  (r6 D25: the former alive-but-damaged DAMSEV>40 branch is removed). For each DISTURBED tree we estimate the
   biomass it WOULD have had at T by scaling its last-alive biomass by the growth factor of the
   cohort's SURVIVING trees between the previous visit and T (fallback: carry-forward). The cohort
   drop% = dropped / would-have-been.
 
 Only trees ALREADY FIA-marked as disturbed count (terminal_fate in {dead_disturbance, harvest_*,
-disappeared_inferred_removal}, or alive with DAMSEV1/2>40). NATURAL deaths are excluded (the
+disappeared_inferred_removal}). NATURAL deaths are excluded (the
 growth/longevity model should handle those). Two severity gates (both 40%, testable):
   - per-tree gate: an alive-but-damaged tree counts only if its shortfall vs would-have-been > SEVERITY_FRAC
   - cohort gate (optional): record the cohort drop only if it exceeds COHORT_SEVERITY_FRAC
@@ -59,6 +59,7 @@ def load(con, states):
         LEFT JOIN curated_trees ct
           ON ct.STATECD=tt.statecd AND ct.UNITCD=tt.unitcd AND ct.COUNTYCD=tt.countycd
           AND ct.PLOT=tt.plot AND ct.SUBP=tt.subp AND ct.TREE=tt.tree AND ct.MEASDATE=tt.measdate
+          AND NOT COALESCE(ct.misrecorded_death, FALSE)   -- r6 D26: never a status source
         WHERE tt.drybio_g IS NOT NULL AND tt.tpa IS NOT NULL {ws}
     """).pl()
     print(f"[load] {df.height:,} trajectory rows  ({df.select(SUBPLOT_ID).unique().height:,} subplots)")
@@ -75,11 +76,11 @@ def compute(df, timber_only: bool = False):
     df = df.with_columns([
         (pl.col("drybio_g") * pl.col("tpa")).alias("w"),
         (pl.col("sim_year") - pl.col("age_calc")).alias("birth_sim_year"),
-        (
+        (   # r6: phantom / gap-interpolated slots are alive by construction
             (pl.col("statuscd") == 1)
-            | (pl.col("statuscd").is_null() & pl.col("intro_type").is_in(["phantom_backfill", "gap_interpolated"]))
-        ).alias("alive"),
-        ((pl.col("damsev1") > 40) | (pl.col("damsev2") > 40)).fill_null(False).alias("severe_dmg"),
+            | pl.col("intro_type").is_in(["phantom_backfill", "gap_interpolated"])
+        ).fill_null(False).alias("alive"),
+        pl.lit(False).alias("severe_dmg"),   # r6 D25: no damage branch (DAMSEV is a 0-9 class code)
     ])
 
     # dense per-subplot visit rank (the measurement time axis)
@@ -121,8 +122,8 @@ def compute(df, timber_only: bool = False):
     disturbed_removal = pl.col("w_cur").is_null() & pl.col("terminal_fate").is_in(DISTURB_FATES)
     natural_removal   = pl.col("w_cur").is_null() & pl.col("terminal_fate").is_in(NATURAL_FATES)
     other_gone        = pl.col("w_cur").is_null() & ~(disturbed_removal | natural_removal)  # alive_censored etc.
-    survivor          = pl.col("w_cur").is_not_null() & ~pl.col("dmg_cur").fill_null(False)
-    damaged_alive     = pl.col("w_cur").is_not_null() & pl.col("dmg_cur").fill_null(False)
+    survivor          = pl.col("w_cur").is_not_null()          # r6 D25: every live tree survives
+    damaged_alive     = pl.lit(False)
     pair = pair.with_columns([
         disturbed_removal.alias("is_disturbed_removal"),
         natural_removal.alias("is_natural_removal"),
@@ -149,12 +150,10 @@ def compute(df, timber_only: bool = False):
     # would-have-been biomass + dropped biomass per disturbed tree
     pair = pair.with_columns((pl.col("w_prev") * pl.col("gf")).alias("w_exp"))
     pair = pair.with_columns([
-        # counted-disturbed flag: removals always; damaged only if shortfall>SEVERITY_FRAC
-        (
-            pl.col("is_disturbed_removal")
-            | (pl.col("is_damaged_alive")
-               & ((pl.col("w_exp") - pl.col("w_cur")).clip(0.0, None) > SEVERITY_FRAC * pl.col("w_exp")))
-        ).alias("counted"),
+        # r6 R3 (D25): drops come from disturbance REMOVALS only. The old damaged-alive branch
+        # (DAMSEV1/2 > 40) could never fire: DAMSEV is a 0-9 class code (10 % classes, recorded
+        # only under MANUAL 1.0-1.6; R4 max 9), and FIA does not quantify biomass lost to damage.
+        pl.col("is_disturbed_removal").alias("counted"),
     ])
     pair = pair.with_columns([
         pl.when(pl.col("counted")).then(pl.col("w_exp")).otherwise(0.0).alias("counted_would_be"),

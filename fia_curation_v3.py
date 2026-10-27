@@ -291,6 +291,11 @@ def _sql_procedural_breaks(con, scope: str = ""):
     """)
 
 
+def dbconn_has_links(con) -> bool:
+    """dbconn's TEMP plot_coord_links (D29) exists on this connection."""
+    return con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'plot_coord_links'").fetchone()[0] > 0
+
+
 def sql_excluded_trees(con, scope: str = ""):
     """
     Step 3b — per-tree reconcile events (curation-fix 2026-10-26).
@@ -353,6 +358,38 @@ def sql_excluded_trees(con, scope: str = ""):
          AND b.COUNTYCD=s.COUNTYCD AND b.PLOT=s.PLOT AND b.MEASDATE=s.next_md
     WHERE s.unrecorded
     """)
+    # r6 D35: a coordinate-linked chain start (D29) is a PROCEDURAL re-tally of the plot. Live
+    # trees of the earlier chain end that are NOT continued at the start (same SUBP / TREE / SPCD,
+    # DIA not decreasing — the D29 match) are censored 'procedural_relink' at the start visit
+    # (they were renumbered or not re-found, not removed), and the start visit becomes a
+    # procedural_breaks row (break_kind 'coord_link') that blocks backfill across it.
+    if dbconn_has_links(con):
+        con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE _relink AS
+        SELECT l.start_cn, l.end_cn, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT,
+               MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6),
+                         COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS start_md
+        FROM plot_coord_links l JOIN PLOT P ON CAST(P.CN AS VARCHAR) = l.start_cn
+        WHERE TRUE {scope}""")
+        con.execute("""
+        INSERT INTO tree_censor_events
+        SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, l.start_md, NULL, 'procedural_relink'
+        FROM _relink l JOIN TREE T ON CAST(T.PLT_CN AS VARCHAR) = l.end_cn
+        WHERE T.STATUSCD = 1 AND T.SUBP <= 4
+          AND NOT EXISTS (SELECT 1 FROM TREE u WHERE CAST(u.PLT_CN AS VARCHAR) = l.start_cn AND u.SUBP = T.SUBP
+                          AND u.TREE = T.TREE AND u.SPCD = T.SPCD AND u.DIA >= T.DIA)
+          AND NOT EXISTS (SELECT 1 FROM tree_censor_events e WHERE e.STATECD = T.STATECD AND e.UNITCD = T.UNITCD
+                          AND e.COUNTYCD = T.COUNTYCD AND e.PLOT = T.PLOT AND e.SUBP = T.SUBP AND e.TREE = T.TREE
+                          AND e.MEASDATE = l.start_md)""")
+        con.execute("""
+        INSERT INTO procedural_breaks BY NAME
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, start_md AS MEASDATE, 0 AS n_closed_rc8,
+               0 AS n_closed_rc8_prev_sapling, 0 AS n_prev_saplings, 0 AS n_unrecorded_saplings,
+               NULL AS detect_tier, 'coord_link' AS break_kind
+        FROM _relink""")
+        nrl = con.execute("SELECT count(*) FROM tree_censor_events WHERE reason = 'procedural_relink'").fetchone()[0]
+        print(f"[step3b] coordinate-linked chain starts: {con.execute('SELECT count(*) FROM _relink').fetchone()[0]} "
+              f"(procedural breaks); {nrl:,} earlier live trees not continued -> censored 'procedural_relink'")
     con.execute("""
     DROP TABLE IF EXISTS tree_reconcile_events;
     CREATE TABLE tree_reconcile_events AS
@@ -378,7 +415,11 @@ def sql_excluded_trees(con, scope: str = ""):
     DROP TABLE IF EXISTS tree_landuse_exits;
     CREATE TABLE tree_landuse_exits AS
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE,
-           MIN(MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15))) AS exit_measdate
+           MIN(MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15))) AS exit_measdate,
+           -- r6 D26: the latest such live record that FIA links back to a dead record (a
+           -- misrecorded death whose tree then left forest land)
+           MAX(MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)))
+               FILTER (WHERE T.PREV_STATUS_CD = 2 AND T.PREV_TRE_CN IS NOT NULL) AS linked_live_after_dead_md
     FROM TREE T
     JOIN PLOT P ON P.CN = T.PLT_CN
     JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
@@ -539,7 +580,7 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
 TREE_SPLIT_OFFSET = 100_000   # R4 TREE numbers are < 61,000
 
 
-def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
+def split_reused_tree_numbers(df: pl.DataFrame, coord_start_cns: set | None = None) -> pl.DataFrame:
     """
     r3 M3 — tree-number reuse. A tree key (STATECD..SUBP, TREE) can be re-used for a new tree,
     e.g. a dead tree's number given to a new RC1 tree. Following the PREV_TRE_CN chain, a record
@@ -554,14 +595,23 @@ def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("CN").cast(pl.Utf8).shift(1).over(TREE_ID).alias("_pcn"),
         pl.col("STATUSCD").shift(1).over(TREE_ID).alias("_pst"),
     ])
+    # r6 S1 (D29): at the first visit of a chain that was linked to an earlier chain by
+    # coordinates + tree continuity (dbconn plot_coord_links), FIA carries no PREV_TRE_CN; a
+    # record there whose same-number predecessor is live is the SAME tree only if the species
+    # matches and DIA did not decrease, otherwise it starts a new tree
+    d = d.with_columns(pl.col("SPCD").shift(1).over(TREE_ID).alias("_psp"),
+                       pl.col("DIA").shift(1).over(TREE_ID).alias("_pdia"))
+    at_link = (pl.col("CN").cast(pl.Utf8).is_in(list(coord_start_cns or [])))
     new_seg = pl.col("_pcn").is_not_null() & (
         (pl.col("prev_tre_cn").is_null() & pl.col("_pst").is_in([2, 3])) |
-        (pl.col("prev_tre_cn").is_not_null() & (pl.col("prev_tre_cn") != pl.col("_pcn"))))
+        (pl.col("prev_tre_cn").is_not_null() & (pl.col("prev_tre_cn") != pl.col("_pcn"))) |
+        (at_link & pl.col("prev_tre_cn").is_null() & (pl.col("_pst") == 1) &
+         ((pl.col("SPCD") != pl.col("_psp")).fill_null(True) | (pl.col("DIA") < pl.col("_pdia")).fill_null(False))))
     d = d.with_columns(new_seg.fill_null(False).cast(pl.Int64).cum_sum().over(TREE_ID).alias("_seg"))
     d = d.with_columns((pl.col("_seg").max().over(TREE_ID) > 0).alias("tree_key_split"))
     n_split = d.filter(pl.col("_seg") > 0).select(TREE_ID).unique().height
     n_rec = d.filter(pl.col("_seg") > 0).height
-    d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(["_pcn", "_pst", "_seg"])
+    d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(["_pcn", "_pst", "_seg", "_psp", "_pdia"])
     print(f"[step4s] tree-number reuse: {n_split:,} keys split, {n_rec:,} records moved to a new tree id")
     return d.sort(TREE_ID + ["MEASDATE"])
 
@@ -835,7 +885,7 @@ def handle_reconcile5(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
+def classify_tree_fate(df: pl.DataFrame, landuse_exits: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     Classify each tree-measurement's status:
       - alive: STATUSCD=1
@@ -857,9 +907,31 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
     # or any dead/cut record after the tree's FIRST dead/cut record, is a RE-RECORD of an
     # earlier death: kept, flagged rerecord_dead, and never an event / fate / harvest source.
     dead = pl.col("STATUSCD").is_in([2, 3])
-    df = df.sort(TREE_ID + ["MEASDATE"]).with_columns(
-        (dead & ((pl.col("prev_status_cd") == 2).fill_null(False) |
-                 (dead.cast(pl.Int32).cum_sum().over(TREE_ID) > 1))).alias("rerecord_dead"))
+    # r6 R4 (D26): a dead/cut record FOLLOWED by a live record of the same tree that FIA links back
+    # (PREV_TRE_CN set, PREV_STATUS_CD = 2) is a MISRECORDED death: kept, flagged
+    # misrecorded_death (tree_fate 'misrecorded_death'), and excluded from every fate / event /
+    # dead-record set; the tree continues
+    res_md = (pl.when((pl.col("STATUSCD") == 1) & (pl.col("prev_status_cd") == 2).fill_null(False)
+                      & pl.col("prev_tre_cn").is_not_null()).then(pl.col("MEASDATE"))
+              .max().over(TREE_ID))
+    df = df.sort(TREE_ID + ["MEASDATE"]).with_columns(res_md.alias("_res_md"))
+    # ... or by a linked live record on a now-nonforest condition (tree_landuse_exits: the live
+    # rule keeps it out of the curated records, but FIA's link is the same evidence)
+    if landuse_exits is not None and "linked_live_after_dead_md" in landuse_exits.columns:
+        lx = (landuse_exits.filter(pl.col("linked_live_after_dead_md").is_not_null())
+              .group_by(TREE_ID).agg(pl.col("linked_live_after_dead_md").max().alias("_res_lx")))
+        df = (df.join(lx, on=TREE_ID, how="left")
+                .with_columns(pl.max_horizontal("_res_md", "_res_lx").alias("_res_md")).drop("_res_lx"))
+    df = df.with_columns(
+        (dead & pl.col("_res_md").is_not_null() & (pl.col("MEASDATE") < pl.col("_res_md"))).fill_null(False)
+        .alias("misrecorded_death")).drop("_res_md")
+    real_dead = dead & ~pl.col("misrecorded_death")
+    df = df.with_columns(
+        (real_dead & ((pl.col("prev_status_cd") == 2).fill_null(False) |
+                      (real_dead.cast(pl.Int32).cum_sum().over(TREE_ID) > 1))).alias("rerecord_dead"))
+    n_mis = df.filter(pl.col("misrecorded_death"))
+    print(f"[step5] misrecorded deaths (dead/cut record followed by a linked live record): "
+          f"{n_mis.height:,} records on {n_mis.select(TREE_ID).unique().height:,} trees")
 
     # Raw classification. r3 M6: a cut on a condition that is no longer accessible forest
     # (COND_STATUS 2-4 at that visit) is a land-use DIVERSION, not a harvest of forest.
@@ -867,6 +939,8 @@ def classify_tree_fate(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
         pl.when(pl.col("STATUSCD") == 1)
             .then(pl.lit("alive"))
+        .when(pl.col("misrecorded_death"))
+            .then(pl.lit("misrecorded_death"))
         .when(is_cut & (pl.col("cond_status_cd") != 1).fill_null(False))
             .then(pl.lit("diverted_landuse"))
         .when(is_cut)
@@ -973,14 +1047,16 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
     # r3 I1: a tree that ever has a dead/cut record ends at its FIRST dead/cut record (later
     # records of it are re-records); otherwise at its last (live) record
     first_dead = (
-        df.filter(pl.col("STATUSCD").is_in([2, 3]))
+        df.filter(pl.col("STATUSCD").is_in([2, 3]) & ~pl.col("misrecorded_death"))   # r6 R4
         .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
         .select(TREE_ID + [pl.col("MEASDATE").alias("_dmd"), pl.col("tree_fate").alias("_dfate")])
     )
     last = (
         df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
         .select(TREE_ID + [pl.col("MEASDATE").alias("_lmd"),
-                           pl.col("tree_fate").alias("_lfate"),
+                           # r6 D26: a misrecorded death means the tree was ALIVE at that visit
+                           pl.when(pl.col("tree_fate") == "misrecorded_death").then(pl.lit("alive"))
+                           .otherwise(pl.col("tree_fate")).alias("_lfate"),
                            "censor_last_measdate", "censor_last_reason"])
         .join(first_dead, on=TREE_ID, how="left")
         .with_columns(pl.coalesce(["_dmd", "_lmd"]).alias("_last_md"),
@@ -1001,7 +1077,8 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
     first_subp = subplot_years.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_fsv"))
     dfirst = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
               .join(first_subp, on=SUBPLOT_ID, how="left")
-              .select(TREE_ID + [((pl.col("STATUSCD") == 2) & (pl.col("MEASDATE") == pl.col("_fsv")))
+              .select(TREE_ID + [((pl.col("STATUSCD") == 2) & ~pl.col("misrecorded_death")
+                                  & (pl.col("MEASDATE") == pl.col("_fsv")))
                                  .fill_null(False).alias("dead_at_first_visit")]))
     df = df.join(dfirst, on=TREE_ID, how="left")
 
@@ -1924,7 +2001,8 @@ def build_snapshots(df: pl.DataFrame, scaffold: pl.DataFrame) -> pl.DataFrame:
     # Also compute mortality/harvest summary per subplot-year
     fate_agg = (
         df.filter(pl.col("STATUSCD").is_in([2, 3]) &
-                  ~(pl.col("rerecord_dead") if "rerecord_dead" in df.columns else pl.lit(False)))
+                  ~(pl.col("rerecord_dead") if "rerecord_dead" in df.columns else pl.lit(False)) &
+                  ~(pl.col("misrecorded_death") if "misrecorded_death" in df.columns else pl.lit(False)))
         .group_by(SUBPLOT_INVYR)
         .agg([
             pl.len().alias("n_dead_or_removed"),
@@ -2308,13 +2386,13 @@ def diagnostics(df: pl.DataFrame, snapshots: pl.DataFrame):
 # =============================================================================
 
 def _polars_steps(con, df: pl.DataFrame, estage_raw, all_subplot_years,
-                  landuse_exits=None) -> pl.DataFrame:
+                  landuse_exits=None, coord_start_cns=None) -> pl.DataFrame:
     """Steps 4b-6e for one batch (one state) of tree records."""
-    df = split_reused_tree_numbers(df)
+    df = split_reused_tree_numbers(df, coord_start_cns)
     df = annotate_reconcile(df)
     df, _confusion_edges = analyze_spcd_confusion(df)
     df = handle_reconcile5(df)
-    df = classify_tree_fate(df)
+    df = classify_tree_fate(df, landuse_exits)
     df = add_final_tree_fate(df, all_subplot_years, landuse_exits)
 
     tree_bounds = _compute_tree_bounds(df, all_subplot_years)
@@ -2351,6 +2429,7 @@ FIX_COLUMNS = [
     "dead_at_first_visit", "estage_mapped", "age_domain",
     "rerecord_dead", "tree_key_split", "prev_status_cd", "prev_tre_cn",
     "age_stratum", "unitcd_raw", "countycd_raw", "plot_raw",          # r5 M-5 / M-2
+    "misrecorded_death",                                               # r6 R4
 ]
 
 
@@ -2397,6 +2476,18 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
     print("FIA Curation Pipeline v3 (curation-fix 2026-10-26)")
     print("=" * 70)
     scope = scope_sql(states, counties, "P")
+    # r6 S2: the run scope (states AND the county subset) is recorded, so the age-model fit scope
+    # (KNOWN exceptions / known-bias flags) of a subset run never matches a whole-state one
+    con.execute("CREATE OR REPLACE TABLE run_scope AS SELECT ? AS states, ? AS counties",
+                [",".join(str(int(x)) for x in sorted(states)) if states else None,
+                 ",".join(f"{int(a)}:{int(b)}" for a, b in sorted(counties)) if counties else None])
+    # r6: the plot-key remaps (M-2 / D29) and the plot locations (D28) of this run, for reports
+    # and the verifier
+    con.execute("CREATE OR REPLACE TABLE plot_key_remap AS SELECT * FROM plot_canon_map")
+    con.execute("CREATE OR REPLACE TABLE plot_key_coord_links AS SELECT * FROM plot_coord_links")
+    con.execute("CREATE OR REPLACE TABLE plot_location AS SELECT * FROM plot_loc_visit")
+    coord_start_cns = {r[0] for r in con.execute("""SELECT DISTINCT CAST(T.CN AS VARCHAR) FROM fia.main.TREE T
+                       JOIN plot_coord_links l ON CAST(T.PLT_CN AS VARCHAR) = l.start_cn""").fetchall()}
 
     sql_base_measurements(con, scope)
     sql_clean_subplot_years(con)
@@ -2428,9 +2519,9 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
             FROM clean_subplot_years WHERE STATECD = {int(st)}
         """).pl()
         landuse_exits = con.execute(f"""
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate, linked_live_after_dead_md
             FROM tree_landuse_exits WHERE STATECD = {int(st)}""").pl()
-        df = _polars_steps(con, df, estage_raw, all_subplot_years, landuse_exits)
+        df = _polars_steps(con, df, estage_raw, all_subplot_years, landuse_exits, coord_start_cns)
         df = add_raw_plot_keys(con, add_age_stratum(df), st)
         df = df.select([c for c in df.columns if c not in FIX_COLUMNS]
                        + [c for c in FIX_COLUMNS if c in df.columns])   # age_domain: step 2

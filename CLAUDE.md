@@ -58,7 +58,7 @@ allow-list rather than `search_path`, which would expose them. Helpers: `table_e
 | snapshots by raw SPCD | `curated_snapshots` grouped by `spcd_resolved` / `spgrpcd_resolved` |
 | — | `spgrpcd_resolved`; area proportions for consumer-side normalisation (`cond_condprop_unadj`, `cond_subpprop_unadj`, `cond_micrprop_unadj`, `cond_macrprop_unadj`, `subp_subpcond_prop`, `subp_micrcond_prop`, `subp_macrcond_prop`, `subp_forest_*_prop`, `subp_has_cond_status3`, `cond_status_cd`) |
 
-The 34 new curated_trees columns (incl. `estage_mapped`, `age_domain`, `rerecord_dead`, `tree_key_split`, `prev_status_cd`, `prev_tre_cn`; r5: `age_stratum`, `unitcd_raw`, `countycd_raw`, `plot_raw`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
+The 35 new curated_trees columns (incl. `estage_mapped`, `age_domain`, `rerecord_dead`, `tree_key_split`, `prev_status_cd`, `prev_tre_cn`; r5: `age_stratum`, `unitcd_raw`, `countycd_raw`, `plot_raw`; r6: `misrecorded_death`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
 schema (names, types, order) is an exact prefix. The polars steps run one state at a time. Every
 rule is tree-, subplot- or condition-local, so this matches a single pass. Only the diagnostic
 `spcd_confusion_cluster` id is state-local. `age_imputation` fits its model once over all states
@@ -722,6 +722,92 @@ KNOWN cells (2).
   - (h) planted passes in AL, GA, TN, FL, NC, SC and MS (KY planted has 31 condition-visits:
     INFO).
   - (j) single-state FL passes all six cells.
+- **r6 correction:** the r5 trajectory phantom shares above were biased low by the R1 bug (see
+  Round-6).
+
+### Round-6 (2026-10-27; audit r5 + genveg T1m; DECISIONS.md D25–D35)
+Whole-state runs for AL, GA, KY, NC, SC, MS, TN and FL, plus the pooled FL + KY + MS DB: steps
+1–11, a determinism rerun of steps 4–10, and the verifier. **0 FAIL in all nine.**
+
+| Run | PASS | INFO | KNOWN | FAIL |
+|---|---|---|---|---|
+| AL, GA, TN, FL, NC, SC, MS | 73 | 10 | 0 | 0 |
+| KY | 70 | 13 | 0 | 0 |
+| pool | 86 | 17 | 2 | 0 |
+
+In the pool, FL planted (j) is 10–15 in −3.2 and 15+ in −4.4 yr (recorded −3.8; the KNOWN drift
+bound is 4.8).
+
+- **R1 (D30), sapling growth-rate basis:** `estimate_sapling_growth_rates(df, basis=...)` now
+  takes an explicit basis, `tpa_expanded` (Sim A) or `per_tree` (trajectories).
+  - In r5 the trajectories were divided by TPA twice, so their phantoms were 5–10 % too low.
+  - Trajectory phantom AGB share, r5 → r6:
+
+    | AL | GA | TN | FL | KY | NC | SC | MS |
+    |---|---|---|---|---|---|---|---|
+    | 0.0360 → 0.0394 | 0.0246 → 0.0266 | 0.0228 → 0.0243 | 0.0358 → 0.0386 | 0.0237 → 0.0248 | 0.0266 → 0.0287 | 0.0314 → 0.0334 | 0.0272 → 0.0292 |
+
+  - The rates are written as `sapling_growth_rates_simA` / `_traj`. (n11): the two are
+    identical per species group everywhere.
+- **R2, exported COND / PLOT:** `export_reference_tables` copies COND / PLOT / data_plot_eco
+  from dbconn's remapped views.
+  - Before, slim COND rows for remapped visits of slim plots were 0 everywhere. Now all are
+    present: AL 3, FL 6, GA 11, KY 9, MS 3, NC 14, SC 12, TN 3.
+  - (n10) and `slim_guard post`: every Sim A / Sim B / trajectory visit has its PLOT row and
+    COND rows, in the curated DB and in the slim DB.
+- **R3 (D25):** the damaged-alive drop branch is removed (DAMSEV is a 0–9 class code); drops
+  come from removals only.
+- **R4 (D26), misrecorded deaths:** a dead / cut record followed by a live record that FIA
+  links back (PREV_TRE_CN, PREV_STATUS_CD = 2) gets the new FIX column `misrecorded_death` and
+  `tree_fate = 'misrecorded_death'`. It is excluded from every fate, event and dead-record set,
+  and the tree continues. The linked record may also be a land-use exit.
+  - Records / trees: AL 80 / 72, GA 88 / 72, TN 120 / 94, FL 83 / 80, KY 80 / 76,
+    NC 103 / 95, SC 63 / 58, MS 101 / 99.
+  - Those visits are now gap-interpolated live slots: AL 66, GA 64, TN 76, FL 38, KY 34, NC 56,
+    SC 43, MS 57. (c1) re-derives the flag from raw: 0 missing / 0 extra.
+- **R5 (D27):** gap interpolation now has real candidates (the visits above). (n3) checks them
+  (0 at / across nonforest). The `selftest_fixtures.py` fixtures (n9) pass 4 / 4.
+- **R6 (D31):** the stored Sim B drop is `(dropped / 4046.8564224) / (agb + dropped /
+  4046.8564224)`, exactly what Pan's `_weighted_cohort_drop` assumes
+  (`would_be = agb / (1 − drop)`).
+  - Rows with ingrowth (AGB > the drop model's base × 1.01): AL 211, GA 137, MS 142, SC 87,
+    NC 59, FL 44, TN 12, KY 5 (up to 5.4×). These were over-dropped before.
+  - (n8): Pan's formula reconstructs the dropped biomass on every row (max relative error
+    < 1.5e−8).
+- **R7 (D28), plot location:** a plot whose chain has a remapped visit takes its LAT / LON /
+  ELEV (PLOT view) and its data_plot_eco row (L3 / L4 / ECOSUBCD) from its most recent visit.
+  The identity key stays the first visit's.
+  - The latest visit differs in coordinates on 30 of 36 such R4 plots, in county on 32, in L4 on
+    13, and in L3 on 1 (TN). Per state in D28.
+  - (n12): all curated PLOT rows of those plots carry the latest coordinates.
+- **R8 (D32), consumer issue:** Pan recomputes `sim_year` from its own first measurement
+  (landis_region4 src/data/utils.jl:371–372) and ignores the curated axis. On the r5 slim, its
+  steps disagree on GA 408 / 76,835 Sim A and 947 / 68,093 Sim B steps (NC, AL, KY in D32).
+  **Required change for the Pan rebuild: read the curated `sim_year`.**
+- **S1 (D29) + D35, coordinate links:** a chain start at an earlier chain end's exact
+  coordinates, with ≥ 30 % of the end's live trees continued (same SUBP / TREE / SPCD,
+  non-decreasing DIA), is linked into one plot.
+  - R4 links: GA 87/45 → 87/146 (0.43), MS 163/84 → 163/101 (0.37), SC 19/74 → 19/279 (0.63),
+    SC 19/101 → 19/280 (1.00).
+  - The link visit is a procedural re-tally (D35). End trees that are not continued are censored
+    `procedural_relink` (GA 29, MS 37, SC 17), and a `coord_link` break blocks backfill across
+    it. `disappeared_inferred_removal` therefore stays at its r5 level: GA 15, SC 2, MS 0.
+  - (n14) checks every end tree is continued or censored. The verifier's own map (links
+    included) equals dbconn's.
+- **S2 (D33):** `run_scope` (states, counties) is written by v3, and the fit scope includes the
+  county subset.
+- **T1m (D34), FIADB live-tree plots missing from the curated product:** the old slim_r4 lacked
+  GA 2,507, FL 250 and KY 79 in-scope live-tree plots. Now (n13) absent / plots:
+
+  | AL | GA | TN | FL | KY | NC | SC | MS |
+  |---|---|---|---|---|---|---|---|
+  | 0 / 5,406 | 4 / 8,384 | 0 / 3,603 | 5 / 3,659 | 10 / 2,645 | 6 / 4,679 | 1 / 3,777 | 5 / 4,187 |
+
+  Every remaining one is a plot whose live trees FIA withdrew as "erroneously tallied" (RC7).
+  0 are unexplained.
+- **New FIX columns:** `misrecorded_death` (curated_trees). **New tables:** `run_scope`,
+  `plot_key_remap`, `plot_key_coord_links`, `plot_location`, `sapling_growth_rates_simA` /
+  `_traj`. `tree_landuse_exits` gains `linked_live_after_dead_md`.
 
 ---
 

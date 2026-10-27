@@ -79,6 +79,23 @@ else:
     if empty:
         sys.exit(f"[slim_guard] empty slim tables: {empty}")
     print("[slim_guard] post: all 8 slim tables present and non-empty")
+    # r6 R2: every cohort visit (canonical key, measdate) has its PLOT row and >= 1 COND row
+    k = duckdb.connect(a.slim, read_only=True)
+    miss = k.execute("""
+        WITH v AS (SELECT DISTINCT statecd,unitcd,countycd,plot,measdate FROM curated_cohorts_landis_stdorg
+                   UNION SELECT DISTINCT statecd,unitcd,countycd,plot,measdate FROM curated_cohorts_landis_simB),
+        p AS (SELECT CAST(CN AS VARCHAR) cn, STATECD, UNITCD, COUNTYCD, PLOT,
+                     MAKE_DATE(CAST(MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(MEASMON, 0), 6) AS BIGINT),
+                               CAST(COALESCE(NULLIF(MEASDAY, 0), 15) AS BIGINT)) md FROM PLOT),
+        c AS (SELECT DISTINCT CAST(PLT_CN AS VARCHAR) cn FROM COND)
+        SELECT count(*), count(*) FILTER (WHERE p.cn IS NULL), count(*) FILTER (WHERE p.cn IS NOT NULL AND c.cn IS NULL)
+        FROM v LEFT JOIN p ON p.STATECD=v.statecd AND p.UNITCD=v.unitcd AND p.COUNTYCD=v.countycd AND p.PLOT=v.plot
+                          AND p.md=v.measdate
+        LEFT JOIN c ON c.cn = p.cn""").fetchone()
+    k.close()
+    if miss[1] or miss[2]:
+        sys.exit(f"[slim_guard] {miss[1]} cohort visits lack their PLOT row and {miss[2]} lack COND rows (of {miss[0]:,})")
+    print(f"[slim_guard] post: all {miss[0]:,} cohort visits have their PLOT row and COND rows")
     if a.ref_slim:
         def schema(path):
             k = duckdb.connect(path, read_only=True)

@@ -94,14 +94,54 @@ con.execute(f"SET threads={os.environ.get('FIA_DUCKDB_THREADS', '3')}; "
 # in-memory catalog `f` holds one view per FIADB table, remapped where the table is plot-keyed.
 con.execute(f"ATTACH '{a.fiadb}' AS fraw (READ_ONLY)")
 con.execute("ATTACH ':memory:' AS f")
+# r6 S1 (D29): a chain start is also linked to an earlier chain end with IDENTICAL LAT/LON (same
+# state, earlier, different key) when >= 30 % of the end's live trees reappear at the start with
+# the same SUBP / TREE / SPCD and non-decreasing DIA (best end per start, each end once); a link
+# whose re-keyed chain would collide on a plot-INVYR is dropped. Re-derived here independently.
+con.execute("""CREATE TABLE f.main._ap AS SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.LAT, P.LON,
+    MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(P.MEASDAY,0),15) AS BIGINT)) md
+    FROM fraw.main.PLOT P JOIN fraw.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'""")
+con.execute("""CREATE TABLE f.main._links AS
+WITH par AS (SELECT a.CN, a.PREV_PLT_CN FROM f.main._ap a SEMI JOIN f.main._ap b ON b.CN = a.PREV_PLT_CN),
+st AS (SELECT a.* FROM f.main._ap a ANTI JOIN par USING (CN)),
+en AS (SELECT a.* FROM f.main._ap a ANTI JOIN par ON par.PREV_PLT_CN = a.CN),
+pr AS (SELECT st.CN s, en.CN e, en.md emd FROM st JOIN en ON en.STATECD = st.STATECD AND en.LAT = st.LAT AND en.LON = st.LON
+       AND en.md < st.md AND en.CN <> st.CN AND (en.UNITCD, en.COUNTYCD, en.PLOT) IS DISTINCT FROM (st.UNITCD, st.COUNTYCD, st.PLOT)),
+tr AS (SELECT pr.s, pr.e, count(*) nl,
+              count(*) FILTER (WHERE EXISTS (SELECT 1 FROM fraw.main.TREE u WHERE u.PLT_CN = pr.s AND u.SUBP = t.SUBP
+                               AND u.TREE = t.TREE AND u.SPCD = t.SPCD AND u.DIA >= t.DIA)) nm
+       FROM pr JOIN fraw.main.TREE t ON t.PLT_CN = pr.e AND t.STATUSCD = 1 GROUP BY ALL),
+ok AS (SELECT tr.*, pr.emd, nm / nl r FROM tr JOIN pr USING (s, e) WHERE nm >= 0.30 * nl)
+SELECT s, e FROM (SELECT * FROM ok QUALIFY row_number() OVER (PARTITION BY s ORDER BY r DESC, emd DESC, e) = 1)
+QUALIFY row_number() OVER (PARTITION BY e ORDER BY r DESC, s) = 1""")
+
+
+def _canon_walk(with_links):
+    lk = "UNION ALL SELECT s, e FROM f.main._links" if with_links else ""
+    con.execute(f"""CREATE OR REPLACE TABLE f.main._walk AS
+    WITH RECURSIVE ed AS (SELECT a.CN c, a.PREV_PLT_CN p FROM f.main._ap a SEMI JOIN f.main._ap b ON b.CN = a.PREV_PLT_CN
+                          WHERE a.CN NOT IN (SELECT s FROM f.main._links WHERE {str(with_links).upper()})
+                          {lk}),
+    roots AS (SELECT CN FROM f.main._ap ANTI JOIN ed ON ed.c = CN),
+    walk(CN, root) AS (SELECT CN, CN FROM roots UNION ALL SELECT ed.c, w.root FROM walk w JOIN ed ON ed.p = w.CN)
+    SELECT * FROM walk""")
+
+
+_canon_walk(False)
+con.execute("CREATE TABLE f.main._walk0 AS SELECT * FROM f.main._walk")
+for _it in range(10):
+    _canon_walk(True)
+    _bad = con.execute("""WITH k AS (SELECT w.CN, w.root, w0.root root0, a.STATECD, a.INVYR, o.UNITCD, o.COUNTYCD, o.PLOT
+                                     FROM f.main._walk w JOIN f.main._walk0 w0 USING (CN) JOIN f.main._ap a ON a.CN = w.CN
+                                     JOIN f.main._ap o ON o.CN = w.root),
+                          d AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM k GROUP BY ALL HAVING count(*) > 1)
+                          SELECT DISTINCT root0 FROM k JOIN d USING (STATECD, UNITCD, COUNTYCD, PLOT, INVYR) WHERE root <> root0""").fetchall()
+    if not _bad:
+        break
+    con.executemany("DELETE FROM f.main._links WHERE s = ?", _bad)
 con.execute("""CREATE TABLE f.main._canon AS
-WITH RECURSIVE ap AS (SELECT P.CN, P.PREV_PLT_CN, P.UNITCD, P.COUNTYCD, P.PLOT FROM fraw.main.PLOT P
-                      JOIN fraw.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'),
-roots AS (SELECT a.CN FROM ap a WHERE a.PREV_PLT_CN IS NULL OR a.PREV_PLT_CN NOT IN (SELECT CN FROM ap)),
-walk(CN, root) AS (SELECT CN, CN FROM roots
-                   UNION ALL SELECT c.CN, w.root FROM walk w JOIN ap c ON c.PREV_PLT_CN = w.CN)
 SELECT w.CN, r.UNITCD, r.COUNTYCD, r.PLOT, a.UNITCD AS unitcd_raw, a.COUNTYCD AS countycd_raw, a.PLOT AS plot_raw
-FROM walk w JOIN ap a ON a.CN = w.CN JOIN ap r ON r.CN = w.root
+FROM f.main._walk w JOIN f.main._ap a ON a.CN = w.CN JOIN f.main._ap r ON r.CN = w.root
 WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS DISTINCT FROM (r.UNITCD, r.COUNTYCD, r.PLOT)""")
 _kt = {}
 for _tn, _cn, _dt in con.execute("""SELECT table_name, column_name, data_type FROM duckdb_columns()
@@ -120,6 +160,10 @@ for (_t,) in con.execute("SELECT table_name FROM duckdb_tables() WHERE database_
 con.execute(f"ATTACH '{a.curated_db}' AS new (READ_ONLY)")
 FIT_SCOPE = ",".join(str(int(r[0])) for r in con.execute(
     "SELECT DISTINCT STATECD FROM new.curated_trees ORDER BY 1").fetchall())
+if con.execute("SELECT count(*) FROM duckdb_tables() WHERE database_name='new' AND table_name='run_scope'").fetchone()[0]:
+    _cty = con.execute("SELECT counties FROM new.run_scope").fetchone()[0]
+    if _cty:   # r6 S2
+        FIT_SCOPE += f"|counties={_cty}"
 print(f"fit scope (states fitted together in this DB): {FIT_SCOPE}")
 if a.simb_db:
     con.execute(f"ATTACH '{a.simb_db}' AS newsimb (READ_ONLY)")
@@ -173,6 +217,30 @@ WHERE T.STATUSCD = 1 AND T.TPA_UNADJ > 0 AND T.SUBP <= 4 AND C.COND_STATUS_CD = 
   AND T.SPCD IN (SELECT SPCD FROM f.REF_SPECIES)
   AND {scope('T')}
 """)
+# r6 (genveg T1m finding, D34): plots with live FIADB trees that are absent from curated_trees.
+# The reference plot set is every plot with a live tree (STATUSCD 1, TPA > 0, SUBP <= 4, own
+# COND_STATUS 1, annual, PLOT_STATUS < 3, SUBP_STATUS <> 3, not P2A); a plot is EXPLAINED when all
+# its live trees precede a STATUSCD 0 + RECONCILECD 7 "erroneously tallied previously" record
+# (the documented RC7 rule drops those records). Unexplained absences must be 0.
+r = con.execute(f"""
+WITH lt AS (SELECT T.CN, T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT,
+                   (rc7.d7 IS NOT NULL AND MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) < rc7.d7) pre_rc7
+            FROM f.TREE T JOIN f.PLOT P ON P.CN = T.PLT_CN JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
+            JOIN f.COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
+            JOIN f.SUBPLOT SU ON SU.PLT_CN = T.PLT_CN AND SU.SUBP = T.SUBP
+            LEFT JOIN rc7 ON rc7.STATECD=T.STATECD AND rc7.UNITCD=T.UNITCD AND rc7.COUNTYCD=T.COUNTYCD
+                 AND rc7.PLOT=T.PLOT AND rc7.SUBP=T.SUBP AND rc7.TREE=T.TREE
+            WHERE T.STATUSCD = 1 AND T.TPA_UNADJ > 0 AND T.SUBP <= 4 AND C.COND_STATUS_CD = 1
+              AND P.PLOT_STATUS_CD < 3 AND COALESCE(SU.SUBP_STATUS_CD, -1) <> 3 AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
+              AND {scope('T')}),
+pl AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, bool_and(pre_rc7) all_rc7 FROM lt GROUP BY ALL),
+cp AS (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT FROM new.curated_trees WHERE {scope()})
+SELECT pl.STATECD, count(*) n, count(*) FILTER (WHERE cp.PLOT IS NULL) absent,
+       count(*) FILTER (WHERE cp.PLOT IS NULL AND all_rc7) absent_rc7, count(*) FILTER (WHERE cp.PLOT IS NULL AND NOT all_rc7) unexplained
+FROM pl LEFT JOIN cp USING (STATECD, UNITCD, COUNTYCD, PLOT) GROUP BY 1 ORDER BY 1""").fetchall()
+for st_, n_, ab_, rc_, un_ in r:
+    check(f"(n13) state {st_}: every FIADB live-tree plot is in curated_trees, or absent only by the RC7 rule",
+          un_ == 0, f"({n_:,} plots; absent {ab_} = {100*ab_/max(n_,1):.2f} %: {rc_} all-trees-erroneously-tallied (RC7), {un_} unexplained)")
 con.execute(f"CREATE TEMP TABLE newct AS SELECT CN FROM new.curated_trees WHERE STATUSCD=1 AND {scope()}")
 con.execute(f"CREATE TEMP TABLE oldct AS SELECT CN FROM f.main.curated_trees WHERE STATUSCD=1 AND {scope()}")
 show("1. live-tree TPA coverage of FIADB TREE (independent reference: live, SUBP<=4, TPA>0, own "
@@ -294,6 +362,10 @@ _ub = con.execute("""SELECT (SELECT count(*) FROM ub),
                            WHERE break_kind='unrecorded' OR n_unrecorded_saplings > 0))""").fetchone()
 info("(b) raw re-tally candidate set vs pipeline procedural_breaks (unrecorded part)",
      f"(raw {_ub[0]:,}; pipeline-only {_ub[1]:,}; raw-only {_ub[2]:,})")
+# r6 D35: coordinate-linked chain starts (verifier's own _links) are procedural breaks for EVERY debut
+con.execute("""CREATE TEMP TABLE lb AS SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT,
+    MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(P.MEASDAY,0),15) AS BIGINT)) bd
+    FROM f.main._links l JOIN f.PLOT P ON CAST(P.CN AS VARCHAR) = l.s""")
 # member debut (first live record meeting the cohort-table filter)
 con.execute(f"""
 CREATE TEMP TABLE deb AS
@@ -324,7 +396,9 @@ def block_reasons(src_sql, rule_c=True):
                     OR EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=j.STATECD AND ub.UNITCD=j.UNITCD AND ub.COUNTYCD=j.COUNTYCD
                              AND ub.PLOT=j.PLOT AND ub.bd > j.p AND ub.bd <= j.D)))
       OR (COALESCE(j.drn = 8, FALSE) AND EXISTS (SELECT 1 FROM rb WHERE rb.STATECD=j.STATECD AND rb.UNITCD=j.UNITCD
-                             AND rb.COUNTYCD=j.COUNTYCD AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D)) AS r_b,
+                             AND rb.COUNTYCD=j.COUNTYCD AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D))
+      OR EXISTS (SELECT 1 FROM lb WHERE lb.STATECD=j.STATECD AND lb.UNITCD=j.UNITCD AND lb.COUNTYCD=j.COUNTYCD
+                 AND lb.PLOT=j.PLOT AND lb.bd > j.p AND lb.bd <= j.D) AS r_b,
       {"(j.ddia >= 5 AND COALESCE(j.drc NOT IN (2,3,7,8), TRUE) AND EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=j.STATECD AND rv.UNITCD=j.UNITCD AND rv.COUNTYCD=j.COUNTYCD AND rv.PLOT=j.PLOT AND rv.SUBP=j.SUBP AND rv.md >= j.p AND rv.md < j.D AND rv.fmic > 0))" if rule_c else "FALSE"} AS r_c
     FROM j"""
 
@@ -375,9 +449,10 @@ check("(a) every cohort-pass phantom slot has a member that survives its own blo
 # (pv / pv2 / us: built from RAW FIADB above, with the block-rule re-derivation)
 con.execute("""
 CREATE TEMP TABLE us2 AS
-SELECT us.*, (e.TREE IS NOT NULL) AS censored_unrec
-FROM us LEFT JOIN (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,MEASDATE FROM new.tree_censor_events
-                   WHERE reason='procedural_unrecorded') e
+SELECT us.*, (e.TREE IS NOT NULL) AS censored_unrec, COALESCE(e.pu, FALSE) AS censored_pu
+FROM us LEFT JOIN (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,MEASDATE, bool_or(reason = 'procedural_unrecorded') pu
+                   FROM new.tree_censor_events
+                   WHERE reason IN ('procedural_unrecorded', 'procedural_relink') GROUP BY ALL) e   -- r6 D35
   ON e.STATECD=us.STATECD AND e.UNITCD=us.UNITCD AND e.COUNTYCD=us.COUNTYCD AND e.PLOT=us.PLOT
  AND e.SUBP=us.SUBP AND e.TREE=us.TREE AND e.MEASDATE=us.nmd""")
 show("(b) unrecorded saplings by state x MANUAL transition (raw), censored by the pipeline, residual", """
@@ -392,7 +467,7 @@ WITH t AS (SELECT STATECD, MANUAL, nman, count(*) n, count(*) FILTER (WHERE unre
 p AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,nmd, count(*) n, count(*) FILTER (WHERE unrec AND NOT censored_unrec) res FROM us2 GROUP BY ALL)
 SELECT (SELECT count(*) FROM t WHERE n >= 20 AND res >= 0.5*n),
        (SELECT count(*) FROM p WHERE res >= 3 AND res >= 0.5*n),
-       (SELECT count(*) FROM us2 WHERE censored_unrec AND NOT unrec)""").fetchone()
+       (SELECT count(*) FROM us2 WHERE censored_pu AND NOT unrec)""").fetchone()   # relink censoring covers recorded, non-continued trees
 check("(b) no transition with >= 50 % uncensored unrecorded saplings (n >= 20)", r[0] == 0, f"({r[0]})")
 check("(b) no plot-visit with >= 3 and >= 50 % uncensored unrecorded saplings", r[1] == 0, f"({r[1]})")
 check("(b) censored only saplings that are really unrecorded", r[2] == 0, f"({r[2]})")
@@ -429,11 +504,36 @@ FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY SV ON SV.CN = P.SRV_C
 JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
 WHERE T.STATUSCD IN (2,3) AND T.SUBP<=4 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y' AND C.COND_STATUS_CD IN (1,2,3,4)
   AND {scope('T')}""")
+# r6 R4 (D26), re-derived from raw: a dead/cut record FOLLOWED by a live record of the same tree
+# key that FIA links back (PREV_TRE_CN set, PREV_STATUS_CD = 2) is a misrecorded death
+con.execute(f"""
+CREATE TEMP TABLE rawmis AS
+SELECT d.cn FROM rawdead d WHERE EXISTS (
+  SELECT 1 FROM f.TREE L JOIN f.PLOT P ON P.CN = L.PLT_CN JOIN f.SURVEY SV ON SV.CN = P.SRV_CN AND SV.ANN_INVENTORY = 'Y'
+  WHERE L.STATECD = d.STATECD AND L.UNITCD = d.UNITCD AND L.COUNTYCD = d.COUNTYCD AND L.PLOT = d.PLOT
+    AND L.SUBP = d.SUBP AND L.TREE = d.TREE AND L.STATUSCD = 1 AND L.PREV_STATUS_CD = 2 AND L.PREV_TRE_CN IS NOT NULL
+    AND MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) > d.md)""")
+con.execute("DELETE FROM rawdead WHERE cn IN (SELECT cn FROM rawmis)")   # fates / first records ignore them
 con.execute(f"""
 CREATE TEMP TABLE curdead AS
 SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE, arg_min(CAST(CN AS VARCHAR), MEASDATE) first_cn,
        any_value(final_tree_fate) final_fate
-FROM new.curated_trees WHERE STATUSCD IN (2,3) AND {scope()} GROUP BY ALL""")
+FROM new.curated_trees WHERE STATUSCD IN (2,3) AND NOT misrecorded_death AND {scope()} GROUP BY ALL""")
+r = con.execute(f"""SELECT (SELECT count(*) FROM rawmis),
+    (SELECT count(*) FROM new.curated_trees WHERE misrecorded_death AND {scope()}),
+    (SELECT count(*) FROM rawmis WHERE cn NOT IN (SELECT CAST(CN AS VARCHAR) FROM new.curated_trees WHERE misrecorded_death)
+       AND cn IN (SELECT CAST(CN AS VARCHAR) FROM new.curated_trees)),   -- raw records the curation drops (RC7) are out
+    (SELECT count(*) FROM new.curated_trees WHERE misrecorded_death AND {scope()} AND CAST(CN AS VARCHAR) NOT IN (SELECT cn FROM rawmis)),
+    (SELECT count(DISTINCT (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE)) FROM new.curated_trees WHERE misrecorded_death AND {scope()})""").fetchone()
+check("(c1) R4: misrecorded deaths flagged exactly as re-derived from raw (dead/cut record, later linked live record)",
+      r[2] == 0 and r[3] == 0, f"(raw {r[0]:,}, curated {r[1]:,} records on {r[4]:,} trees; missing {r[2]}, extra {r[3]})")
+r = con.execute("""SELECT count(*) FILTER (WHERE tt.intro_type = 'real'), count(*) FILTER (WHERE tt.intro_type = 'gap_interpolated'),
+  (SELECT count(*) FROM new.curated_trees WHERE misrecorded_death)
+  FROM new.tree_trajectories tt JOIN new.curated_trees t
+  ON t.STATECD=tt.statecd AND t.UNITCD=tt.unitcd AND t.COUNTYCD=tt.countycd AND t.PLOT=tt.plot AND t.SUBP=tt.subp
+ AND t.TREE=tt.tree AND t.MEASDATE=tt.measdate AND t.STATUSCD IN (2,3) WHERE t.misrecorded_death""").fetchone()
+check("(c1) R4: a misrecorded death is never a REAL trajectory slot (the tree continues)", r[0] == 0,
+      f"({r[0]}; {r[1]} of {r[2]} such visits are now gap-interpolated live slots)")
 r = con.execute("""
 WITH fr AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE, min(md) md0 FROM rawdead GROUP BY ALL),
 j AS (
@@ -458,7 +558,7 @@ SELECT CASE WHEN (d.STATUSCD=3 OR d.AGENTCD=80) AND d.cs<>1 THEN 'diverted_landu
 
 # ---- (c2) re-records never produce events -------------------------------------------------------
 r = con.execute("""
-SELECT count(*) FILTER (WHERE d.ps = 2) rerec_raw, count(*) FILTER (WHERE d.ps = 2 AND NOT t.rerecord_dead) unflagged
+SELECT count(*) FILTER (WHERE d.ps = 2) rerec_raw, count(*) FILTER (WHERE d.ps = 2 AND NOT t.rerecord_dead AND NOT t.misrecorded_death) unflagged
 FROM rawdead d JOIN new.curated_trees t ON CAST(t.CN AS VARCHAR) = d.cn""").fetchone()
 check("(c2) every raw PREV_STATUS_CD=2 dead record in curated is flagged rerecord_dead", r[1] == 0,
       f"({r[0]:,} re-records, {r[1]} unflagged)")
@@ -488,7 +588,7 @@ WITH fr AS (SELECT T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE, T.STATUSC
             FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY SV ON SV.CN = P.SRV_CN AND SV.ANN_INVENTORY = 'Y'
             JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
             WHERE T.STATUSCD IN (2,3) AND T.SUBP<=4 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y' AND C.COND_STATUS_CD IN (1,2,3,4)
-              AND {scope('T')}
+              AND {scope('T')} AND CAST(T.CN AS VARCHAR) NOT IN (SELECT cn FROM rawmis)   -- r6 R4
             QUALIFY row_number() OVER (PARTITION BY T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE ORDER BY md) = 1)
 SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP FROM fr
 WHERE ps IS DISTINCT FROM 2 AND cs = 1 AND (
@@ -810,28 +910,39 @@ if a.simb_db:
     lv AS (SELECT tt.statecd, tt.unitcd, tt.countycd, tt.plot, tt.subp, tt.tree, tt.measdate FROM new.tree_trajectories tt
            LEFT JOIN new.curated_trees ct ON ct.STATECD=tt.statecd AND ct.UNITCD=tt.unitcd AND ct.COUNTYCD=tt.countycd
             AND ct.PLOT=tt.plot AND ct.SUBP=tt.subp AND ct.TREE=tt.tree AND ct.MEASDATE=tt.measdate
-           WHERE tt.intro_type = 'gap_interpolated' OR (tt.intro_type = 'real' AND ct.STATUSCD = 1)),   -- alive slots only
-    dmg AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate
-            FROM new.curated_trees WHERE STATUSCD = 1 AND (DAMSEV1 > 40 OR DAMSEV2 > 40))
+           WHERE tt.intro_type = 'gap_interpolated' OR (tt.intro_type = 'real' AND ct.STATUSCD = 1))   -- alive slots only
     SELECT d.*,
       EXISTS (SELECT 1 FROM mem m WHERE m.statecd=d.statecd AND m.unitcd=d.unitcd AND m.countycd=d.countycd AND m.plot=d.plot
               AND m.subp=d.subp AND m.species_symbol=d.species_symbol AND m.b=d.b AND m.measdate=p.pmd
               AND NOT EXISTS (SELECT 1 FROM lv WHERE lv.statecd=m.statecd AND lv.unitcd=m.unitcd AND lv.countycd=m.countycd
                               AND lv.plot=m.plot AND lv.subp=m.subp AND lv.tree=m.tree AND lv.measdate=d.measdate)) AS has_removed,
-      EXISTS (SELECT 1 FROM mem m JOIN dmg ON dmg.statecd=m.statecd AND dmg.unitcd=m.unitcd AND dmg.countycd=m.countycd
-              AND dmg.plot=m.plot AND dmg.subp=m.subp AND dmg.tree=m.tree AND dmg.measdate=d.measdate
-              WHERE m.statecd=d.statecd AND m.unitcd=d.unitcd AND m.countycd=d.countycd AND m.plot=d.plot
-              AND m.subp=d.subp AND m.species_symbol=d.species_symbol AND m.b=d.b AND m.measdate=p.pmd) AS has_damaged,
       NOT EXISTS (SELECT 1 FROM newsimb.curated_cohorts_landis_simB c WHERE c.statecd=d.statecd AND c.unitcd=d.unitcd
               AND c.countycd=d.countycd AND c.plot=d.plot AND c.subp=d.subp AND c.species_symbol=d.species_symbol
               AND c.sim_year - c.age_calc = d.b AND c.measdate < d.measdate) AS is_first
     FROM d LEFT JOIN pv p USING ({TRK}, measdate)""")
-    r = con.execute("""SELECT count(*), count(*) FILTER (WHERE NOT has_removed AND NOT has_damaged),
-                              count(*) FILTER (WHERE NOT has_removed AND has_damaged), count(*) FILTER (WHERE is_first)
+    r = con.execute("""SELECT count(*), count(*) FILTER (WHERE NOT has_removed), count(*) FILTER (WHERE is_first)
                        FROM simb_drop""").fetchone()
-    check("(n2) I-1: every Sim B drop > 0 has a real >= 5 in member removed / died (or severely damaged) since the previous visit",
-          r[1] == 0, f"({r[1]} of {r[0]:,} drops unbacked; {r[2]} backed only by damaged-alive members)")
-    check("(n2) I-1: no Sim B drop on a cohort's first Sim B row", r[3] == 0, f"({r[3]})")
+    # r6 D25: removals only (the damaged-alive branch is gone)
+    check("(n2) I-1: every Sim B drop > 0 has a real >= 5 in member removed / died since the previous visit",
+          r[1] == 0, f"({r[1]} of {r[0]:,} drops unbacked)")
+    check("(n2) I-1: no Sim B drop on a cohort's first Sim B row", r[2] == 0, f"({r[2]})")
+    # n8 (R6): Pan's consumer reconstructs a row's pre-drop biomass as agb / (1 - drop)
+    # (landis_region4 _weighted_cohort_drop); applying it must give back the drop model's dropped
+    # biomass (g/acre -> g/m2: / 4046.8564224)
+    r = con.execute(f"""
+    SELECT count(*), count(*) FILTER (WHERE abs((c.agb / (1 - c.disturbance_drop_pct) - c.agb) - d.dropped / 4046.8564224)
+                                           > 1e-5 * (d.dropped / 4046.8564224) + 1e-6),
+           max(abs((c.agb / (1 - c.disturbance_drop_pct) - c.agb) / NULLIF(d.dropped / 4046.8564224, 0) - 1))
+    FROM newsimb.curated_cohorts_landis_simB c JOIN newsimb.cohort_disturbance d
+      USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)
+    WHERE c.disturbance_drop_pct > 0 AND {scope('c', 'statecd', 'countycd')}""").fetchone()
+    check("(n8) R6: Pan's formula agb/(1-drop) - agb reconstructs the dropped biomass on every Sim B drop row",
+          r[1] == 0, f"({r[1]} of {r[0]:,} rows off by > 1e-5; max rel err {0 if r[2] is None else r[2]:.2e})")
+    r = con.execute(f"""SELECT count(*) FROM newsimb.curated_cohorts_landis_simB c
+        LEFT JOIN newsimb.cohort_disturbance d USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)
+        WHERE c.disturbance_drop_pct > 0 AND (d.disturbance_drop_pct IS NULL OR d.disturbance_drop_pct <> c.disturbance_drop_pct)
+          AND {scope('c', 'statecd', 'countycd')}""").fetchone()[0]
+    check("(n8) R6: the attached drop equals cohort_disturbance's on every drop row", r == 0, f"({r})")
 # n3 (M-4): no gap-interpolated live slot at, or between bracketing real records across, an
 # entirely nonforest subplot visit (raw forest proportions: rv)
 r = con.execute(f"""
@@ -844,8 +955,18 @@ br AS (SELECT g.*, (SELECT max(r.measdate) FROM r WHERE r.statecd=g.statecd AND 
 SELECT count(*), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=br.statecd AND rv.UNITCD=br.unitcd
        AND rv.COUNTYCD=br.countycd AND rv.PLOT=br.plot AND rv.SUBP=br.subp AND rv.md > br.p AND rv.md < br.n
        AND rv.fsub + rv.fmic <= 0)) FROM br""").fetchone()
-check("(n3) M-4: no gap-interpolated slot at / across an entirely nonforest subplot visit", r[1] == 0,
-      f"({r[1]} of {r[0]:,} gap slots)")
+if r[0] == 0:   # r6 R5 (D27): nothing to check in the data; the fixtures below exercise the code
+    info("(n3) M-4: no gap-interpolated slots in this run (no candidates) — see the (n9) fixtures")
+else:
+    check("(n3) M-4: no gap-interpolated slot at / across an entirely nonforest subplot visit", r[1] == 0,
+          f"({r[1]} of {r[0]:,} gap slots)")
+# n9 (R5, D27): synthetic fixtures for the interpolation (incl. the nonforest / censoring rules)
+# and the timber-only drop branch — code paths the R4 data never reaches
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import selftest_fixtures
+for _nm, _ok, _det in selftest_fixtures.run():
+    check(f"(n9) fixture {_nm}", _ok, _det)
 # n4 (M-8): phantoms never exceed the debut (first real) value they are scaled from. Sim A rows
 # carry no tree id and several trees' phantoms can share one cohort key, so the Sim A test is per
 # cohort key: sum of tree-pass phantom AGB <= sum of the source trees' debut AGB (keys that the
@@ -917,6 +1038,79 @@ SELECT count(*), count(*) FILTER (WHERE T.STATUSCD = 0), count(*) FILTER (WHERE 
 FROM f1 LEFT JOIN fraw.main.TREE T ON CAST(T.CN AS VARCHAR) = f1.prev_tre_cn""").fetchone()
 info("(n7) tree-number splits: segments / linked through a STATUSCD 0 record / of those WITHOUT evidence of a different tree",
      f"({r[0]} / {r[1]} / {r[2]})")
+
+# n14 (D35): every live tree of a coordinate-linked chain end is either continued at the start
+# (same SUBP / TREE / SPCD, DIA not decreasing) or censored 'procedural_relink' there
+r = con.execute(f"""
+WITH lk AS (SELECT l.s, l.e, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, lb.bd FROM f.main._links l
+            JOIN f.PLOT P ON CAST(P.CN AS VARCHAR) = l.s JOIN lb USING (STATECD, UNITCD, COUNTYCD, PLOT)
+            WHERE lb.bd = MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(P.MEASDAY,0),15) AS BIGINT))
+              AND {scope('P')}),
+et AS (SELECT lk.*, T.SUBP, T.TREE, T.SPCD, T.DIA,
+              EXISTS (SELECT 1 FROM f.TREE u WHERE CAST(u.PLT_CN AS VARCHAR) = lk.s AND u.SUBP = T.SUBP AND u.TREE = T.TREE
+                      AND u.SPCD = T.SPCD AND u.DIA >= T.DIA) cont
+       FROM lk JOIN f.TREE T ON CAST(T.PLT_CN AS VARCHAR) = lk.e WHERE T.STATUSCD = 1 AND T.SUBP <= 4)
+SELECT count(DISTINCT s), count(*), count(*) FILTER (WHERE cont),
+       count(*) FILTER (WHERE NOT cont AND NOT EXISTS (SELECT 1 FROM new.tree_censor_events c WHERE c.STATECD = et.STATECD
+              AND c.UNITCD = et.UNITCD AND c.COUNTYCD = et.COUNTYCD AND c.PLOT = et.PLOT AND c.SUBP = et.SUBP
+              AND c.TREE = et.TREE AND c.MEASDATE = et.bd))
+FROM et""").fetchone()
+check("(n14) D35: every live tree of a coordinate-linked chain end is continued or censored at the link",
+      r[3] == 0, f"({r[0]} links; {r[1]} end trees: {r[2]} continued, {r[1]-r[2]-r[3]} censored, {r[3]} neither)")
+# n10 (R2): every Sim A / Sim B / trajectory (canonical key, measdate) visit has its PLOT row and
+# >= 1 COND row in the curated DB (export_reference_tables) and in the slim DB
+def _visit_cov(cat):
+    vsrc = [f"SELECT DISTINCT statecd,unitcd,countycd,plot,measdate FROM new.{t} WHERE {scope('', 'statecd', 'countycd')}"
+            for t in ("curated_cohorts_landis", "tree_trajectories")]
+    if a.simb_db:
+        vsrc.append(f"SELECT DISTINCT statecd,unitcd,countycd,plot,measdate FROM newsimb.curated_cohorts_landis_simB WHERE {scope('', 'statecd', 'countycd')}")
+    return con.execute(f"""
+    WITH v AS ({' UNION '.join(vsrc)}),
+    p AS (SELECT CAST(CN AS VARCHAR) cn, STATECD, UNITCD, COUNTYCD, PLOT,
+                 MAKE_DATE(CAST(MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(MEASMON, 0), 6) AS BIGINT),
+                           CAST(COALESCE(NULLIF(MEASDAY, 0), 15) AS BIGINT)) md FROM {cat}.PLOT),
+    c AS (SELECT DISTINCT CAST(PLT_CN AS VARCHAR) cn FROM {cat}.COND)
+    SELECT count(*), count(*) FILTER (WHERE p.cn IS NULL), count(*) FILTER (WHERE p.cn IS NOT NULL AND c.cn IS NULL)
+    FROM v LEFT JOIN p ON p.STATECD=v.statecd AND p.UNITCD=v.unitcd AND p.COUNTYCD=v.countycd AND p.PLOT=v.plot AND p.md=v.measdate
+    LEFT JOIN c ON c.cn = p.cn""").fetchone()
+for _cat, _lab in (("new", "curated DB"),) + ((("nslim", "slim DB"),) if a.new_slim else ()):
+    r = _visit_cov(_cat)
+    check(f"(n10) R2: every Sim A / Sim B / trajectory visit has its PLOT row and >= 1 COND row in the {_lab}",
+          r[1] == 0 and r[2] == 0, f"({r[0]:,} visits; no PLOT {r[1]}, no COND {r[2]})")
+# n11 (R1): the Sim A and trajectory sapling growth rates (both per-tree biomass) agree per species
+# group (spgrpcd groups with >= 50 training trees in both)
+if dbconn_tables := {r[0] for r in con.execute("SELECT table_name FROM duckdb_tables() WHERE database_name='new'").fetchall()}:
+    if {"sapling_growth_rates_simA", "sapling_growth_rates_traj"} <= dbconn_tables:
+        r = con.execute("""
+        WITH x AS (SELECT a.spgrpcd, a.rate ra, b.rate rb, a.n_trees na, b.n_trees nb
+                   FROM new.sapling_growth_rates_simA a JOIN new.sapling_growth_rates_traj b USING (level, spgrpcd)
+                   WHERE level = 'spgrp' AND a.n_trees >= 50 AND b.n_trees >= 50)
+        SELECT count(*), count(*) FILTER (WHERE abs(ra - rb) > greatest(0.10 * (ra + rb) / 2, 0.002)),
+               max(abs(ra - rb) / NULLIF((ra + rb) / 2, 0)), any_value(basis) FROM x
+        CROSS JOIN (SELECT DISTINCT basis FROM new.sapling_growth_rates_traj) bb""").fetchone()
+        check("(n11) R1: Sim A and trajectory sapling growth rates agree per species group (within 10 % or 0.002 / yr)",
+              r[1] == 0, f"({r[1]} of {r[0]} groups differ; max rel diff {0 if r[2] is None else r[2]:.3f})")
+        show("(n11) sapling growth rate per species group: Sim A (agb / tpa) vs trajectories (drybio_g)", """
+        SELECT a.spgrpcd, a.n_trees n_simA, round(a.rate, 5) rate_simA, b.n_trees n_traj, round(b.rate, 5) rate_traj
+        FROM new.sapling_growth_rates_simA a JOIN new.sapling_growth_rates_traj b USING (level, spgrpcd)
+        WHERE level = 'spgrp' ORDER BY a.n_trees DESC LIMIT 12""")
+    else:
+        check("(n11) R1: sapling growth rate tables present", False, "(sapling_growth_rates_simA / _traj missing)")
+# n12 (R7, D28): a plot whose chain has a remapped visit takes its LOCATION from its most recent
+# annual visit — the curated PLOT copy carries that visit's LAT / LON on every visit
+r = con.execute(f"""
+WITH ch AS (SELECT p.CN, m.CN mcn FROM f.PLOT p LEFT JOIN f.main._canon m ON m.CN = CAST(p.CN AS VARCHAR)),
+k AS (SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT FROM f.PLOT P JOIN f.main._canon m ON m.CN = CAST(P.CN AS VARCHAR) GROUP BY ALL),
+lastv AS (SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT,
+                 arg_max(R.LAT, MAKE_DATE(CAST(R.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(R.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(R.MEASDAY,0),15) AS BIGINT))) lat,
+                 arg_max(R.LON, MAKE_DATE(CAST(R.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(R.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(R.MEASDAY,0),15) AS BIGINT))) lon
+          FROM f.PLOT P JOIN k USING (STATECD, UNITCD, COUNTYCD, PLOT) JOIN fraw.main.PLOT R ON R.CN = P.CN
+          JOIN fraw.main.SURVEY S ON S.CN = R.SRV_CN AND S.ANN_INVENTORY = 'Y' GROUP BY ALL)
+SELECT count(*), count(*) FILTER (WHERE (c.LAT, c.LON) IS DISTINCT FROM (l.lat, l.lon)), count(DISTINCT (l.STATECD,l.UNITCD,l.COUNTYCD,l.PLOT))
+FROM new.PLOT c JOIN lastv l ON l.STATECD=c.STATECD AND l.UNITCD=c.UNITCD AND l.COUNTYCD=c.COUNTYCD AND l.PLOT=c.PLOT
+WHERE {scope('c')}""").fetchone()
+check("(n12) R7: renumbered plots carry their most recent visit's LAT / LON on every curated PLOT row",
+      r[1] == 0, f"({r[0]:,} PLOT rows of {r[2]} plots; {r[1]} differ)")
 
 # ---- (m) I2 reports: STDAGE field-truth classes ----------------------------------------------------
 show("(m) calibration-set composition (live >= 5 in, Tree_Age > 1, field age) by class", f"""

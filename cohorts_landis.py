@@ -402,7 +402,10 @@ def compute_sim_year_ages(df: pl.DataFrame, visits: pl.DataFrame | None = None) 
 # Step 4c: phantom backfill
 # =============================================================================
 
-def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
+RATE_TABLES: dict = {}   # r6 R1: last computed rates per caller tag (written as tables by the stages)
+
+
+def estimate_sapling_growth_rates(df: pl.DataFrame, basis: str, tag: str | None = None) -> tuple:
     """
     Estimate annual relative biomass growth rate from saplings.
 
@@ -421,9 +424,16 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
     """
     # r5 M-8: the rate is a PER-TREE biomass rate. Sim A's agb is TPA-expanded and the expansion
     # drops ~12x at the 5 in microplot -> subplot switch (74.965 -> 6.018), which made many
-    # growing saplings' rates negative (clipped to 0). Per-tree biomass = agb / tpa (Sim A);
-    # the trajectories' agb is per-tree already.
-    bio = (pl.col("agb") / pl.col("tpa")) if "tpa" in df.columns else pl.col("agb")
+    # growing saplings' rates negative (clipped to 0).
+    # r6 R1: the caller states the basis of `agb` EXPLICITLY ('tpa_expanded': Sim A, per-tree =
+    # agb / tpa; 'per_tree': the trajectories' drybio_g). r5 inferred it from a `tpa` column,
+    # which the trajectories also carry, so their per-tree biomass was divided by TPA again.
+    if basis == "tpa_expanded":
+        bio = pl.col("agb") / pl.col("tpa")
+    elif basis == "per_tree":
+        bio = pl.col("agb")
+    else:
+        raise ValueError(f"estimate_sapling_growth_rates: basis must be 'tpa_expanded' or 'per_tree', not {basis!r}")
     srt = df.filter(pl.col("intro_type").is_null() if "intro_type" in df.columns else pl.lit(True)) \
             .with_columns(bio.alias("_bio")).sort(TREE_ID + ["MEASDATE"])
 
@@ -490,6 +500,20 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
                                       for r in (sp_rates, grp_rates, glb_rates))
     print(f"           {sp_rates.height:,} (species, epa_l3) pairs  "
           f"| {grp_rates.height:,} (spgrpcd, epa_l3) pairs computed")
+    if tag is not None:
+        glb_n = tree_rates.group_by("spgrpcd").len().rename({"len": "n_trees"})
+        RATE_TABLES[tag] = pl.concat([
+            sp_rates.select(pl.lit("species_l3").alias("level"), pl.col("species_symbol").cast(pl.Utf8).alias("species_symbol"),
+                            pl.col("epa_l3").cast(pl.Utf8), pl.lit(None).cast(pl.Int64).alias("spgrpcd"), "rate",
+                            pl.lit(None).cast(pl.UInt32).alias("n_trees")),
+            grp_rates.select(pl.lit("spgrp_l3").alias("level"), pl.lit(None).cast(pl.Utf8).alias("species_symbol"),
+                             pl.col("epa_l3").cast(pl.Utf8), pl.col("spgrpcd").cast(pl.Int64), "rate",
+                             pl.lit(None).cast(pl.UInt32).alias("n_trees")),
+            glb_rates.join(glb_n, on="spgrpcd", how="left").select(
+                pl.lit("spgrp").alias("level"), pl.lit(None).cast(pl.Utf8).alias("species_symbol"),
+                pl.lit(None).cast(pl.Utf8).alias("epa_l3"), pl.col("spgrpcd").cast(pl.Int64), "rate",
+                pl.col("n_trees").cast(pl.UInt32)),
+        ]).with_columns(pl.lit(basis).alias("basis")).sort(["level", "spgrpcd", "species_symbol", "epa_l3"], nulls_last=True)
     return sp_rates, grp_rates, glb_rates
 
 
@@ -572,7 +596,8 @@ def load_backfill_context(con) -> dict:
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS break_date,
                bool_or(break_kind = 'rc8') AS _brk_rc8,
                bool_or(n_closed_rc8_prev_sapling > 0 OR break_kind = 'unrecorded'
-                       OR n_unrecorded_saplings > 0) AS _brk_sap
+                       OR n_unrecorded_saplings > 0) AS _brk_sap,
+               bool_or(break_kind = 'coord_link') AS _brk_link      -- r6 D35
         FROM procedural_breaks GROUP BY ALL
     """).pl()
     visit = con.execute("""
@@ -588,7 +613,8 @@ def load_backfill_context(con) -> dict:
     # error — gets no phantom at or before that dead record)
     dead = con.execute("""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS _dd
-        FROM curated_trees WHERE STATUSCD IN (2, 3)""").pl()
+        FROM curated_trees WHERE STATUSCD IN (2, 3) AND NOT COALESCE(misrecorded_death, FALSE)  -- r6 R4
+    """).pl()
     # r3: RC3 (missed live) >= 5 in debuts that pair with a same-subplot, same-species RC7/RC8
     # closure of similar size (|PREVDIA - DIA| <= 2 in) at the debut visit are the SAME physical
     # tree re-tallied under a new number: its old records already represent it at the prior
@@ -699,13 +725,14 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
     # (b) plot-level procedural break in (p, D]: the SAPLING part only for sapling re-tally
     # breaks (closed RC8 saplings, or unrecorded saplings: r2 M9), the RC8-entry part for
     # RC8 closure breaks
-    cand = prior.filter(pl.col("_bf_sap") | pl.col("_bf_rc8")).select(
-        list(dict.fromkeys(key + ["MEASDATE", "_bf_sap", "_bf_rc8"]))).unique()
+    # r6 D35: a coordinate-link break (a plot re-keyed by D29) blocks EVERY tree's backfill across it
+    brk_link = (pl.col("_brk_link").fill_null(False) if "_brk_link" in breaks.columns else pl.lit(False))
+    cand = prior.select(list(dict.fromkeys(key + ["MEASDATE", "_bf_sap", "_bf_rc8"]))).unique()
     crossed = (
         cand.join(breaks, on=PLOT_KEY, how="inner")
         .filter((pl.col("break_date") > pl.col("prior_measdate")) &
                 (pl.col("break_date") <= pl.col("MEASDATE")) &
-                ((pl.col("_bf_sap") & pl.col("_brk_sap")) | (pl.col("_bf_rc8") & pl.col("_brk_rc8"))))
+                ((pl.col("_bf_sap") & pl.col("_brk_sap")) | (pl.col("_bf_rc8") & pl.col("_brk_rc8")) | brk_link))
         .select(key).unique().with_columns(pl.lit(True).alias("_crossed"))
     )
     n2 = prior.height
@@ -750,7 +777,9 @@ def tree_prior_candidates(df: pl.DataFrame, ctx, rule_c: bool = True) -> pl.Data
 
 def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFrame:
     """prior_agb = min(agb, max(MIN_BACKFILL_AGB, agb * (1 - rate * years_back)))."""
-    sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(df)
+    # Sim A agb is TPA-expanded (g/m2); the rates are recorded once (tree pass) as sapling_growth_rates
+    sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(
+        df, basis="tpa_expanded", tag="simA" if tag == "backfill trees" else None)
     missing = (
         missing
         .join(sp_rates.rename({"rate": "_r_sp"}),  on=["species_symbol", "epa_l3"], how="left")
@@ -1211,6 +1240,10 @@ if __name__ == "__main__":
     src = PHANTOM_COHORT_SOURCES
     con.register("_src_view", src.to_arrow())
     con.execute("CREATE OR REPLACE TABLE phantom_cohort_sources AS SELECT * FROM _src_view")
+    if "simA" in RATE_TABLES:   # r6 R1: the Sim A sapling growth rates (per-tree basis)
+        con.register("_rate_view", RATE_TABLES["simA"])
+        con.execute("CREATE OR REPLACE TABLE sapling_growth_rates_simA AS SELECT * FROM _rate_view")
+        con.unregister("_rate_view")
     con.unregister("_src_view")
     tsrc = PHANTOM_TREE_SOURCES if PHANTOM_TREE_SOURCES is not None else pl.DataFrame(
         schema={**{k: pl.Int64 for k in TREE_ID}, "prior_measdate": pl.Date,
