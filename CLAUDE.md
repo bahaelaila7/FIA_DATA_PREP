@@ -752,7 +752,9 @@ bound is 4.8).
 - **R2, exported COND / PLOT:** `export_reference_tables` copies COND / PLOT / data_plot_eco
   from dbconn's remapped views.
   - Before, slim COND rows for remapped visits of slim plots were 0 everywhere. Now all are
-    present: AL 3, FL 6, GA 11, KY 9, MS 3, NC 14, SC 12, TN 3.
+    present: remapped visits AL 3, FL 6, GA 11, KY 9, MS 3, NC 14, SC 12, TN 3, with COND rows
+    AL 6, FL 6, GA 21, KY 13, MS 3, NC 21, SC 21, TN 6 (r7 doc fix, F7: the first list was the
+    visit counts, not COND rows).
   - (n10) and `slim_guard post`: every Sim A / Sim B / trajectory visit has its PLOT row and
     COND rows, in the curated DB and in the slim DB.
 - **R3 (D25):** the damaged-alive drop branch is removed (DAMSEV is a 0–9 class code); drops

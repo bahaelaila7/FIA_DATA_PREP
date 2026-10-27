@@ -264,6 +264,7 @@ decided and how to reverse it.
   - (c) apply the pooled values to every scope, which hides the fact that the single-state fit passes.
 - **Chosen:** (a).
   - Same nature as D6: regression to the mean, which only reaches trees without a TreeAge record.
+    - **r7 correction (audit B M-2): this mechanism does not hold against field truth.** In the pool, on FL planted records that have a model, an estage and a field age, model − field is −0.47 (10–15 in) / −0.33 yr (15+ in) while mapped − field is +1.94 / +0.81 yr: the (j) gap sits largely on the MAPPED side. The 88 flagged records all have a field STDAGE and take the model age; their final − field age is median +2.33 / mean −4.83 yr (single-state fit +3.33 / −2.67). The entries are re-measured under D40.
   - A scope with no recorded entries is fully strict: a Region-4 fit must re-measure these cells and record its own values, which is the point of D14.
 - **Reverse:** delete the scope entries from `KNOWN_EXCEPTIONS` and `KNOWN_BIAS_FLAGS`.
 
@@ -273,16 +274,16 @@ decided and how to reverse it.
 - **D26, resurrected trees:** a dead / cut record followed by a PREV_TRE_CN-linked live record is a misrecorded death. It is excluded from fates and events, and the tree continues.
   - Options rejected: end the tree at the death; leave as is.
 - **D27, gap interpolation:** kept. Check (n3) is INFO when it has no candidates, and a synthetic fixture test exercises the code.
-- **D28, plot location:** the most recent visit's coordinates / county / ecoregion. The key stays the first-visit key.
+- **D28, plot location:** the most recent visit's coordinates / ecoregion. The key, COUNTYCD included, stays the first-visit key (r7 doc fix: the latest county is only in `plot_location.LOC_COUNTYCD`).
   - Options rejected: the first-visit location; per-visit locations.
 - **D29, renumbers without a PREV_PLT_CN link:** linked only on identical coordinates plus ≥ 30 % tree continuity.
   - Options rejected: ignore them; coordinates alone.
-- **D30, consumer requirement (not a curation change):**
+- **D30, consumer requirement (not a curation change; r7 doc fix: recorded in detail as D32, while the detailed D30 is the sapling-rate basis):**
   - Pan (landis_region4 src/data/utils.jl:371-372) recomputes its own sim_year and must use the curated axis.
   - Pan's drop consumer (utils.jl:398) defines the drop semantics the curated table must match (audit R6).
   - Both are recorded for the Pan rebuild phase.
 
-## D31 — Generalisation beyond Region 4 (2026-10-27, agent; recorded for the expansion phase)
+## D31-G — Generalisation beyond Region 4 (2026-10-27, agent; recorded for the expansion phase; renumbered from a second "D31" in r7)
 - **Evidence (FIADB annual live trees since 2000, by TPA_UNADJ):**
   - Interior West, North Central, Northeast and the other southern states use only 6.018 (subplot) and 74.965 (microplot), as R4 does.
   - PNW / CA also have **0.999 (macroplot) on 16.6 % of live trees**.
@@ -316,7 +317,7 @@ decided and how to reverse it.
   - That visit then becomes an ordinary gap, which can be interpolated live: GA 64 of 88 such visits.
   - The verifier re-derives the rule from raw (c1). Raw records that the curation itself drops (RC7) are out of scope there.
   - **Found by the first r7 run, then fixed:**
-    - (a) The later linked live record can sit on a now-NONFOREST condition. The live rule keeps it out of curated_trees, so `tree_landuse_exits` now carries `linked_live_after_dead_md`, and it counts as resurrection evidence too (NC 4, TN 1, FL 1, pool 1 trees). For the final fate a misrecorded death counts as alive at its visit, so such trees end `diverted_landuse`.
+    - (a) The later linked live record can sit on a now-NONFOREST condition. The live rule keeps it out of curated_trees, so `tree_landuse_exits` now carries `linked_live_after_dead_md`, and it counts as resurrection evidence too (NC 4 records on 3 trees, TN 1, FL 1, pool 1 trees; r7 doc fix: NC was records, not trees). For the final fate a misrecorded death counts as alive at its visit, so such trees end `diverted_landuse`.
     - (b) cohort_disturbance joined the trajectories' gap slot at a misrecorded visit to that dead record, read STATUSCD 2 and counted a false removal (AL 1, SC 3, TN 2, KY 2 drops). Phantom / gap slots are now alive by construction, and misrecorded records are never a status source.
 - **Reverse:** set `res_md` to null in `classify_tree_fate`.
 
@@ -326,7 +327,7 @@ decided and how to reverse it.
   - The code is kept.
   - (n3) prints INFO "no candidates" when there are none.
   - New `selftest_fixtures.py` (run by the verifier as n9) exercises interpolation (basic / nonforest / censoring) and the timber-only drop branch (removal, shrink to 4.9 in, gap-only slot, sapling).
-  - With D26 the data now does produce gap slots (GA 67), and (n3) checks them.
+  - With D26 the data now does produce gap slots (GA 64; r7 doc fix: the first r6 run's 67 included 3 slots of trees merged at a coordinate link, F7-1 / D36), and (n3) checks them.
 - **Reverse:** n/a.
 
 ## D28 — Plot location of a renumbered plot (audit r5 R7; 2026-10-27, coordinator option (b))
@@ -368,12 +369,12 @@ decided and how to reverse it.
   - A link whose re-keyed chain would collide with another visit on a plot-INVYR is dropped. FIADB-wide: 1 dropped, 18 kept.
   - At a linked chain start FIA has no PREV_TRE_CN, so a same-number record whose predecessor is live starts a NEW tree when its SPCD differs or its DIA decreased (the evidence rule in `split_reused_tree_numbers`).
 - **R4 links (end → start, trees matched):** GA 13/87/45 → 87/146 (29/68 = 0.43), MS 28/163/84 → 163/101 (30/81 = 0.37), SC 45/19/74 → 19/279 (31/49 = 0.63), SC 45/19/101 → 19/280 (4/4 = 1.00).
-  - The auditor's AL 61/71 → 87 (17/37 with −0.3 in tolerance) fails the strict rule or the collision guard.
+  - The auditor's AL 61/71 → 87 (17/37 with −0.3 in tolerance) passes the strict rule too (16/37 = 0.43) and was dropped only by the collision guard (r7 doc fix). Since r7 (D37) it is a duplicate visit: the link is kept and the 71 visit of 2010 is dropped.
 - The verifier rebuilds the links independently, and its map equals dbconn's (117 remapped visits, 18 links).
 - **Reverse:** set `COORD_LINK_MIN_SHARE` > 1 (no links).
 
 ## D30 — Sapling growth-rate basis (audit r5 R1; 2026-10-27, agent)
-- **Evidence:** r5 inferred the biomass basis from the presence of a `tpa` column. The trajectories carry `tpa` too, so their per-tree drybio_g was divided by TPA a second time, and trajectory phantoms came out 4.4 % (KY) to 7.8 % (NC) too low.
+- **Evidence:** r5 inferred the biomass basis from the presence of a `tpa` column. The trajectories carry `tpa` too, so their per-tree drybio_g was divided by TPA a second time, and trajectory phantoms came out 4.4 % (KY) to 8.6 % (AL; r7 doc fix, was "7.8 % (NC)") too low.
 - **Chosen:** `estimate_sapling_growth_rates(df, basis=...)` takes an EXPLICIT basis: `tpa_expanded` (Sim A, agb / tpa) or `per_tree` (trajectories). Anything else raises an error.
   - The rates are written as `sapling_growth_rates_simA` / `_traj`.
   - Check (n11): per species group with ≥ 50 training trees, the two agree within 10 % or 0.002 / yr.
@@ -405,6 +406,7 @@ decided and how to reverse it.
 
 ## D33 — Fit scope of a county-subset run (audit r5 S2; 2026-10-27, agent)
 - **Chosen:** v3 writes `run_scope(states, counties)`. The fit scope used by `KNOWN_BIAS_FLAGS` and `KNOWN_EXCEPTIONS` is `<states>` or `<states>|counties=<s:c,…>`, so a subset run never inherits pooled entries or flags.
+- **County subsets (r7 doc fix, F7-13):** a county subset selects by the CANONICAL (first-visit) COUNTYCD. A renumbered plot recorded in another county later (e.g. KY 21/3/121/18, county 125 since 2015) belongs to its first county's subset.
 - **Reverse:** drop the `|counties=` suffix.
 
 ## D34 — FIADB live-tree plots absent from the curated product (genveg T1m finding; 2026-10-27, agent)
