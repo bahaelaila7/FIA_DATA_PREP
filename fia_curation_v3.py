@@ -1326,13 +1326,18 @@ def detect_condition_resets(df: pl.DataFrame) -> pl.DataFrame:
     TRTCD 10 alone (a partial cut), including at a condition's first visit, is NOT a reset, and
     neither is an STDAGE drop without the loss (STDAGE re-estimation).
 
+    D40 (audit r7 M-10): the loss is measured across the subplot's CONDIDs. A tree that was
+    live in the condition at its previous visit and is live at this visit in ANOTHER CONDID of
+    its subplot (condition re-delineation) is not lost: it counts towards this visit's live
+    count / live BA (its BA at this visit).
+
     Returns (reset_flag, reset_reasons) keyed by COND_ID + MEASDATE.
     """
     COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
     live = pl.col("STATUSCD") == 1
+    dfb = df.with_columns((pl.col("DIA").pow(2) * 0.005454 * pl.col("TPA_UNADJ")).alias("_ba"))
     cv = (
-        df.with_columns((pl.col("DIA").pow(2) * 0.005454 * pl.col("TPA_UNADJ")).alias("_ba"))
-        .group_by(COND_ID + ["MEASDATE"])
+        dfb.group_by(COND_ID + ["MEASDATE"])
         .agg([
             pl.col("cond_stdage").first().alias("cond_stdage"),
             live.sum().alias("n_live"),
@@ -1341,15 +1346,38 @@ def detect_condition_resets(df: pl.DataFrame) -> pl.DataFrame:
             pl.any_horizontal([pl.col(c).is_in([30, 40]) for c in ("TRTCD1", "TRTCD2", "TRTCD3")]).any().alias("regen"),
         ])
         .sort(COND_ID + ["MEASDATE"])
+    )
+    # trees live in the condition at its previous visit and live in another CONDID at this visit
+    live_rec = dfb.filter(live).select(TREE_ID + ["CONDID", "MEASDATE", "_ba"])
+    nxt = cv.select(COND_ID + ["MEASDATE"]).with_columns(
+        pl.col("MEASDATE").shift(-1).over(COND_ID).alias("_next_md")).filter(pl.col("_next_md").is_not_null())
+    moved = (live_rec.select(TREE_ID + ["CONDID", "MEASDATE"])
+             .join(nxt, on=COND_ID + ["MEASDATE"], how="inner")
+             .join(live_rec.rename({"CONDID": "_condid_next", "MEASDATE": "_next_md", "_ba": "_ba_next"}),
+                   on=TREE_ID + ["_next_md"], how="inner")
+             .filter(pl.col("_condid_next") != pl.col("CONDID"))
+             .group_by(COND_ID + ["_next_md"])
+             .agg(pl.len().alias("_n_moved"), pl.col("_ba_next").sum().alias("_ba_moved"))
+             .rename({"_next_md": "MEASDATE"}))
+    cv = (
+        cv.join(moved, on=COND_ID + ["MEASDATE"], how="left")
+        .with_columns(pl.col("_n_moved").fill_null(0), pl.col("_ba_moved").fill_null(0.0))
+        .sort(COND_ID + ["MEASDATE"])
         .with_columns([
             pl.col("cond_stdage").shift(1).over(COND_ID).alias("_prev_stdage"),
             pl.col("n_live").shift(1).over(COND_ID).alias("_prev_n"),
             pl.col("ba_live").shift(1).over(COND_ID).alias("_prev_ba"),
         ])
-        .with_columns(
+        .with_columns([
+            (((pl.col("_prev_n") > 0) & ((pl.col("n_live") + pl.col("_n_moved"))
+                                         <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
+             ((pl.col("_prev_ba") > 0) & ((pl.col("ba_live") + pl.col("_ba_moved"))
+                                          <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
+            .fill_null(False).alias("_loss"),
             (((pl.col("_prev_n") > 0) & (pl.col("n_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
              ((pl.col("_prev_ba") > 0) & (pl.col("ba_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
-            .fill_null(False).alias("_loss"))
+            .fill_null(False).alias("_loss_within_condid"),
+        ])
     )
     drop = (pl.col("_prev_stdage").is_not_null() & pl.col("cond_stdage").is_not_null()
             & (pl.col("cond_stdage") < pl.col("_prev_stdage")))
@@ -1364,9 +1392,11 @@ def detect_condition_resets(df: pl.DataFrame) -> pl.DataFrame:
     reset_flag = reset_reasons.select(COND_ID + ["MEASDATE"]).unique().with_columns(pl.lit(True).alias("is_reset"))
     n_drop_only = cv.filter(drop & ~pl.col("_loss")).height
     n_cut_only = cv.filter(pl.col("cut") & ~pl.col("regen") & ~pl.col("_loss")).height
+    n_moved_only = cv.filter(pl.col("_loss_within_condid") & ~pl.col("_loss") & (drop | pl.col("cut"))).height
     print(f"[step6b-reset] {reset_flag.height:,} stand-replacing condition-visit resets: "
           + ", ".join(f"{p.get_column('reset_reason')[0] if p.height else '?'} {p.height:,}" for p in parts)
-          + f" | NOT resets: STDAGE drop without loss {n_drop_only:,}, TRTCD 10 alone {n_cut_only:,}")
+          + f" | NOT resets: STDAGE drop without loss {n_drop_only:,}, TRTCD 10 alone {n_cut_only:,}"
+          + f" | D40: {n_moved_only:,} drop/cut visits whose within-CONDID loss is trees now live in another CONDID")
     return reset_flag, reset_reasons
 
 
