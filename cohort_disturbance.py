@@ -52,7 +52,7 @@ def load(con, states):
     df = con.execute(f"""
         SELECT tt.statecd, tt.unitcd, tt.countycd, tt.plot, tt.subp, tt.tree,
                tt.measdate, tt.sim_year, tt.age_calc, tt.species_symbol,
-               tt.drybio_g, tt.tpa, tt.intro_type, tt.is_terminal,
+               tt.drybio_g, tt.tpa, tt.intro_type, tt.is_terminal, tt.dia,
                tt.terminal_fate, tt.death_cause,
                ct.STATUSCD AS statuscd, ct.DAMSEV1 AS damsev1, ct.DAMSEV2 AS damsev2
         FROM tree_trajectories tt
@@ -65,7 +65,13 @@ def load(con, states):
     return df
 
 
-def compute(df):
+def compute(df, timber_only: bool = False):
+    """timber_only (r5 I-1, Sim B): Sim B holds only REAL trees with DIA >= 5 in, so its drops
+    are computed from those members only: a pair (tree, previous visit -> visit) counts only if
+    the tree is a real (not phantom / gap-interpolated) record with DIA >= 5 at the previous
+    visit, and, when alive at the visit, a real record with DIA >= 5 there too. Saplings that
+    die or are cut, and trees that grow past 5 in between the visits, no longer put drops on
+    surviving timber cohorts."""
     df = df.with_columns([
         (pl.col("drybio_g") * pl.col("tpa")).alias("w"),
         (pl.col("sim_year") - pl.col("age_calc")).alias("birth_sim_year"),
@@ -85,9 +91,12 @@ def compute(df):
     df = df.join(visits.select(SUBPLOT_ID + ["measdate", "vrank"]), on=SUBPLOT_ID + ["measdate"], how="left")
 
     # one row per alive tree-visit
-    alive = df.filter(pl.col("alive")).select(
-        COHORT_ID + ["tree", "vrank", "w", "severe_dmg", "terminal_fate"]
-    )
+    alive = df.filter(pl.col("alive")).with_columns(
+        ((pl.col("intro_type") == "real") & (pl.col("dia") >= 5)).fill_null(False).alias("_timber"))
+    alive_all = alive
+    if timber_only:
+        alive = alive.filter(pl.col("_timber"))
+    alive = alive.select(COHORT_ID + ["tree", "vrank", "w", "severe_dmg", "terminal_fate"])
 
     # PAIR consecutive visits: a tree alive at vrank_prev, its state at vrank (= vrank_prev+1)
     prev = (
@@ -100,6 +109,13 @@ def compute(df):
         .rename({"w": "w_cur", "severe_dmg": "dmg_cur"})
     )
     pair = prev.join(cur, on=COHORT_ID + ["tree", "vrank"], how="left")
+    if timber_only:
+        # a tree still ALIVE at the visit but not a real >= 5 in record there (shrank below 5 in,
+        # or only a gap-interpolated slot) is neither a survivor nor a removal: drop the pair
+        nont = (alive_all.filter(~pl.col("_timber")).select(COHORT_ID + ["tree", "vrank"])
+                .unique().with_columns(pl.lit(True).alias("_nont")))
+        pair = (pair.join(nont, on=COHORT_ID + ["tree", "vrank"], how="left")
+                    .filter(pl.col("_nont").is_null()).drop("_nont"))
 
     # classify each tree at the target visit vrank
     disturbed_removal = pl.col("w_cur").is_null() & pl.col("terminal_fate").is_in(DISTURB_FATES)
@@ -161,7 +177,10 @@ def compute(df):
         ])
         .with_columns((pl.col("would_be_disturbed") + pl.col("live_w")).alias("would_be"))
         .filter(pl.col("dropped") > 0)
-        .with_columns((pl.col("dropped") / pl.col("would_be")).alias("disturbance_drop_pct"))
+        # r5 M-3: float sums depend on the summation order -> round for bit-identical reruns
+        .with_columns(pl.col("would_be_disturbed").round(6), pl.col("dropped").round(6),
+                      pl.col("live_w").round(6), pl.col("would_be").round(6))
+        .with_columns((pl.col("dropped") / pl.col("would_be")).round(9).alias("disturbance_drop_pct"))
     )
     # Only PARTIAL disturbances are in scope: a surviving cohort remains at T to scale. Full-cohort
     # removals (n_survivors==0) have no live row in curated_cohorts_landis and are already handled by
@@ -180,6 +199,7 @@ def compute(df):
         .with_columns((pl.col("sim_year") - pl.col("birth_sim_year")).cast(pl.Int32).alias("age_calc"))
         .select(SUBPLOT_ID + ["species_symbol", "measdate", "age_calc",
                               "disturbance_drop_pct", "dropped", "would_be", "n_disturbed", "n_survivors"])
+        .sort(SUBPLOT_ID + ["species_symbol", "measdate", "age_calc"])
     )
     return coh
 

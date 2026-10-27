@@ -26,12 +26,26 @@ print(f"OUT: {a.out_db}\nCURATED: {a.curated_db} (read-only)  states: {states or
 con = dbconn.connect(a.out_db, a.fiadb, curated_db=a.curated_db)
 dbconn.require_tables(con, "tree_trajectories", "curated_trees", TABLE)
 
-coh = cd.compute(cd.load(con, states))
+coh = cd.compute(cd.load(con, states), timber_only=True)   # r5 I-1: real >= 5 in members only
 cd.diagnostics(coh)
 
 con.register("_cd", coh.to_pandas())
 con.execute("CREATE OR REPLACE TABLE cohort_disturbance AS SELECT * FROM _cd")
 con.unregister("_cd")
+# r5 I-1: a cohort's FIRST Sim B row has no previous Sim B state to drop from -> no drop there
+# (cohort = subplot x species x birth_sim_year, birth_sim_year = sim_year - age_calc)
+con.execute(f"""
+    CREATE OR REPLACE TEMP TABLE _first_rows AS
+    SELECT statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc FROM (
+      SELECT *, min(measdate) OVER (PARTITION BY statecd,unitcd,countycd,plot,subp,species_symbol,
+                                                 sim_year - age_calc) AS md0 FROM {TABLE})
+    WHERE measdate = md0""")
+n_first = con.execute("""SELECT count(*) FROM cohort_disturbance
+    SEMI JOIN _first_rows USING (statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc)""").fetchone()[0]
+con.execute("""DELETE FROM cohort_disturbance d USING _first_rows f
+    WHERE d.statecd=f.statecd AND d.unitcd=f.unitcd AND d.countycd=f.countycd AND d.plot=f.plot AND d.subp=f.subp
+      AND d.species_symbol=f.species_symbol AND d.measdate=f.measdate AND d.age_calc=f.age_calc""")
+print(f"[I-1] {n_first:,} drops on a cohort's first Sim B row removed")
 
 _meta = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
         "n_trees_known_bias", "share_known_bias"]
@@ -46,6 +60,7 @@ con.execute(f"""
     LEFT JOIN cohort_disturbance d
       ON c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
       AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc
+    ORDER BY c.statecd, c.unitcd, c.countycd, c.plot, c.subp, c.species_symbol, c.measdate, c.age_calc
 """)
 # curation-fix (audit I4): procedural re-tally flag, appended after disturbance_drop_pct
 from cohorts_landis import add_procedural_break

@@ -13,6 +13,8 @@
 #   TO_STEP         stop after this step number (default: all; e.g. reruns of steps 4-7)
 #   SLIM_OUT        slim DB to build (optional; the slim step is skipped when empty)
 #   SLIM_ECOS       comma EPA-L3 list for the slim builder                (with SLIM_OUT)
+#   SLIM_REF        reference slim DB (read-only): post-check that its schema is an exact
+#                   prefix of the new slim's (appended columns only)      (optional, r5 M-7)
 #   LANDIS_PROJECT  Julia project holding tools/build_slim_db_region.jl   (with SLIM_OUT)
 #   JULIA_DEPOT_PATH  explicit Julia depot list — first entry writable    (with SLIM_OUT)
 #   JULIA           julia executable (default: julia)
@@ -75,6 +77,6 @@ if [[ -n "${SLIM_OUT:-}" ]] && (( SLIM_STEP >= FROM_STEP && SLIM_STEP <= TO_STEP
   nice -n 10 "${JULIA:-julia}" --project="$LANDIS_PROJECT" "$LANDIS_PROJECT/tools/build_slim_db_region.jl" \
       --out "$SLIM_OUT" --states "$FIA_STATES" --ecos "$SLIM_ECOS" \
       --fiadb "$FIA_CURATED_DB" --simb "$FIA_SIMB_DB"
-  nice -n 10 "$PY" -I slim_guard.py post --slim "$SLIM_OUT"
+  nice -n 10 "$PY" -I slim_guard.py post --slim "$SLIM_OUT" ${SLIM_REF:+--ref-slim "$SLIM_REF"}
 fi
 echo; echo "===== done ($(date -Is))"

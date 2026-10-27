@@ -124,6 +124,9 @@ def attach_modeling_context(con, df: pl.DataFrame) -> pl.DataFrame:
 #     mapped vs raw Tree_Age against the field age.
 CAL_MIN_N = 200
 N_FOLDS = 5
+# r5 M-5: the age-scale stratum is decided per TREE (fia_curation_v3.add_age_stratum: STDORGCD at
+# its first live record), not per record; cond_stdorgcd stays a model FEATURE.
+PLANTED = (pl.col("age_stratum") == "planted").fill_null(False)
 CV_REPORT = None
 
 
@@ -135,7 +138,7 @@ def plot_fold(plot_keys) -> np.ndarray:
     return np.array([zlib.crc32(str(k).encode()) % N_FOLDS for k in plot_keys], dtype=np.int64)
 CAL_SLOPE_MIN, CAL_SLOPE_MAX = 0.25, 1.5
 CAL_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "spcd_resolved", "spgrpcd_resolved", "cond_stdorgcd",
-            "STATUSCD", "DIA", "estage_raw", "age_from_totage", "age_from_stdage"]
+            "STATUSCD", "DIA", "estage_raw", "age_from_totage", "age_from_stdage", "age_stratum"]
 
 
 def _calibration_set(con) -> pl.DataFrame:
@@ -149,7 +152,7 @@ def _calibration_set(con) -> pl.DataFrame:
                   on="spcd_resolved", how="left")
             .with_columns([
                 pl.coalesce(["age_from_totage", "age_from_stdage"]).alias("field_age"),
-                (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("planted"),
+                PLANTED.alias("planted"),
                 pl.concat_str([pl.col(c).cast(pl.Utf8) for c in ("STATECD", "UNITCD", "COUNTYCD", "PLOT")],
                               separator="_").alias("_plot"),
             ])
@@ -323,7 +326,7 @@ def remap_estage(df: pl.DataFrame, models, tree_bounds: pl.DataFrame) -> pl.Data
              & (pl.col("estage_raw") > ESTAGE_MIN_AGE))
     sub = df.select(pl.int_range(pl.len()).alias("_i"), valid.alias("_v"), "estage_raw",
                     "spgrpcd_resolved", "major_spgrpcd",
-                    (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("_pl")).filter(pl.col("_v"))
+                    PLANTED.alias("_pl")).filter(pl.col("_v"))
     mapped, _ = map_estage(models, sub["estage_raw"].to_numpy(), sub["spgrpcd_resolved"].to_list(),
                            sub["major_spgrpcd"].to_list(), sub["_pl"].to_list())
     # r4 (user decision: SPLIT BY STRATUM): the field-scale mapping applies to PLANTED rows only;
@@ -377,7 +380,7 @@ def _support_cell(df: pl.DataFrame) -> pl.Expr:
     """DIA 2-in class x stratum (planted/natural) x stand-size class (FLDSZCD 1 vs other)."""
     return pl.concat_str([
         (pl.col("DIA") / 2).floor().clip(0, 12).cast(pl.Int32).cast(pl.Utf8),
-        pl.when(pl.col("cond_stdorgcd") == 1).then(pl.lit("P")).otherwise(pl.lit("N")),
+        pl.when(PLANTED).then(pl.lit("P")).otherwise(pl.lit("N")),
         pl.when(pl.col("cond_fldszcd") == 1).then(pl.lit("s1")).otherwise(pl.lit("s2")),
     ], separator="|")
 
@@ -393,13 +396,14 @@ def build_training_set(con, est) -> pl.DataFrame:
     SITETREE bored ages are never used for fitting (they are the independent check).
     Robust outlier rule per source (r3 I3a); outliers are scored but not trained on."""
     cols = ", ".join(TRAIN_COLS + ["estage_raw", "spgrpcd_resolved", "cond_fldszcd", "cond_stdszcd",
-                                   "cond_stdorgcd", "age_from_totage"])
+                                   "cond_stdorgcd", "age_from_totage", "age_stratum",
+                                   "SUBP", "TREE", "MEASDATE"])
     df = attach_modeling_context(con, con.execute(f"SELECT {cols} FROM curated_trees").pl())
     df = df.filter((pl.col("STATUSCD") == 1) & pl.col("DIA").is_not_null() & pl.col("DIA").is_not_nan())
     df = df.with_columns(
         pl.concat_str([pl.col(c).cast(pl.Utf8) for c in ("STATECD", "UNITCD", "COUNTYCD", "PLOT")],
                       separator="_").alias("_plot"),
-        (pl.col("cond_stdorgcd") == 1).fill_null(False).alias("_planted"))
+        PLANTED.alias("_planted"))
     has_tot = pl.col("age_from_totage").is_not_null()
     valid_te = (pl.col("DIA") >= ESTAGE_MIN_DIA) & (pl.col("estage_raw") > ESTAGE_MIN_AGE)
     field_ok = (pl.col("age_source").is_not_null() & pl.col("estimated_age").is_not_null()
@@ -442,7 +446,7 @@ def _remap_targets(train: pl.DataFrame, est, models) -> np.ndarray:
         sub = train[mrows]
         y[mrows], _ = map_estage(models, sub["estage_raw"].to_numpy(), sub["spgrpcd_resolved"].to_list(),
                                  sub["major_spgrpcd"].to_list(),
-                                 (sub["cond_stdorgcd"] == 1).fill_null(False).to_list())
+                                 sub["_planted"].to_list())
     return y
 
 
@@ -499,7 +503,7 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
     folds = train["_fold"].to_numpy()
     src = train["source"].to_numpy()
     cells = recal_cell(train["_planted"].to_numpy() if "_planted" in train.columns
-                       else (train["cond_stdorgcd"] == 1).fill_null(False).to_numpy(), train["DIA"].to_numpy())
+                       else train.select(PLANTED).to_series().to_numpy(), train["DIA"].to_numpy())
     y_full = train["target"].to_numpy().astype(float)
     raw_oof = np.full(y_full.shape, np.nan)
     oof = np.full(y_full.shape, np.nan)
@@ -562,33 +566,45 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
     support = (train.filter(pl.col("_kept") if "_kept" in train.columns else pl.lit(True))
                .with_columns(_support_cell(train).alias("_cell"))
                .group_by("_cell").len().rename({"len": "_n_train"}))
-    return model, enc, support, recal
+    # r5 M-6: rows the production model was TRAINED on get their cross-fitted (outer out-of-fold)
+    # raw prediction instead of the in-sample one, so the recalibration map (fitted on OOF
+    # predictions) is applied to predictions of the same kind
+    ok = kept & np.isfinite(raw_oof)
+    oof_tab = (train.filter(pl.Series(ok)).select(TREE_ID + ["MEASDATE"])
+               .with_columns(pl.Series("_raw_oof", raw_oof[ok])))
+    return model, enc, support, (recal, oof_tab)
 
 
 # =============================================================================
 # Step 3: apply + merge
 # =============================================================================
 
-# r4 ACCEPT + FLAG (user decision 2026-10-26): two verifier cells fail for reasons the curation
-# cannot fix without tuning; their ages are kept and flagged in age_domain (which then overrides
-# the model-age values above). Each rule: (age_domain value, STATECD, planted?, age sources,
-# minimum DIA). planted = cond STDORGCD == 1; natural = anything else, incl. unknown.
-#   known_bias_ky_natural_treeage      KY natural, TreeAge-sourced and model ages: TreeAge itself
-#                                      is -5.0 yr vs bored SITETREE ages (verifier (k): -5.7)
-#   known_bias_fl_planted_model_15plus FL planted model ages, DIA >= 15 in: model vs mapped
-#                                      TreeAge regression to the mean (verifier (j): -3.5); only
-#                                      trees without a TreeAge record take the model age
+# ACCEPT + FLAG (D6 / D8 / D9; r5 D14 + D-log): known-bias cells are flagged in age_domain (which
+# then overrides the model-age values above). The bias depends on the FIT SCOPE (the age model
+# and the TreeAge mapping are fitted once over all states in the DB), so each rule names the fit
+# scopes it was measured on = the sorted, comma-joined STATECDs of the DB (FIT_SCOPE).
+# Rule: (age_domain value, STATECD, planted?, age sources, minimum DIA, fit scopes).
+# planted = the tree's age_stratum (r5 M-5).
+#   (known_bias_ky_natural_treeage: retired by D13 — natural (k) is INFO by wood group)
+#   (known_bias_fl_planted_model_15plus: retired in r5 — the single-state FL fit now passes
+#    (j) at -1.6 yr)
+#   known_bias_fl_planted_model_10plus  FL planted MODEL ages, DIA >= 10 in, under the pooled
+#                                       FL + KY + MS fit: model vs mapped TreeAge regression to
+#                                       the mean, (j) 10-15 in -3.2 / 15+ in -3.8 yr; only trees
+#                                       without a TreeAge record take the model age
 KNOWN_BIAS_FLAGS = [
-    ("known_bias_ky_natural_treeage",      21, False, ("estage", "model"), None),
-    ("known_bias_fl_planted_model_15plus", 12, True,  ("model",),          15.0),
+    ("known_bias_fl_planted_model_10plus", 12, True, ("model",), 10.0, ("12,21,28",)),
 ]
+FIT_SCOPE = None   # set in __main__ from the DB's states
 
 
 def flag_known_bias(df: pl.DataFrame) -> pl.DataFrame:
     if "age_domain" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("age_domain"))
-    planted = (pl.col("cond_stdorgcd") == 1).fill_null(False)
-    for val, st, pl_, srcs, min_dia in KNOWN_BIAS_FLAGS:
+    planted = PLANTED
+    for val, st, pl_, srcs, min_dia, scopes in KNOWN_BIAS_FLAGS:
+        if FIT_SCOPE not in scopes:
+            continue
         m = (pl.col("STATECD") == st) & (planted if pl_ else ~planted) & pl.col("age_source").is_in(list(srcs))
         if min_dia is not None:
             m = m & (pl.col("DIA") >= min_dia)
@@ -618,8 +634,18 @@ def apply_age_model(df: pl.DataFrame,
     )
     X_cand = _build_X(alive_w_dia, enc, fit_enc=False)
     raw    = np.expm1(model.predict(X_cand))
+    oof_tab = None
+    if isinstance(recal, tuple):
+        recal, oof_tab = recal
+    if oof_tab is not None and oof_tab.height:   # r5 M-6: cross-fitted predictions for training rows
+        o = (alive_w_dia.select(TREE_ID + ["MEASDATE"]).with_row_index("_i")
+             .join(oof_tab, on=TREE_ID + ["MEASDATE"], how="inner"))
+        if o.height:
+            raw[o["_i"].to_numpy()] = o["_raw_oof"].to_numpy()
+        print(f"         model ages: {o.height:,} of {alive_w_dia.height:,} live rows use their cross-fitted "
+              f"(out-of-fold) prediction (training rows), the rest the full-data model")
     if recal:   # r4: monotone post-hoc recalibration per stratum x DIA class
-        raw = _recal_apply(recal, raw, recal_cell((alive_w_dia["cond_stdorgcd"] == 1).fill_null(False).to_numpy(),
+        raw = _recal_apply(recal, raw, recal_cell(alive_w_dia.select(PLANTED).to_series().to_numpy(),
                                                   alive_w_dia["DIA"].to_numpy()))
     raw    = np.asarray(raw).clip(1.0, 999.0)
 
@@ -673,9 +699,7 @@ def apply_age_model(df: pl.DataFrame,
                 .join(support, on="_cell", how="left")
                 .with_columns(
                     pl.when(pl.col("age_source") == "model")
-                    .then(pl.when(pl.col("cond_stdorgcd") != 1)   # natural, or STDORGCD unknown
-                          .then(pl.lit("natural_treeage_scale"))
-                          .when(pl.col("cond_stdorgcd").is_null())
+                    .then(pl.when(~PLANTED)   # natural tree (age_stratum, r5 M-5)
                           .then(pl.lit("natural_treeage_scale"))
                           .when(pl.col("_n_train").fill_null(0) >= SUPPORT_MIN)
                           .then(pl.lit("in_support")).otherwise(pl.lit("out_of_support")))
@@ -768,6 +792,8 @@ if __name__ == "__main__":
     scaffold_all = build_subplot_year_scaffold(con)
     states = [r[0] for r in con.execute(
         "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]
+    FIT_SCOPE = ",".join(str(int(x)) for x in states)
+    print(f"[step2] fit scope (states fitted together): {FIT_SCOPE}")
     parts_t, parts_s = [], []
     for st in states:
         print(f"\n----- STATECD {st} -----")

@@ -14,6 +14,8 @@ Name resolution (unqualified names in the stages' SQL):
     REFERENCE_TABLES (data_plot_eco, species_longevity_ref) are exposed as TEMP views over
     `fia.main.<name>`;
   * everything else resolves only in the output DB (or, with curated_db, in `cur`).
+  * r5 M-2: plot-keyed raw views carry the CANONICAL plot key (build_plot_canon_map); the
+    TEMP table plot_canon_map lists the renumbered visits with their raw keys.
 FIADB also still holds the OLD curated tables (curated_trees, curated_cohorts_landis*,
 clean_subplot_years, tree_trajectories, DATA_SUBPLOTS*, ...). They are NOT exposed: an
 unqualified reference to a curated table that is missing from the output DB fails with a
@@ -87,6 +89,45 @@ def parse_states(s) -> list[int] | None:
     return [int(x) for x in str(s).replace(" ", "").split(",") if x]
 
 
+def build_plot_canon_map(con, max_iter: int = 50) -> int:
+    """r5 M-2: a few FIA plots change their (UNITCD, COUNTYCD, PLOT) key between annual visits
+    (e.g. GA 13/2/87 146 -> 45 -> 146; most are county corrections). The PREV_PLT_CN chain links
+    the visits. Each annual plot visit is mapped to the CANONICAL key = the key at its chain's
+    FIRST ANNUAL visit (the chain is followed only through annual-inventory plots). The TEMP
+    table plot_canon_map holds ONLY the visits whose key changes:
+      CN (PLOT.CN = PLT_CN elsewhere), UNITCD/COUNTYCD/PLOT (canonical), *_RAW (as recorded).
+    Every plot-keyed raw view (PLOT by CN, the rest by PLT_CN) then carries the canonical key,
+    so all stages see one key per physical plot before anything else. Returns the row count."""
+    con.execute("""CREATE OR REPLACE TEMP TABLE _canon_ap AS
+        SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT
+        FROM fia.main.PLOT P JOIN fia.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'""")
+    con.execute("""CREATE OR REPLACE TEMP TABLE _canon_root AS
+        SELECT a.CN, a.CN AS root FROM _canon_ap a""")
+    for _ in range(max_iter):
+        n = con.execute("""SELECT count(*) FROM _canon_root r JOIN _canon_ap a ON a.CN = r.root
+                           JOIN _canon_ap p ON p.CN = a.PREV_PLT_CN""").fetchone()[0]
+        if n == 0:
+            break
+        con.execute("""CREATE OR REPLACE TEMP TABLE _canon_root AS
+            SELECT r.CN, COALESCE(p.CN, r.root) AS root FROM _canon_root r JOIN _canon_ap a ON a.CN = r.root
+            LEFT JOIN _canon_ap p ON p.CN = a.PREV_PLT_CN""")
+    else:
+        sys.exit("[dbconn] PREV_PLT_CN chain did not terminate (cycle?)")
+    con.execute("""CREATE OR REPLACE TEMP TABLE plot_canon_map AS
+        SELECT a.CN, a.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
+               a.UNITCD AS UNITCD_RAW, a.COUNTYCD AS COUNTYCD_RAW, a.PLOT AS PLOT_RAW
+        FROM _canon_root r JOIN _canon_ap a ON a.CN = r.CN JOIN _canon_ap o ON o.CN = r.root
+        WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS DISTINCT FROM (o.UNITCD, o.COUNTYCD, o.PLOT)""")
+    dup = con.execute("""SELECT count(*) FROM (SELECT P.STATECD, COALESCE(m.UNITCD, P.UNITCD), COALESCE(m.COUNTYCD, P.COUNTYCD),
+                             COALESCE(m.PLOT, P.PLOT), P.INVYR FROM fia.main.PLOT P
+                             JOIN fia.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
+                             LEFT JOIN plot_canon_map m ON m.CN = P.CN GROUP BY ALL HAVING count(*) > 1)""").fetchone()[0]
+    if dup:
+        sys.exit(f"[dbconn] canonical plot keys collide on {dup} plot-INVYRs")
+    con.execute("DROP TABLE _canon_ap; DROP TABLE _canon_root")
+    return con.execute("SELECT count(*) FROM plot_canon_map").fetchone()[0]
+
+
 def connect(out_db: str, fiadb: str, curated_db: str | None = None) -> duckdb.DuckDBPyConnection:
     d = os.path.dirname(os.path.abspath(out_db))
     os.makedirs(d, exist_ok=True)
@@ -106,8 +147,25 @@ def connect(out_db: str, fiadb: str, curated_db: str | None = None) -> duckdb.Du
         "SELECT table_name FROM duckdb_tables() WHERE database_name='fia'").fetchall()]
     raw = [t for t in fia_tabs
            if (t == t.upper() and not t.startswith(OLD_DERIVED_PREFIXES)) or t in REFERENCE_TABLES]
+    build_plot_canon_map(con)
+    ktype = {}
+    for tn, cn, dt in con.execute(
+            "SELECT table_name, column_name, data_type FROM duckdb_columns() WHERE database_name='fia' "
+            "AND column_name IN ('UNITCD','COUNTYCD','PLOT')").fetchall():
+        ktype.setdefault(tn, {})[cn] = dt
+    keyed = {tn for tn, d in ktype.items() if len(d) == 3}
+    pltcn = {r[0] for r in con.execute(
+        "SELECT table_name FROM duckdb_columns() WHERE database_name='fia' AND column_name='PLT_CN'").fetchall()}
     for t in raw:
-        con.execute(f'CREATE TEMP VIEW "{t}" AS SELECT * FROM fia.main."{t}"')
+        # M-2 (r5): plot-keyed raw tables carry the CANONICAL plot key (see build_plot_canon_map)
+        on = "t.CN" if t == "PLOT" else ("t.PLT_CN" if t in pltcn else None)
+        if t in keyed and on:
+            rep = ", ".join(f"CASE WHEN m.CN IS NULL THEN t.{k} ELSE CAST(m.{k} AS {ktype[t][k]}) END AS {k}"
+                            for k in ("UNITCD", "COUNTYCD", "PLOT"))
+            con.execute(f"""CREATE TEMP VIEW "{t}" AS SELECT t.* REPLACE ({rep})
+                FROM fia.main."{t}" t LEFT JOIN plot_canon_map m ON m.CN = CAST({on} AS VARCHAR)""")
+        else:
+            con.execute(f'CREATE TEMP VIEW "{t}" AS SELECT * FROM fia.main."{t}"')
 
     if curated_db:
         if not os.path.exists(curated_db):

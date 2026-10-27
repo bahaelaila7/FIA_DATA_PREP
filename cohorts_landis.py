@@ -74,13 +74,10 @@ def _has_table(con, table: str) -> bool:
 # phantom rows inherit their source tree's values; Sim B aggregates them AGB-weighted)
 # r4 ACCEPT + FLAG: + n_trees_known_bias / share_known_bias (members whose age_domain is any
 # known_bias_* flag; one generic pair, the flag names live in age_imputation.KNOWN_BIAS_FLAGS).
-# *_natural_treeage_scale keeps its r4 meaning (natural MODEL ages), including KY natural model
-# ages that now carry known_bias_ky_natural_treeage.
+# *_natural_treeage_scale = natural MODEL ages (the D11 KY special case went with D13).
 AGE_META_COLS = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
                  "n_trees_known_bias", "share_known_bias"]
-IS_NATURAL_MODEL = ((pl.col("_age_domain") == "natural_treeage_scale") |
-                    ((pl.col("_age_domain") == "known_bias_ky_natural_treeage") &
-                     (pl.col("_age_source") == "model"))).fill_null(False)
+IS_NATURAL_MODEL = (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False)  # D13: KY flag retired
 IS_KNOWN_BIAS = pl.col("_age_domain").str.starts_with("known_bias_").fill_null(False)
 AGE_META_EXPRS = [
     IS_NATURAL_MODEL.cast(pl.Int64).alias("n_trees_natural_treeage_scale"),
@@ -333,11 +330,13 @@ def _diagnose_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
 # Step 4b: sim_year age anchoring
 # =============================================================================
 
-def sim_year_map(visits: pl.DataFrame, anchors: pl.DataFrame) -> pl.DataFrame:
+def sim_year_map(visits: pl.DataFrame, anchors: pl.DataFrame | None = None) -> pl.DataFrame:
     """
-    Per-subplot integer time axis (r3 M2: STRICTLY increasing).
-      raw_i      = round((MEASDATE_i - anchor).days / 365.25), anchor = the subplot's first
-                   REAL row (first live tree record)
+    Per-subplot integer time axis (r3 M2: STRICTLY increasing; r5 M-1: ONE axis per subplot).
+      raw_i      = round((MEASDATE_i - anchor).days / 365.25), anchor = the subplot's FIRST
+                   SCAFFOLD visit = min MEASDATE of `visits` (every caller passes the full
+                   clean_subplot_years scaffold, so Sim A, Sim B and the trajectories share one
+                   axis with sim_year 0 at that visit; `anchors` is ignored since r5)
       sim_year_i = max(raw_i, sim_year_{i-1} + 1) over the visits in date order
                  = i + cummax_j<=i (raw_j - j)
     Two visits that round to the same year (e.g. 0.4 yr apart) therefore get consecutive
@@ -346,7 +345,7 @@ def sim_year_map(visits: pl.DataFrame, anchors: pl.DataFrame) -> pl.DataFrame:
     _first_measdate. Returns SUBPLOT_ID + MEASDATE + sim_year.
     """
     v = (visits.select(SUBPLOT_ID + ["MEASDATE"]).unique()
-         .join(anchors, on=SUBPLOT_ID, how="inner")
+         .with_columns(pl.col("MEASDATE").min().over(SUBPLOT_ID).alias("_first_measdate"))
          .with_columns(((pl.col("MEASDATE") - pl.col("_first_measdate")).dt.total_days() / 365.25)
                        .round(0).cast(pl.Int32).alias("_raw"))
          .sort(SUBPLOT_ID + ["MEASDATE"])
@@ -420,18 +419,24 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
       grp_rates  : (spgrpcd,        epa_l3) → rate
       glb_rates  : (spgrpcd)                → rate
     """
-    srt = df.sort(TREE_ID + ["MEASDATE"])
+    # r5 M-8: the rate is a PER-TREE biomass rate. Sim A's agb is TPA-expanded and the expansion
+    # drops ~12x at the 5 in microplot -> subplot switch (74.965 -> 6.018), which made many
+    # growing saplings' rates negative (clipped to 0). Per-tree biomass = agb / tpa (Sim A);
+    # the trajectories' agb is per-tree already.
+    bio = (pl.col("agb") / pl.col("tpa")) if "tpa" in df.columns else pl.col("agb")
+    srt = df.filter(pl.col("intro_type").is_null() if "intro_type" in df.columns else pl.lit(True)) \
+            .with_columns(bio.alias("_bio")).sort(TREE_ID + ["MEASDATE"])
 
     first = (
         srt.unique(subset=TREE_ID, keep="first")
         .select(TREE_ID + [pl.col("age_calc").alias("first_age"),
-                            pl.col("agb").alias("first_agb"),
+                            pl.col("_bio").alias("first_agb"),
                             pl.col("dia").alias("first_dia")])
     )
     last = (
         srt.unique(subset=TREE_ID, keep="last")
         .select(TREE_ID + [pl.col("age_calc").alias("last_age"),
-                            pl.col("agb").alias("last_agb")])
+                            pl.col("_bio").alias("last_agb")])
     )
     meta = (
         df.select(TREE_ID + ["species_symbol", "spgrpcd", "epa_l3"])
@@ -459,8 +464,10 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
     )
 
     n_sap = tree_rates.height
+    n_neg = tree_rates.filter(pl.col("last_agb") < pl.col("first_agb")).height
     print(f"[sapling rates] {n_sap:,} training saplings "
-          f"(first_dia ≤ {SAPLING_DIA_MAX} in, ≥2 measurements)")
+          f"(first_dia ≤ {SAPLING_DIA_MAX} in, ≥2 measurements; per-tree biomass; "
+          f"{n_neg:,} with a negative raw rate, clipped to 0)")
 
     sp_rates = (
         tree_rates.group_by(["species_symbol", "epa_l3"])
@@ -640,7 +647,7 @@ BF_FLAGS = ["_bf_none", "_bf_rc8", "_bf_sap", "_bf_ge5_ingrowth"]
 def scaffold_visits(df: pl.DataFrame, ctx) -> pl.DataFrame:
     """Candidate prior visits: the full scaffold (ctx['visit']) restricted to the subplots in
     df, with prior_sim_year on the SAME strict per-subplot axis as compute_sim_year_ages
-    (sim_year_map anchored at the subplot's first REAL row; negative before it). Without ctx:
+    (sim_year_map anchored at the subplot's first scaffold visit). Without ctx:
     df's own visits."""
     if ctx is None:
         return (df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
@@ -742,7 +749,7 @@ def tree_prior_candidates(df: pl.DataFrame, ctx, rule_c: bool = True) -> pl.Data
 
 
 def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFrame:
-    """prior_agb = max(MIN_BACKFILL_AGB, agb * (1 - rate * years_back))."""
+    """prior_agb = min(agb, max(MIN_BACKFILL_AGB, agb * (1 - rate * years_back)))."""
     sp_rates, grp_rates, glb_rates = estimate_sapling_growth_rates(df)
     missing = (
         missing
@@ -761,6 +768,8 @@ def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFr
                 ).clip(MIN_BACKFILL_AGB, None)
             )
             .otherwise(pl.lit(MIN_BACKFILL_AGB))
+            # r5 M-8: a phantom never exceeds the debut (first real) value it is scaled from
+            .clip(upper_bound=pl.col("agb"))
             .alias("prior_agb")
         )
         .drop("_rate")
@@ -1097,10 +1106,8 @@ def build_cohorts_landis(con, backfill_blocks: bool = True) -> pl.DataFrame:
     df, sources = backfill_phantom_cohorts(df, ctx)
     global PHANTOM_COHORT_SOURCES
     PHANTOM_COHORT_SOURCES = sources
-    # phantoms at full-scaffold visits before the subplot's first real row get a negative
-    # sim_year: re-base so sim_year = years since the subplot's first row (>= 0)
-    df = df.with_columns((pl.col("sim_year") - pl.col("sim_year").min().over(SUBPLOT_ID)
-                          .clip(upper_bound=0)).alias("sim_year"))
+    # r5 M-1: no re-base — the axis is anchored at the subplot's first scaffold visit
+    # (sim_year_map), so sim_year >= 0 already and equals Sim B's / the trajectories'
 
     # plt_cn: unique string key per plot (not per visit); Julia uses it only to
     # count subplots (subp_count = unique subp per plt_cn) for AGB normalisation

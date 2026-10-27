@@ -247,6 +247,7 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
                     (pl.col("age_calc").cast(pl.Float64) - pl.col("prior_age").cast(pl.Float64))))
                   .clip(MIN_BACKFILL_AGB, None))
             .otherwise(pl.lit(MIN_BACKFILL_AGB))
+            .clip(upper_bound=pl.col("agb"))   # r5 M-8: never above the debut value
             .alias("prior_agb")).drop("_rate")
     )
     synthetic = (
@@ -364,6 +365,19 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
             pl.col("_span").is_null()).drop("_span")
     if n_g0 != g.height:
         print(f"[interp] {n_g0 - g.height:,} gap slots NOT filled (span a censoring interval)")
+    # r5 M-4: never at, or across, an entirely NONFOREST subplot visit (the same forest test as
+    # the cohort pass: forest subplot + microplot proportion <= 0); the tree cannot have been a
+    # live forest tree there, and the land use broke the trajectory
+    if {"forest_subpcond_prop", "forest_micrcond_prop"} <= set(visits.columns):
+        n_g1 = g.height
+        nf = (visits.filter((pl.col("forest_subpcond_prop").fill_null(0) + pl.col("forest_micrcond_prop").fill_null(0)) <= 0)
+              .select(SUBPLOT_ID + [pl.col("MEASDATE").alias("_nfd")]))
+        spans = (g.select(TREE_ID + ["MEASDATE", "prev_measdate", "next_measdate"])
+                 .join(nf, on=SUBPLOT_ID, how="inner")
+                 .filter((pl.col("_nfd") > pl.col("prev_measdate")) & (pl.col("_nfd") < pl.col("next_measdate")))
+                 .select(TREE_ID + ["MEASDATE"]).unique().with_columns(pl.lit(True).alias("_span")))
+        g = g.join(spans, on=TREE_ID + ["MEASDATE"], how="left").filter(pl.col("_span").is_null()).drop("_span")
+        print(f"[interp] {n_g1 - g.height:,} gap slots NOT filled (at / across a nonforest visit)")
     n_gaps = g.height
     if n_gaps == 0:
         return live.with_columns(pl.lit(False).alias("was_missed_reintroduced"))

@@ -90,6 +90,9 @@ def build(con) -> pl.DataFrame:
                  kb.cast(pl.Int64).sum().alias("n_trees_known_bias"),
                  ((pl.col("agb") * kb.cast(pl.Float64)).sum() / pl.col("agb").sum())
                  .alias("share_known_bias"))
+            # r5 M-3: float sums depend on the summation order -> round for bit-identical reruns
+            .with_columns(pl.col("agb").round(6), pl.col("share_natural_treeage_scale").round(9),
+                          pl.col("share_known_bias").round(9))
             .join(src, on=grp, how="left", nulls_equal=True)
             .select(OUT_COLS + c1.AGE_META_COLS)
             .sort(["statecd", "unitcd", "countycd", "plot", "subp", "species_symbol", "measdate", "age_calc"]))

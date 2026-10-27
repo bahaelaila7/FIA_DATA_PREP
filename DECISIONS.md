@@ -158,3 +158,111 @@ decided and how to reverse it.
   - (b) **measure them on a pooled multi-state test DB now (FL + KY + MS), and record the values as a function of the fit scope**;
   - (c) loosen the drift tolerance.
 - **Chosen:** (b).
+
+## D15 — Canonical plot key (audit r4 M-2; 2026-10-26, agent)
+- **Evidence:** 75 annual plot visits in FIADB change (UNITCD, COUNTYCD, PLOT) along their PREV_PLT_CN chain, most of them into a different county. In R4: AL 3, FL 4, GA 5, KY 5, MS 0, NC 11, SC 2, TN 4 (audit a04). GA 13/2/87 146 → 45 → 146 is one example. A renumber splits one plot into two, so its trees "disappear" and reappear as new ones: GA `disappeared_inferred_removal` was 101 trees, 86 of them on such plots.
+- **Options:**
+  - (a) **remap in the dbconn raw views.** Every plot-keyed raw view (PLOT by CN, every other table by PLT_CN) carries the canonical key = the key at the chain's FIRST ANNUAL visit, so every stage sees one key per physical plot before anything else;
+  - (b) remap only in v3's output tables. Later stages join raw COND / PLOT / data_plot_eco by plot key and would mismatch;
+  - (c) drop the renumbered plots.
+- **Chosen:** (a).
+  - Guards: a chain that does not terminate, or canonical keys that collide on a plot-INVYR, stops the run (0 collisions in FIADB).
+  - `curated_trees` appends `unitcd_raw`, `countycd_raw` and `plot_raw`. All three are kept, not just PLOT, because most renumbers also change the county.
+  - The verifier rebuilds the map independently (a recursive CTE over the raw FIADB, attached as `fraw`, and an in-memory `f` catalog of remapped views) and checks (n6).
+  - Map cost: about 3 s per stage connection.
+- **Reverse:** make `build_plot_canon_map` return an empty map (or create the plain views), and drop the three FIX columns.
+
+## D16 — One age scale per tree (audit r4 M-5; 2026-10-26, agent)
+- **Evidence:** trees whose condition STDORGCD changes between visits mixed field-scale-mapped (planted) and raw (natural) TreeAge candidates in one median anchor (AL 5,389 trees, GA 4,262; blended offsets −9.0 / −4.8 yr). Live trees spanning two STDORGCD codes in r5: KY 458, AL 8,250, GA 8,879, TN 3,130, NC 11,059, SC 6,729, MS 10,383.
+- **Options:**
+  - (a) **the stratum at the tree's FIRST LIVE record** (a tree with no live record takes its first record; null or other codes = natural);
+  - (b) the majority over its live records;
+  - (c) the latest record;
+  - (d) keep it per record (status quo).
+- **Chosen:** (a).
+  - It is the stand origin when the tree was first seen, and it is stable as later visits are added; the majority rule could flip it.
+  - The new FIX column `age_stratum` (v3 `add_age_stratum`) drives every age-scale decision in step 2: the calibration-set planted split, `remap_estage`, training strata, the recalibration cells, support cells, the `natural_treeage_scale` domain and the known-bias flags. `cond_stdorgcd` stays a model FEATURE.
+  - Check (j) and the flag rule use `age_stratum`. Checks (d), (h) and (k) keep the record's stand type, since they describe stands rather than age scales.
+- **Reverse:** set `PLANTED` in age_imputation back to `(cond_stdorgcd == 1)`.
+
+## D17 — Cross-fitted production predictions (audit r4 M-6; 2026-10-26, agent)
+- **Evidence:** the recalibration map was fitted on out-of-fold predictions but applied to in-sample predictions of the training rows. Planted 5–10 in model age minus the tree's own field age, mean / median: AL +0.05 / +0.68 yr, NC +0.57 / +1.22 yr (the audit quoted +0.85 / +1.16).
+- **Options:**
+  - (a) **training rows (kept, trained-on) use their outer out-of-fold raw prediction, matched by tree × MEASDATE; every other row uses the full-data model; the map is applied to both**;
+  - (b) apply the map only to non-training rows;
+  - (c) fit the map on in-sample predictions.
+- **Chosen:** (a). Outlier rows that were scored but not trained on use the full model.
+  - After: AL −0.02 / +0.62 yr, NC 0.00 / +0.92 yr (MAE AL 3.19 → 3.28, NC 4.60 → 4.59).
+  - Training rows using OOF predictions: AL 389,830 of 576,536 live rows; NC 317,216 of 506,268.
+- **Reverse:** drop `oof_tab` in `apply_age_model`.
+
+## D18 — One sim_year axis (audit r4 M-1; 2026-10-26, agent)
+- **Evidence:** each table anchored `sim_year_map` on its own "first real row". Sim A then re-based phantoms to ≥ 0, while Sim B and the trajectories did not.
+  - Shared subplot-visits with a different Sim A vs Sim B sim_year: KY 407 / 32,806, FL 1,284, AL 2,188, GA 3,440, TN 779, NC 1,667 / 52,474, SC 1,775, MS 1,727.
+  - The trajectories reached sim_year −19 to −27.
+- **Options:**
+  - (a) **anchor at the subplot's FIRST SCAFFOLD visit (clean_subplot_years) for every table, and drop Sim A's re-base**;
+  - (b) re-base every table the way Sim A did;
+  - (c) anchor at the first live tree.
+- **Chosen:** (a), per the batch.
+  - Sim A's sim_year 0 can now be a scaffold visit with no live tree; the gap to the first live row is real elapsed time.
+  - Every caller already passes the full scaffold, so the `anchors` argument of `sim_year_map` is ignored.
+  - Check (n1): 0 differences and sim_year 0 at the first visit in all states.
+- **Reverse:** restore the `anchors` join and the Sim A re-base.
+
+## D19 — Sim B drops from timber members only (audit r4 I-1; 2026-10-26, agent)
+- **Options for the backing check:**
+  - (a) **removed / died, or alive with DAMSEV > 40** (the drop model's own damaged-alive branch);
+  - (b) removed / died only, as in the batch text.
+- **Chosen:** (a). Option (b) would flag legitimate damage drops. The check reports separately how many drops are backed only by damaged-alive members: 0 in every state.
+- **The drops themselves:**
+  - A pair counts only if the tree is a REAL record with DIA ≥ 5 at the previous visit and, if alive at the visit, real with DIA ≥ 5 there too.
+  - First Sim B rows are removed from `cohort_disturbance` as well, so the table and the attached column agree.
+  - That first-row rule removed 0 drops in every state: with timber-only members, a first row has no previous members.
+  - **Found by the n2 check (FL 12/2/73/23 subp 3):** a tree that is still ALIVE at the visit but no longer a real ≥ 5 in record there (it shrank from 5.0 to 4.9 in, or the slot is gap-interpolated) was counted as a removal. Such pairs are now dropped: neither survivor nor removal.
+- **Reverse:** `compute(..., timber_only=False)` in attach_disturbance_simB, and drop the `_first_rows` delete.
+
+## D20 — Phantom biomass (audit r4 M-8; 2026-10-26, agent)
+- **Options for the growth rate:**
+  - (a) **per-tree biomass (Sim A agb / tpa; the trajectories' agb is per tree already), from REAL rows only**;
+  - (b) per-tree biomass on all rows, phantoms included (circular: the cohort pass trained on tree-pass phantoms).
+- **Chosen:** (a), and a phantom is capped at the debut value it is scaled from (`min(agb, …)`).
+  - Training saplings with a negative raw rate (clipped to 0): NC 2,485 of 31,537 (was 5,298 on TPA-expanded AGB). What remains is real shrinkage.
+- **Reverse:** remove `_bio`, the real-row filter and the `.clip(upper_bound=agb)` in cohorts_landis / build_tree_trajectories.
+
+## D21 — Suspected false tree-number splits (audit r4; 2026-10-26, agent)
+- **Evidence:** across the 8 states, the only splits linked through a dropped STATUSCD 0 record are 5 AL keys (Mobile Co. plot 105, an RC9 nonsampled visit in 2001, then RC3 entries in 2007). Each has evidence of a different tree: a dead record before (2), a species change (3), or a DIA drop of up to 25 in. 0 splits lack such evidence. GA's 176 split segments are other-key links (46) or dead-then-unlinked (130).
+- **Options:**
+  - (a) **no rule change, plus an INFO monitor (n7) counting status-0-linked splits without evidence**;
+  - (b) add the evidence requirement now.
+- **Chosen:** (a). The suspicion is not confirmed, and (b) would change 0 rows while adding a raw TREE lookup to step 1.
+- **Reverse:** n/a (implement (b) if n7 ever reports > 0).
+
+## D22 — Verifier independence and slim schema (audit r4 M-7; 2026-10-26, agent)
+- **(b):** the re-tally candidate set (`ub`) is rebuilt from raw FIADB with the documented plot / transition tiers plus RC8-closure visits that have unrecorded saplings. The mismatch with `procedural_breaks` is reported as INFO; its consequences are enforced through 1g (phantoms across a re-tally).
+- **(c2):** a `subp_has_dstrb` subplot needs a raw FIRST dead/cut record (not a re-record) on forest that is a cut, a harvest-inferred death (AGENTCD null, TRTCD 10) or a death under a disturbance code.
+  - Enforced: flagged ⇒ attributed.
+  - INFO: attributed but not flagged (trees without an age or cohort).
+- **Slim:** ENFORCED that old tables keep their columns as an exact prefix (verifier section 6), and in `slim_guard.py post` via `SLIM_REF` (optional env; the r5 runs pass the R4 slim).
+- **Reverse:** revert the `ub` block to `new.procedural_breaks`, and drop the checks.
+
+## D23 — Determinism of steps 9–10 (audit r4 M-3; 2026-10-26, agent)
+- **Chosen:**
+  - Sim B AGB rounded to 6 dp; shares and the drop fraction to 9 dp; `dropped` / `would_be` sums to 6 dp.
+  - `cohort_disturbance` sorted on its key, and the attach ordered.
+  - (e) also compares `curated_cohorts_landis_simB` and `cohort_disturbance` after rerunning steps 4–10 into a second Sim B DB (`--determinism-simb-db`).
+- **Reverse:** remove the rounding.
+
+## D24 — FL (j) under the pooled fit (D14 outcome; 2026-10-26, agent)
+- **Evidence:** single-state FL fit (r5): (j) planted 10–15 in and 15+ in both pass (15+ −1.6 yr). Pooled FL + KY + MS fit: 10–15 in **−3.2** (5,243 trees, a NEW failing cell) and 15+ in **−3.8** (431 trees). The 15+ cell moves 2.2 yr between fit scopes (> 1 yr), so per D14 the value is recorded per fit scope.
+- **Options:**
+  - (a) **key KNOWN_EXCEPTIONS by FIT SCOPE** (the DB's sorted STATECDs).
+    - Retire the single-state FL entry (it passes).
+    - Record pooled-scope entries for 10–15 (−3.2) and 15+ (−3.8).
+    - Flag them `known_bias_fl_planted_model_10plus` (FL planted model ages, DIA ≥ 10 in) only in that fit scope. The old `…_15plus` flag is retired.
+  - (b) tune the pooled model (e.g. a state feature). The user's D6 rule is not to tune these cells.
+  - (c) apply the pooled values to every scope, which hides the fact that the single-state fit passes.
+- **Chosen:** (a).
+  - Same nature as D6: regression to the mean, which only reaches trees without a TreeAge record.
+  - A scope with no recorded entries is fully strict: a Region-4 fit must re-measure these cells and record its own values, which is the point of D14.
+- **Reverse:** delete the scope entries from `KNOWN_EXCEPTIONS` and `KNOWN_BIAS_FLAGS`.

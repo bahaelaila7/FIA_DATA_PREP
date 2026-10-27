@@ -58,7 +58,7 @@ allow-list rather than `search_path`, which would expose them. Helpers: `table_e
 | snapshots by raw SPCD | `curated_snapshots` grouped by `spcd_resolved` / `spgrpcd_resolved` |
 | — | `spgrpcd_resolved`; area proportions for consumer-side normalisation (`cond_condprop_unadj`, `cond_subpprop_unadj`, `cond_micrprop_unadj`, `cond_macrprop_unadj`, `subp_subpcond_prop`, `subp_micrcond_prop`, `subp_macrcond_prop`, `subp_forest_*_prop`, `subp_has_cond_status3`, `cond_status_cd`) |
 
-The 30 new curated_trees columns (incl. `estage_mapped`, `age_domain`, `rerecord_dead`, `tree_key_split`, `prev_status_cd`, `prev_tre_cn`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
+The 34 new curated_trees columns (incl. `estage_mapped`, `age_domain`, `rerecord_dead`, `tree_key_split`, `prev_status_cd`, `prev_tre_cn`; r5: `age_stratum`, `unitcd_raw`, `countycd_raw`, `plot_raw`) are APPENDED after all old columns (`FIX_COLUMNS`), so the old
 schema (names, types, order) is an exact prefix. The polars steps run one state at a time. Every
 rule is tree-, subplot- or condition-local, so this matches a single pass. Only the diagnostic
 `spcd_confusion_cluster` id is state-local. `age_imputation` fits its model once over all states
@@ -79,7 +79,8 @@ EXCEPT-identical `curated_trees` / `curated_snapshots` (tested on AL).
   - (n) the subplot was entirely nonforest at p, or at any visit between p and D: backfill stops
     at the latest nonforest visit. Candidate prior visits and the nonforest lookup come from the
     FULL `clean_subplot_years` scaffold. sim_year is re-based so phantoms before the subplot's
-    first real row keep sim_year ≥ 0;
+    first real row keep sim_year ≥ 0 (r5 M-1: no re-base any more; every table's axis is
+    anchored at the subplot's first scaffold visit, so sim_year ≥ 0 by construction);
   - (b) the PLOT had a procedural re-tally (`procedural_breaks`) at b with p < b ≤ D:
     - the sapling-debut part uses only breaks with closed-RC8 saplings, `break_kind =
       'unrecorded'`, or unrecorded saplings;
@@ -141,6 +142,9 @@ copied into the curated DB, so the slim builder can use it as its `--fiadb`) →
   FIADB and simB and silently skips a missing simB.
 - **dbconn guards**: `--out-db` must not be FIADB or a link to it (`os.path.samefile`), and
   `--curated-db` must not be FIADB.
+- **r5**: `SLIM_REF` (optional) = a reference slim DB, read-only; `slim_guard.py post` then
+  requires its schema to be an exact prefix of the new slim's. The determinism rerun covers
+  steps 4–10, into a second Sim B DB (`--determinism-simb-db`).
 - **Verification**: `verify_curation_v2.py` checks live coverage against an INDEPENDENT raw
   reference (live, SUBP ≤ 4, TPA > 0, own COND_STATUS 1, PLOT_STATUS < 3, SUBP_STATUS ≠ 3,
   annual, not P2A, not before an RC7 erroneous tally). It also checks: SUBP > 4 rows, lost
@@ -234,9 +238,9 @@ are interim, on the raw scale.
     - `out_of_support`: planted, and the record falls in a DIA 2-in class × stratum ×
       FLDSZCD (1 vs other) cell with < 50 training rows;
     - `in_support`: otherwise.
-    - `known_bias_ky_natural_treeage` / `known_bias_fl_planted_model_15plus` (r4 ACCEPT + FLAG,
-      override the values above, also set on KY natural estage rows): see "Round-4 ACCEPT +
-      FLAG" below.
+    - `known_bias_fl_planted_model_10plus` (r5; overrides the values above, only in the pooled
+      FL + KY + MS fit scope): see "Round-5" below. The r4 flags `known_bias_ky_natural_treeage`
+      (D13) and `known_bias_fl_planted_model_15plus` (D24) are retired.
     The column flows into the slim DB, because the slim builder copies `curated_trees.*`.
 
 Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monotone ages: 0/25 and 0/25):
@@ -415,6 +419,12 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
     | TN | −0.3 (raw +7.0) | −7.0 (raw −1.0) |
     | FL | +0.8 (raw +5.0) | −3.3 (raw 0.0); mapped MAE 12.2 vs raw 10.0 |
 
+  - **Correction (r5, D13)**: the D5 evidence summary "natural raw TreeAge −1 to +4 yr" was
+    wrong (KY was already −5.0 in this table; MS is +6.0). Raw TreeAge in natural stands splits by
+    wood group against bored ages: softwoods run OLD (NC +6.4 / +7.9, SC +5.7 / +6.3, MS +7.0 /
+    +4.2 yr), hardwoods YOUNG (NC −2.9, SC −1.4, KY −6.4). Stratum medians pass only where the two
+    cancel, and 72–92 % of links are proxies. Natural (k) is therefore INFO by state × wood group
+    × link method since r5.
   - **Reading**: planted strata are enforced (|bias| ≤ 5) and pass. In NATURAL stands the
     field-scale ages are biased young against bored ages, while the raw TreeAge is closer: the
     field-age truth available for natural stands (post-reset STDAGE) does not represent
@@ -549,7 +559,12 @@ Results (AL, KY whole-state; all verifier checks pass in both, incl. (d) monoton
 
   Determinism (steps 4–7 rerun) is EXCEPT-identical in all five states.
 
-### Round-4 ACCEPT + FLAG (2026-10-26, user; DECISIONS.md D6, D8–D12)
+### Round-4 ACCEPT + FLAG (2026-10-26, user; DECISIONS.md D6, D8–D12) — partly superseded in r5
+r5: the KY (k) entry and `known_bias_ky_natural_treeage` are retired (D13). The FL (j) entry is
+now keyed by fit scope, and its flag is `known_bias_fl_planted_model_10plus` (D24). D11 is moot:
+`*_natural_treeage_scale` counts `natural_treeage_scale` model ages only. The text below
+describes r4.
+
 The two r4 failures are accepted, flagged in the data, and guarded against drift. Every other
 cell and state stays strict.
 - **Verifier `KNOWN_EXCEPTIONS`** (`verify_curation_v2.py`; exact keys only):
@@ -609,6 +624,104 @@ cell and state stays strict.
   - AGB share known_bias: KY 0.997 (stdorg and simB; KY is almost entirely natural), FL 0.0.
     `share_natural_treeage_scale` is unchanged (KY 0.071 / 0.009).
   - The slim DB carries both new cohort columns and the flags.
+
+### Round-5 (2026-10-27; audit r4 on NC / SC / MS; DECISIONS.md D13–D24)
+Whole-state runs for AL, GA, KY, NC, SC, MS, TN and FL, plus a pooled FL + KY + MS DB: steps 1–11,
+a determinism rerun of steps 4–10, and the verifier. **0 FAIL in all nine.** Only the pool shows
+KNOWN cells (2).
+
+| Run | PASS | INFO | KNOWN | FAIL |
+|---|---|---|---|---|
+| AL, GA, TN, FL, NC, SC, MS | 59 | 10 | 0 | 0 |
+| KY | 56 | 13 | 0 | 0 |
+| pool FL + KY + MS | 70 | 17 | 2 | 0 |
+
+- **D13, natural site trees:** natural (k) is INFO, reported per state × wood group × link
+  method. Planted (k) stays enforced: AL 0.5, GA 2.1, TN 0.2, FL 0.8, NC 1.3, SC 1.3, MS 0.1
+  (KY n 17, INFO).
+  - Natural final-age median bias, softwood / hardwood (proxy links): NC +6.0 / −2.9,
+    SC +5.3 / −1.4, MS +7.2 / +2.7, AL +4.0 / −1.7, GA +3.7 / −2.1, TN +1.8 / −1.3,
+    KY +0.1 / −6.4, FL −0.8 (softwood).
+  - The KY KNOWN entry and the `known_bias_ky_natural_treeage` flag are retired, so KY natural
+    rows are back to `natural_treeage_scale`.
+- **D14 / D24, fit scope:** the KNOWN exceptions and the known-bias flags are keyed by FIT
+  SCOPE, the sorted STATECDs of the DB.
+  - Single-state FL now passes (j) planted 15+ in at −1.6 yr (r4: −3.5), so that entry and
+    the `…_15plus` flag are retired.
+  - Under the pooled fit, FL planted is −3.2 at 10–15 in (a newly failing cell) and −3.8 at
+    15+ in. Both are recorded for scope `12,21,28` and flagged
+    `known_bias_fl_planted_model_10plus` (88 live model ages in the pool).
+  - A scope with no entries (e.g. a Region-4 fit) is fully strict, so those cells must be
+    re-measured there.
+- **I-1, Sim B drops:**
+  - Drops now come only from members that are REAL records with DIA ≥ 5 in at the previous
+    visit and, if alive, at the visit. A tree that is alive at the visit but has shrunk below
+    5 in, or exists only as a gap slot, is neither a survivor nor a removal.
+  - A cohort's first Sim B row never carries a drop; that rule removed 0 drops.
+  - Drop rows before → after:
+
+    | AL | GA | TN | FL | KY | NC | SC | MS |
+    |---|---|---|---|---|---|---|---|
+    | 5,888 → 5,290 | 8,373 → 7,524 | 932 → 786 | 2,838 → 2,416 | 514 → 402 | 3,072 → 2,775 | 4,780 → 4,193 | 3,938 → 3,543 |
+
+  - New check (n2): every drop is backed by a real ≥ 5 in member that was removed, died or
+    severely damaged (DAMSEV > 40). 0 unbacked everywhere.
+- **M-1, one time axis:** every table's sim_year is anchored at the subplot's first scaffold
+  visit, and Sim A's re-base is gone.
+  - Before: Sim A vs Sim B differed on 407–3,440 shared subplot-visits per state (NC 1,667 of
+    52,474), and the trajectories went down to sim_year −19 to −27.
+  - After, (n1): 0 differences and sim_year 0 at the first visit in all nine runs.
+- **M-2, canonical plot key:** the dbconn views map renumbered plot visits to the key at the
+  PREV_PLT_CN chain's first annual visit, and `unitcd_raw` / `countycd_raw` / `plot_raw` keep
+  the recorded key.
+  - Remapped records (plots): AL 176 (2), FL 233 (3), GA 357 (4), KY 306 (5), MS 0, NC 754 (9),
+    SC 88 (2), TN 62 (2).
+  - GA `disappeared_inferred_removal`: 101 → 15 trees.
+  - (n6): 0 key mismatches against the verifier's own recursive-CTE map.
+- **M-3:** Sim B AGB, shares and drops are rounded and sorted. (e) now also covers
+  `curated_cohorts_landis_simB` and `cohort_disturbance`: EXCEPT-identical in all nine runs.
+- **M-4:** gap interpolation never fills a slot at, or across, an entirely nonforest visit.
+  GA: 10 slots no longer filled. (n3): 0.
+- **M-5, one age scale per tree:** `age_stratum` is the stratum at the tree's first live
+  record, and step 2's scale decisions use it.
+  - Trees whose live records span two STDORGCD codes: AL 8,250, GA 8,879, NC 11,059, MS 10,383,
+    SC 6,729, FL 5,033, TN 3,130, KY 458.
+  - (n5): 0 records differ, and 0 natural trees have mixed-scale candidates.
+- **M-6, cross-fitted production predictions:** training rows get their outer out-of-fold
+  prediction (AL 389,830 of 576,536 live rows).
+  - Planted 5–10 in model age minus the tree's own field age, mean / median: AL +0.05 / +0.68
+    → −0.02 / +0.62 yr; NC +0.57 / +1.22 → 0.00 / +0.92 yr.
+- **M-7:**
+  - The slim schema is ENFORCED: old columns are an exact prefix (verifier section 6, and
+    `slim_guard post` with `SLIM_REF`). It passes for all 8 slim tables.
+  - (c2) is re-derived from raw records with attribution: 0 flagged subplots lack an
+    attributed first dead/cut record.
+  - (b) takes the re-tally candidate set from raw FIADB; raw vs pipeline differ in 0 plot-visits
+    in every state.
+- **M-8, phantom biomass:** the sapling rate uses per-tree biomass from real rows only, and a
+  phantom is capped at its debut value. (n4): 0 phantoms exceed their debut value.
+  - Phantom AGB share, Sim A / trajectories, before → after:
+
+    | State | Sim A | Trajectories |
+    |---|---|---|
+    | AL | 0.0117 → 0.0092 | 0.0398 → 0.0360 |
+    | GA | 0.0074 → 0.0061 | 0.0268 → 0.0246 |
+    | TN | 0.0068 → 0.0058 | 0.0246 → 0.0228 |
+    | FL | 0.0116 → 0.0098 | 0.0385 → 0.0358 |
+    | KY | 0.0095 → 0.0088 | 0.0247 → 0.0237 |
+    | NC | 0.0099 → 0.0082 | 0.0292 → 0.0266 |
+    | SC | 0.0103 → 0.0081 | 0.0341 → 0.0314 |
+    | MS | 0.0081 → 0.0071 | 0.0290 → 0.0272 |
+
+- **Suspected false tree-number splits: not confirmed.** The only splits linked through a
+  STATUSCD 0 record (AL: 5) all show a dead record before, a species change or a large DIA drop.
+  No rule change; (n7) monitors it (0 without evidence).
+- **Other checks:**
+  - (d) planted is 0 non-monotone everywhere. Natural is INFO: TN 1/25 and FL 1/23 (r4 FL
+    5/23); the rest 0.
+  - (h) planted passes in AL, GA, TN, FL, NC, SC and MS (KY planted has 31 condition-visits:
+    INFO).
+  - (j) single-state FL passes all six cells.
 
 ---
 

@@ -2350,7 +2350,38 @@ FIX_COLUMNS = [
     "censor_last_measdate", "censor_last_reconcilecd", "censor_last_reason",
     "dead_at_first_visit", "estage_mapped", "age_domain",
     "rerecord_dead", "tree_key_split", "prev_status_cd", "prev_tre_cn",
+    "age_stratum", "unitcd_raw", "countycd_raw", "plot_raw",          # r5 M-5 / M-2
 ]
+
+
+def add_age_stratum(df: pl.DataFrame) -> pl.DataFrame:
+    """r5 M-5: ONE age scale per tree. A tree whose condition's STDORGCD flips between visits
+    used to mix the planted (field-scale mapped) and natural (raw TreeAge) scales in its anchor
+    candidates. age_stratum = 'planted' if the condition STDORGCD at the tree's FIRST LIVE record
+    is 1, else 'natural' (null / other codes = natural); a tree without any live record takes its
+    first record. Every age-scale decision in step 2 uses this column."""
+    first = (df.with_columns((pl.col("STATUSCD") != 1).alias("_nl"))
+               .sort(TREE_ID + ["_nl", "MEASDATE"])
+               .group_by(TREE_ID, maintain_order=True).first()
+               .select(TREE_ID + [pl.when(pl.col("cond_stdorgcd") == 1).then(pl.lit("planted"))
+                                  .otherwise(pl.lit("natural")).alias("age_stratum")]))
+    return df.join(first, on=TREE_ID, how="left")
+
+
+def add_raw_plot_keys(con, df: pl.DataFrame, st: int) -> pl.DataFrame:
+    """r5 M-2: the as-recorded plot key of each record (the stages see the canonical key)."""
+    raw = con.execute(f"""SELECT CAST(T.CN AS VARCHAR) AS _cn, m.UNITCD_RAW, m.COUNTYCD_RAW, m.PLOT_RAW
+        FROM fia.main.TREE T JOIN plot_canon_map m ON m.CN = CAST(T.PLT_CN AS VARCHAR)
+        WHERE T.STATECD = {int(st)}""").pl()
+    d = df.with_columns(pl.col("CN").cast(pl.Utf8).alias("_cn")).join(raw, on="_cn", how="left")
+    n = d.filter(pl.col("PLOT_RAW").is_not_null()).height
+    print(f"[step4p] canonical plot key: {n:,} records on renumbered plot visits "
+          f"({d.filter(pl.col('PLOT_RAW').is_not_null()).select(['STATECD','UNITCD','COUNTYCD','PLOT']).unique().height} plots)")
+    return d.with_columns(
+        pl.coalesce("UNITCD_RAW", "UNITCD").cast(pl.Int64).alias("unitcd_raw"),
+        pl.coalesce("COUNTYCD_RAW", "COUNTYCD").cast(pl.Int64).alias("countycd_raw"),
+        pl.coalesce("PLOT_RAW", "PLOT").cast(pl.Int64).alias("plot_raw"),
+    ).drop(["_cn", "UNITCD_RAW", "COUNTYCD_RAW", "PLOT_RAW"])
 
 
 def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
@@ -2400,6 +2431,7 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
             SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate
             FROM tree_landuse_exits WHERE STATECD = {int(st)}""").pl()
         df = _polars_steps(con, df, estage_raw, all_subplot_years, landuse_exits)
+        df = add_raw_plot_keys(con, add_age_stratum(df), st)
         df = df.select([c for c in df.columns if c not in FIX_COLUMNS]
                        + [c for c in FIX_COLUMNS if c in df.columns])   # age_domain: step 2
 

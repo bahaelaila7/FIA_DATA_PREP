@@ -6,7 +6,10 @@ old cohorts_simB.duckdb and which silently SKIPS a missing simB table.
 
   pre   --curated-db C --simb-db S --fiadb F   both sources exist, are not FIADB, and hold
                                                every table the builder copies
-  post  --slim OUT                             every expected table exists and is non-empty
+  post  --slim OUT [--ref-slim REF]            every expected table exists and is non-empty;
+                                               r5 M-7: with REF (a previous slim DB, read-only)
+                                               every REF table's columns are an exact prefix
+                                               (name, type, order) of OUT's: appended columns only
 """
 import argparse
 import os
@@ -34,7 +37,7 @@ def tables(path):
 ap = argparse.ArgumentParser()
 ap.add_argument("mode", choices=["pre", "post"])
 ap.add_argument("--curated-db"); ap.add_argument("--simb-db"); ap.add_argument("--fiadb")
-ap.add_argument("--slim")
+ap.add_argument("--slim"); ap.add_argument("--ref-slim")
 a = ap.parse_args()
 
 if a.mode == "pre":
@@ -76,3 +79,25 @@ else:
     if empty:
         sys.exit(f"[slim_guard] empty slim tables: {empty}")
     print("[slim_guard] post: all 8 slim tables present and non-empty")
+    if a.ref_slim:
+        def schema(path):
+            k = duckdb.connect(path, read_only=True)
+            out = {}
+            for tn, cn, dt in k.execute("SELECT table_name, column_name, data_type FROM duckdb_columns() "
+                                        "WHERE database_name=current_database() ORDER BY table_name, column_index").fetchall():
+                out.setdefault(tn, []).append((cn, dt))
+            k.close()
+            return out
+        so, sn = schema(a.ref_slim), schema(a.slim)
+        bad = []
+        for t, cols in so.items():
+            new = sn.get(t)
+            if new is None:
+                bad.append(f"{t}: missing")
+            elif new[:len(cols)] != cols:
+                bad.append(f"{t}: old columns changed (first diff "
+                           f"{next(((x, y) for x, y in zip(cols, new) if x != y), 'length')})")
+        if bad:
+            sys.exit(f"[slim_guard] slim schema NOT compatible with {a.ref_slim}: {bad}")
+        print(f"[slim_guard] post: schema compatible with the reference slim (old columns an exact prefix, "
+              f"{sum(len(sn[t]) - len(so[t]) for t in so)} appended columns)")
