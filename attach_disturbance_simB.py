@@ -1,9 +1,22 @@
 #!/usr/bin/env python
 """
 Attach disturbance_drop_pct onto curated_cohorts_landis_simB in the SEPARATE sim-B DB,
-computing the per-cohort partial-disturbance biomass-drop from the curated DB
-(tree_trajectories + curated_trees, read-only). Mirrors cohort_disturbance.py --attach
-but targets the sim B table; writes only the sim-B DB.
+computing the per-cohort disturbance biomass-drop from the curated DB (tree_trajectories +
+curated_trees, read-only); writes only the sim-B DB. It is the ONLY writer of `cohort_disturbance`.
+
+cohort_disturbance (the Pan consumer contract; r7 D42):
+  statecd, unitcd, countycd, plot, subp  BIGINT   canonical subplot key
+  species_symbol                         VARCHAR
+  measdate                               TIMESTAMP_MS  the visit (date at midnight; the type is
+                                                        kept for the slim schema prefix)
+  age_calc                               INTEGER  the cohort's age at the visit (Sim B axis)
+  disturbance_drop_pct                   DOUBLE   partial: (dropped / ACRE_M2) / (agb + dropped / ACRE_M2)
+                                                  with agb the Sim B row's g/m2 (D31); full removal: 1.0
+  dropped, would_be                      DOUBLE   the drop model's sums of drybio_g x TPA (g/acre)
+  n_disturbed, n_survivors               UINTEGER counted removals / surviving timber members
+  full_removal                           BOOLEAN  r7 D42: TRUE = every member is gone (no Sim B row
+                                                  at this key; the cohort was removed by the counted
+                                                  removals); FALSE = a partial drop on an existing row
 
 curation-fix 2026-10-26: explicit paths (dbconn): curated tables come from --curated-db,
 never from FIADB's old copies; no default paths.
@@ -26,12 +39,28 @@ print(f"OUT: {a.out_db}\nCURATED: {a.curated_db} (read-only)  states: {states or
 con = dbconn.connect(a.out_db, a.fiadb, curated_db=a.curated_db)
 dbconn.require_tables(con, "tree_trajectories", "curated_trees", TABLE)
 
-coh = cd.compute(cd.load(con, states), timber_only=True)   # r5 I-1: real >= 5 in members only
+coh = cd.compute(cd.load(con, states), timber_only=True,   # r5 I-1: real >= 5 in members only
+                 scaffold=cd.load_scaffold(con, states))   # r7 D42: the full visit axis (all-removed visits)
 cd.diagnostics(coh)
 
-con.register("_cd", coh.to_pandas())
-con.execute("CREATE OR REPLACE TABLE cohort_disturbance AS SELECT * FROM _cd")
+con.register("_cd", coh.to_arrow())
+con.execute("""CREATE OR REPLACE TABLE cohort_disturbance AS
+    SELECT statecd::BIGINT AS statecd, unitcd::BIGINT AS unitcd, countycd::BIGINT AS countycd,
+           plot::BIGINT AS plot, subp::BIGINT AS subp, species_symbol::VARCHAR AS species_symbol,
+           measdate::TIMESTAMP_MS AS measdate,          -- r7 C F16: the slim's (pre-existing) type, explicit
+           age_calc::INTEGER AS age_calc, disturbance_drop_pct::DOUBLE AS disturbance_drop_pct,
+           dropped::DOUBLE AS dropped, would_be::DOUBLE AS would_be,
+           n_disturbed::UINTEGER AS n_disturbed, n_survivors::UINTEGER AS n_survivors,
+           full_removal::BOOLEAN AS full_removal       -- r7 D42 (appended)
+    FROM _cd ORDER BY statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc""")
 con.unregister("_cd")
+# r7 D42: a full removal has no live member at the visit, so Sim B has no row at its key
+n_full_row = con.execute(f"""SELECT count(*) FROM cohort_disturbance d SEMI JOIN {TABLE} c
+    ON c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot AND c.subp=d.subp
+   AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc
+    WHERE d.full_removal""").fetchone()[0]
+if n_full_row:
+    raise SystemExit(f"[D42] {n_full_row} full-removal rows have a Sim B row at their key (must be 0)")
 # r5 I-1: a cohort's FIRST Sim B row has no previous Sim B state to drop from -> no drop there
 # (cohort = subplot x species x birth_sim_year, birth_sim_year = sim_year - age_calc)
 con.execute(f"""
@@ -58,13 +87,13 @@ con.execute(f"""
     UPDATE cohort_disturbance d
     SET disturbance_drop_pct = round((d.dropped / {ACRE_M2}) / (c.agb + d.dropped / {ACRE_M2}), 9)
     FROM {TABLE} c
-    WHERE c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
+    WHERE NOT d.full_removal AND c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
       AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc""")
 
 _meta = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
         "n_trees_known_bias", "share_known_bias"]
 _have = dbconn.column_names(con, TABLE)
-_ex = [c for c in ["disturbance_drop_pct", "procedural_break"] + _meta if c in _have]
+_ex = [c for c in ["disturbance_drop_pct", "procedural_break", "all_live_withdrawn_rc7"] + _meta if c in _have]
 keep = f"c.* EXCLUDE ({', '.join(_ex)})" if _ex else "c.*"   # idempotent re-attach, column order kept
 _meta_sel = "".join(f", c.{m}" for m in _meta if m in _have)   # r3 I4: after the old columns
 con.execute(f"""
@@ -74,14 +103,18 @@ con.execute(f"""
     LEFT JOIN cohort_disturbance d
       ON c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
       AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc
+      AND NOT d.full_removal
     ORDER BY c.statecd, c.unitcd, c.countycd, c.plot, c.subp, c.species_symbol, c.measdate, c.age_calc
 """)
-# curation-fix (audit I4): procedural re-tally flag, appended after disturbance_drop_pct
-from cohorts_landis import add_procedural_break
-add_procedural_break(con, TABLE)
+# curation-fix (audit I4) + r7 D39: the visit metadata (procedural_break, all_live_withdrawn_rc7),
+# appended after the age metadata
+from cohorts_landis import add_visit_flags
+add_visit_flags(con, TABLE)
 con.commit()
 tot = con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
 nz = con.execute(f"SELECT COUNT(*) FROM {TABLE} WHERE disturbance_drop_pct>0").fetchone()[0]
-print(f"[attach] {TABLE}.disturbance_drop_pct: {nz:,}/{tot:,} rows >0")
+nfull = con.execute("SELECT count(*) FROM cohort_disturbance WHERE full_removal").fetchone()[0]
+print(f"[attach] {TABLE}.disturbance_drop_pct: {nz:,}/{tot:,} rows >0; cohort_disturbance also holds "
+      f"{nfull:,} full-removal rows (D42; no Sim B row)")
 con.close()
 print("[done]")

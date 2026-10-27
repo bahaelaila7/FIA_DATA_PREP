@@ -14,12 +14,12 @@ Output table: curated_cohorts  (one row per cohort × MEASDATE)
   per-visit live  : n_trees_live, biomass_per_acre, estimated_age_mean/sd
   introduction    : first_measdate, intro_type
   per-interval    : n_harvested, n_disturbance_dead   (since last measurement)
-  damage          : pct_biomass_damaged  (live biomass from DAMSEV > 40 trees)
   cumulative      : ever_harvested, ever_disturbed_dead
+(r7 D44 / E25: the DAMSEV-based pct_biomass_damaged column is removed: DAMSEV is a 0-9 class
+code, never > 40, so it was always 0 (D25).)
 
 Standalone usage:
-    python cohort_tracking.py [path/to/fiadb.duckdb]
-    # default db path: ../data_eco_cohorts.duckdb
+    python cohort_tracking.py --out-db <curated.duckdb> --fiadb <FIADB.duckdb>
 
 Library usage:
     from cohort_tracking import build_cohorts
@@ -33,6 +33,8 @@ import sys
 import duckdb
 import numpy as np
 import polars as pl
+
+from cohorts_landis import disturbance_death_expr   # r7 D41: the one disturbance definition
 
 TREE_ID    = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE"]
 SUBPLOT_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP"]
@@ -163,64 +165,43 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
     Live-tree summary:
       n_trees_live, biomass_per_acre, estimated_age_mean, estimated_age_sd
 
-    Per-interval events (trees whose status changed since last measurement):
+    Per-interval events (a tree's FIRST dead/cut record; re-records, misrecorded deaths and,
+    r7 D38, first_record_dead records — first-seen deaths, not mortality of the interval — are
+    not events):
       n_harvested        trees with tree_fate in {harvest_explicit, harvest_inferred}
-      n_disturbance_dead trees with tree_fate == dead AND condition had a
-                         disturbance code (DSTRBCD != 0 and not null)
-
-    Damage fraction (live trees only):
-      pct_biomass_damaged  % of live biomass (DRYBIO_AG × TPA_UNADJ) from trees
-                           where DAMSEV1 > 40 OR DAMSEV2 > 40
-                           (DAMSEV treated as 0–100 percent severity per the
-                           user's threshold; verify against your FIA version)
+      n_disturbance_dead trees with tree_fate == dead under the ONE disturbance definition
+                         (r7 D41, cohorts_landis.disturbance_death_expr): AGENTCD 10-50 or a
+                         condition DSTRBCD other than 0 / 60
     """
     has_cohort = pl.col("cohort_id").is_not_null()
 
     # ---- Live trees ----
     live = df.filter((pl.col("STATUSCD") == 1) & has_cohort)
 
-    damaged = (
-        (pl.col("DAMSEV1").is_not_null() & (pl.col("DAMSEV1") > 40)) |
-        (pl.col("DAMSEV2").is_not_null() & (pl.col("DAMSEV2") > 40))
-    )
-
     live_agg = (
         live
-        .with_columns([
-            (pl.col("DRYBIO_AG") * pl.col("TPA_UNADJ")).alias("_bio"),
-            damaged.alias("_dmg"),
-        ])
+        .with_columns((pl.col("DRYBIO_AG") * pl.col("TPA_UNADJ")).alias("_bio"))
         .group_by(["cohort_id", "MEASDATE"])
         .agg([
             pl.len().alias("n_trees_live"),
             pl.col("_bio").sum().alias("biomass_per_acre"),
             pl.col("estimated_age").mean().alias("estimated_age_mean"),
             pl.col("estimated_age").std().alias("estimated_age_sd"),
-            # Damaged biomass (only where DRYBIO_AG is available)
-            pl.when(pl.col("_dmg") & pl.col("_bio").is_not_null())
-              .then(pl.col("_bio")).sum().alias("_damaged_bio"),
-            pl.col("_bio").filter(pl.col("_bio").is_not_null()).sum().alias("_total_bio"),
         ])
-        .with_columns(
-            pl.when(pl.col("_total_bio") > 0)
-            .then(100.0 * pl.col("_damaged_bio") / pl.col("_total_bio"))
-            .otherwise(pl.lit(0.0))
-            .alias("pct_biomass_damaged")
-        )
-        .drop(["_damaged_bio", "_total_bio"])
     )
 
     # ---- Dead / removed trees ----
     # r3 I1: only a tree's FIRST dead/cut record is an event; re-records are skipped
-    rerec = pl.col("rerecord_dead") if "rerecord_dead" in df.columns else pl.lit(False)
-    dead = df.filter(pl.col("STATUSCD").is_in([2, 3]) & has_cohort & ~rerec)
+    # r6 D26: a misrecorded death is not a death; r7 D38: a first_record_dead record is a
+    # first-seen death, not mortality of the cohort's interval
+    dead = df.filter(pl.col("STATUSCD").is_in([2, 3]) & has_cohort
+                     & ~pl.col("rerecord_dead").fill_null(False)
+                     & ~pl.col("misrecorded_death").fill_null(False)
+                     & ~pl.col("first_record_dead").fill_null(False))
 
-    # r3 M4: DSTRBCD 60 (vegetation / competition) is not a disturbance — same as elsewhere
-    disturbed_cond = (
-        (pl.col("DSTRBCD1").is_not_null() & ~pl.col("DSTRBCD1").is_in([0, 60])) |
-        (pl.col("DSTRBCD2").is_not_null() & ~pl.col("DSTRBCD2").is_in([0, 60])) |
-        (pl.col("DSTRBCD3").is_not_null() & ~pl.col("DSTRBCD3").is_in([0, 60]))
-    )
+    # r7 D41: THE disturbance-death definition (AGENTCD 10-50 or a DSTRBCD other than 0 / 60;
+    # r3 M4: DSTRBCD 60 is not a disturbance), shared with subp_has_dstrb / trajectories / drops
+    disturbed_cond = disturbance_death_expr()
 
     harvest_agg = (
         dead.filter(pl.col("tree_fate").str.starts_with("harvest"))
@@ -252,7 +233,6 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
         .with_columns([
             pl.col("n_trees_live").fill_null(0),
             pl.col("biomass_per_acre").fill_null(0.0),
-            pl.col("pct_biomass_damaged").fill_null(0.0),
             pl.col("n_harvested").fill_null(0),
             pl.col("n_disturbance_dead").fill_null(0),
         ])
@@ -271,6 +251,8 @@ def add_cumulative_flags(meas: pl.DataFrame) -> pl.DataFrame:
     measurement where the respective event occurred, forward through all
     subsequent measurements of the same cohort.
     """
+    # r7 D44 (F7-4): the joins before this do not guarantee row order; cum_sum needs date order
+    meas = meas.sort(["cohort_id", "MEASDATE"])
     return meas.with_columns([
         (pl.col("n_harvested").cum_sum().over("cohort_id") > 0)
           .alias("ever_harvested"),
@@ -411,7 +393,6 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
         "estimated_age_sd",
         "n_harvested",
         "n_disturbance_dead",
-        "pct_biomass_damaged",
         "ever_harvested",
         "ever_disturbed_dead",
     ]).sort(["cohort_id", "MEASDATE"])
@@ -456,8 +437,9 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
 # =============================================================================
 
 LOAD_COLS = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "estimated_age", "DRYBIO_AG",
-                       "TPA_UNADJ", "DAMSEV1", "DAMSEV2", "DSTRBCD1", "DSTRBCD2", "DSTRBCD3",
-                       "TRTCD1", "TRTCD2", "TRTCD3", "cond_stdorgcd", "rerecord_dead"]
+                       "TPA_UNADJ", "AGENTCD", "DSTRBCD1", "DSTRBCD2", "DSTRBCD3",
+                       "TRTCD1", "TRTCD2", "TRTCD3", "cond_stdorgcd", "rerecord_dead",
+                       "misrecorded_death", "first_record_dead"]
 
 if __name__ == "__main__":
     # curation-fix 2026-10-26: explicit paths (dbconn); cohort species = spcd_resolved

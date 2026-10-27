@@ -625,27 +625,50 @@ def build_cohorts_landis(con) -> pl.DataFrame:
 
 
 # =============================================================================
-# Propagate derived land_use + inventory cycle into curated_cohorts_landis
+# Propagate land_use (2-way) + land_use_4way + inventory cycle into curated_cohorts_landis
 # =============================================================================
 
+# r7: the attach-managed columns of curated_cohorts_landis, in schema order after the step-4
+# columns. Every attach rebuilds the table as <step-4 columns> + MANAGED, so a rerun of this
+# step alone keeps the column order (D F9) and the old schema stays an exact prefix:
+#   land_use, cycle (old), the age metadata (r3 I4 / r4), procedural_break (curation-fix I4),
+#   land_use_4way (r7 C F10), all_live_withdrawn_rc7 (r7 D39).
+AGE_META = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
+            "n_trees_known_bias", "share_known_bias"]
+MANAGED = ["land_use", "cycle", *AGE_META, "procedural_break", "land_use_4way", "all_live_withdrawn_rc7"]
+
+
 def attach_land_use_and_cycle(con) -> None:
-    """Add two columns to curated_cohorts_landis (SQL join, no polars rebuild needed):
-      - `land_use`: the DERIVED stand land use (reserved/plantation/managed/natural; see
-        build_tree_trajectories.derive_land_use). It is per-condition there, but we take the
-        per-PLOT dominant (most-frequent) value so it is MEASUREMENT-TIME INDEPENDENT — a stable
-        plot attribute usable as an ecoregion stratifier.
-      - `cycle`: the FIA inventory cycle, per (plot, measdate) from base_subplot_cond.
-    Requires tree_trajectories (land_use) + base_subplot_cond (CYCLE) to be present."""
-    con.execute("""
+    """Rebuild curated_cohorts_landis with (SQL join, no polars rebuild needed):
+      - `land_use` (r7 D44 / C F10): the 2-way STDORGCD label, the same rule as _stdorg / Sim B /
+        tree_trajectories (cohorts_landis.plot_land_use_sql; r6 carried the 4-way label here);
+      - `cycle`: the FIA inventory cycle, per (plot, measdate) from base_subplot_cond;
+      - `land_use_4way` (r7): the DERIVED management land use (reserved / plantation / managed /
+        natural; build_tree_trajectories.derive_land_use, per subplot there), as the per-PLOT
+        dominant (most frequent over trajectory rows, ties -> alphabetical) value, so it is a
+        stable plot attribute;
+      - the visit metadata procedural_break and all_live_withdrawn_rc7 (cohorts_landis.add_visit_flags).
+    Requires tree_trajectories (land_use_4way) + base_subplot_cond (CYCLE) + COND."""
+    import dbconn
+    from cohorts_landis import add_visit_flags, plot_land_use_sql
+    have = [r[0] for r in con.execute(
+        "SELECT column_name FROM duckdb_columns() WHERE database_name = current_database() "
+        "AND table_name = 'curated_cohorts_landis' ORDER BY column_index").fetchall()]
+    miss = [m for m in AGE_META if m not in have]
+    if miss:
+        raise SystemExit(f"curated_cohorts_landis lacks {miss}: rerun step 4 (cohorts_landis.py)")
+    base = ", ".join(f"c.{x}" for x in have if x.lower() not in {m.lower() for m in MANAGED})
+    con.execute(f"""
     CREATE OR REPLACE TABLE curated_cohorts_landis AS
-    WITH plot_lu AS (
-        SELECT statecd, unitcd, countycd, plot, land_use FROM (
-            SELECT statecd, unitcd, countycd, plot, land_use,
+    WITH plot_lu AS ({plot_land_use_sql(con)}),
+    plot_lu4 AS (
+        SELECT statecd, unitcd, countycd, plot, land_use_4way FROM (
+            SELECT statecd, unitcd, countycd, plot, land_use_4way,
                    ROW_NUMBER() OVER (PARTITION BY statecd, unitcd, countycd, plot
-                                      ORDER BY COUNT(*) DESC, land_use) AS rn
+                                      ORDER BY COUNT(*) DESC, land_use_4way) AS rn
             FROM tree_trajectories
-            WHERE land_use IS NOT NULL
-            GROUP BY statecd, unitcd, countycd, plot, land_use
+            WHERE land_use_4way IS NOT NULL
+            GROUP BY statecd, unitcd, countycd, plot, land_use_4way
         ) WHERE rn = 1
     ),
     plot_cycle AS (
@@ -654,22 +677,28 @@ def attach_land_use_and_cycle(con) -> None:
         FROM base_subplot_cond
         GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE
     )
-    SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major, n_trees_known_bias, share_known_bias),
+    SELECT {base},
            lu.land_use, cy.cycle,
            -- r3 I4: appended AFTER the old columns (old schema stays an exact prefix)
-           c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major, c.n_trees_known_bias, c.share_known_bias
+           {", ".join(f"c.{m}" for m in AGE_META)},
+           {"c.procedural_break" if "procedural_break" in have else "NULL::BOOLEAN AS procedural_break"},
+           lu4.land_use_4way,
+           {"c.all_live_withdrawn_rc7" if "all_live_withdrawn_rc7" in have else "NULL::BOOLEAN AS all_live_withdrawn_rc7"}
     FROM curated_cohorts_landis c
     LEFT JOIN plot_lu lu
         ON c.statecd=lu.statecd AND c.unitcd=lu.unitcd AND c.countycd=lu.countycd AND c.plot=lu.plot
+    LEFT JOIN plot_lu4 lu4
+        ON c.statecd=lu4.statecd AND c.unitcd=lu4.unitcd AND c.countycd=lu4.countycd AND c.plot=lu4.plot
     LEFT JOIN plot_cycle cy
         ON c.statecd=cy.statecd AND c.unitcd=cy.unitcd AND c.countycd=cy.countycd
         AND c.plot=cy.plot AND c.measdate=cy.measdate
     """)
+    add_visit_flags(con, "curated_cohorts_landis")   # fills the two visit-flag columns in place
     con.commit()
-    tot = con.execute("SELECT COUNT(*) FROM curated_cohorts_landis").fetchone()[0]
-    n_lu = con.execute("SELECT COUNT(*) FROM curated_cohorts_landis WHERE land_use IS NOT NULL").fetchone()[0]
-    n_cy = con.execute("SELECT COUNT(*) FROM curated_cohorts_landis WHERE cycle IS NOT NULL").fetchone()[0]
-    print(f"[land_use+cycle] land_use non-null {n_lu:,}/{tot:,}  ·  cycle non-null {n_cy:,}/{tot:,}")
+    tot, n_lu, n_lu4, n_cy = con.execute(
+        "SELECT COUNT(*), COUNT(land_use), COUNT(land_use_4way), COUNT(cycle) FROM curated_cohorts_landis").fetchone()
+    print(f"[land_use+cycle] land_use (2-way) non-null {n_lu:,}/{tot:,}  ·  land_use_4way non-null "
+          f"{n_lu4:,}/{tot:,}  ·  cycle non-null {n_cy:,}/{tot:,}")
 
 
 # =============================================================================
@@ -679,34 +708,23 @@ def attach_land_use_and_cycle(con) -> None:
 if __name__ == "__main__":
     # curation-fix 2026-10-26: explicit --out-db/--fiadb (dbconn). The production table is
     # built by cohorts_landis.py (v1: sim_year + subp_meas_num); this script is used with
-    # --attach-only to add land_use + cycle. Its own full build is kept (MEASDATE-fixed).
+    # --attach-only to add land_use + cycle.
+    # r7 D44 (C F9): the v2 full build is STALE (pre-D18 time axis, no backfill blocks, no age
+    # metadata) and refuses to run; its code is kept for reference only.
     import argparse
     import dbconn
     ap = dbconn.add_db_args(argparse.ArgumentParser(description="cohorts_landis2"))
     ap.add_argument("--attach-only", action="store_true",
-                    help="skip the rebuild; only add land_use + cycle")
+                    help="skip the rebuild; only add land_use + cycle (the only supported mode)")
     a = ap.parse_args()
     dbconn.check_args(a)
+    if not a.attach_only:
+        sys.exit("cohorts_landis2.py: the full rebuild is stale (pre-D18 axis, no backfill blocks) and "
+                 "refuses to run; build curated_cohorts_landis with cohorts_landis.py, then use --attach-only")
     con = dbconn.connect(a.out_db, a.fiadb)
     print(f"DB: {a.out_db}")
 
-    if not a.attach_only:
-        dbconn.require_tables(con, "curated_trees", "curated_cohorts")
-        cohorts = build_cohorts_landis(con)
-        con.register("_landis_view", cohorts)
-        con.execute(
-            "CREATE OR REPLACE TABLE curated_cohorts_landis AS SELECT * FROM _landis_view"
-        )
-        con.unregister("_landis_view")
-        con.commit()
-        print(f"\n[save] curated_cohorts_landis → {cohorts.height:,} rows")
-
-    dbconn.require_tables(con, "curated_cohorts_landis", "tree_trajectories", "base_subplot_cond")
-    have = dbconn.column_names(con, "curated_cohorts_landis")
-    drop = [c for c in ("land_use", "cycle") if c in have]
-    if drop:   # idempotent re-attach
-        con.execute("CREATE OR REPLACE TABLE curated_cohorts_landis AS "
-                    f"SELECT * EXCLUDE ({', '.join(drop)}) FROM curated_cohorts_landis")
+    dbconn.require_tables(con, "curated_cohorts_landis", "tree_trajectories", "base_subplot_cond", "COND", "product_visits")
     attach_land_use_and_cycle(con)
 
     con.close()

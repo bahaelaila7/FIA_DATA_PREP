@@ -19,9 +19,12 @@ def _():
 
 @app.cell
 def _(mo):
+    # r7 D44 (C F15): an EXPLICIT curated DB path (the curated-fix output DB). The old default
+    # pointed at FIADB, whose stale curated tables the fix hides.
     db_input = mo.ui.text(
-        value="../FIASQLITE2PGSQL/FIADB.duckdb",
-        label="Database path",
+        value="",
+        placeholder="path to a curated DB (e.g. .../cur.duckdb)",
+        label="Curated database path (required)",
         full_width=True,
     )
     return (db_input,)
@@ -35,6 +38,7 @@ def _(db_input):
 
 @app.cell
 def _(db_input, duckdb, mo):
+    mo.stop(not db_input.value.strip(), mo.md("_Enter the curated DB path above._"))
     try:
         _con = duckdb.connect(db_input.value, read_only=True)
 

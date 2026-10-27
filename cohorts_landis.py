@@ -3,8 +3,8 @@ cohorts_landis.py
 Curates FIA data into the format expected by the Pan/LANDIS-II Biomass
 Succession parametrization engine (Julia project).
 
-Source tables  : curated_trees, curated_cohorts  (from the FIA curation pipeline)
-Reference tables: data_plot_eco, REF_SPECIES, PLOT (FIA raw)
+Source tables  : curated_trees, clean_subplot_years, procedural_breaks, tree_censor_events (curation)
+Reference tables: data_plot_eco (epa_l3 / epa_l4 / ecosubcd), REF_SPECIES
 Output table   : curated_cohorts_landis
 
 Schema:
@@ -18,7 +18,8 @@ Schema:
   measdate                    DATE
   age_calc                    INTEGER  — estimated_age rounded to nearest year
   agb                         FLOAT    — DRYBIO_AG * TPA_UNADJ, converted lbs/acre → g/m²
-  subp_has_dstrb              BOOL     — True if subplot ever had harvest or disturbance death
+  subp_has_dstrb              BOOL     — True if the subplot ever had a cut / disturbance death /
+                                         inferred removal after its first visit (r7 D41)
   plot_meas_num               INTEGER  — distinct measurement years for this plot
 
 Biomass conversion: 1 lb/acre = 453.592/4046.86 ≈ 0.11208 g/m²
@@ -29,8 +30,7 @@ major_spgrpcd, and sftwd_hrdwd so Julia can compute effective_species on
 whatever subset it loads after its own SQL filters.
 
 Standalone usage:
-    python cohorts_landis.py [path/to/fiadb.duckdb]
-    # default: ../FIASQLITE2PGSQL/FIADB.duckdb
+    python cohorts_landis.py --out-db <curated.duckdb> --fiadb <FIADB.duckdb>
 """
 
 import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
@@ -49,7 +49,11 @@ LBS_ACRE_TO_G_M2 = 453.592 / 4046.86   # ≈ 0.11208
 
 # Phantom backfill thresholds
 MIN_PHANTOM_AGE   = 5    # skip trees whose expected age at first meas < this (noise)
-MIN_BACKFILL_AGB  = 2.0  # g/m² floor — don't generate rows below this biomass
+# r7 D44 (C F5): the phantom biomass floor has explicit units PER TABLE. Sim A agb is TPA-expanded
+# g/m2 (one tree's stand contribution), the trajectories' drybio_g is grams PER TREE; the two
+# floors are separate constants (values unchanged from r6: 2.0 in each table's own unit).
+MIN_BACKFILL_AGB  = 2.0  # g/m2 (Sim A, TPA-expanded) floor of a phantom row's agb
+MIN_BACKFILL_DRYBIO_G = 2.0  # g per tree (tree_trajectories drybio_g) floor of a phantom row
 SAPLING_DIA_MAX   = 5.0  # DIA threshold (inches) for microplot saplings used to estimate growth rates
 MIN_RATE_TREES    = 10   # min trees for species×epa_l3 rate; else fall back to spgrpcd
 
@@ -77,7 +81,13 @@ def _has_table(con, table: str) -> bool:
 # *_natural_treeage_scale = natural MODEL ages (the D11 KY special case went with D13).
 AGE_META_COLS = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
                  "n_trees_known_bias", "share_known_bias"]
-IS_NATURAL_MODEL = (pl.col("_age_domain") == "natural_treeage_scale").fill_null(False)  # D13: KY flag retired
+# D46 (r7, after D40 M-9 relabelled natural model ages with DIA < 5 in 'out_of_support'): D11's
+# "natural MODEL ages" = natural_treeage_scale, plus out_of_support model ages of a NATURAL tree
+# (age_stratum not 'planted'; planted out_of_support cells stay out). age_domain is null for
+# non-model ages, so both terms are model ages only.
+IS_NATURAL_MODEL = ((pl.col("_age_domain") == "natural_treeage_scale")
+                    | ((pl.col("_age_domain") == "out_of_support")
+                       & (pl.col("_age_stratum") != "planted").fill_null(True))).fill_null(False)
 IS_KNOWN_BIAS = pl.col("_age_domain").str.starts_with("known_bias_").fill_null(False)
 AGE_META_EXPRS = [
     IS_NATURAL_MODEL.cast(pl.Int64).alias("n_trees_natural_treeage_scale"),
@@ -95,29 +105,13 @@ AGE_META_EXPRS = [
 def load_base_data(con) -> pl.DataFrame:
     """
     One row per live tree × measurement visit.
-    Joins: data_plot_eco (epa_l3, optionally epa_l4), PLOT (ecosubcd), REF_SPECIES.
+    Joins: data_plot_eco (epa_l3, optionally epa_l4, ecosubcd), REF_SPECIES.
     """
     has_l4      = _has_column(con, "data_plot_eco", "epa_l4")
     epa_l4_expr = "e.epa_l4" if has_l4 else "NULL::VARCHAR AS epa_l4"
-
-    has_ecosubcd = _has_table(con, "PLOT") and _has_column(con, "PLOT", "ECOSUBCD")
-    if has_ecosubcd:
-        ecosubcd_join = """
-        LEFT JOIN (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT,
-                   FIRST(ECOSUBCD) AS ecosubcd
-            FROM PLOT
-            GROUP BY STATECD, UNITCD, COUNTYCD, PLOT
-        ) plt
-            ON  plt.STATECD  = t.STATECD
-            AND plt.UNITCD   = t.UNITCD
-            AND plt.COUNTYCD = t.COUNTYCD
-            AND plt.PLOT     = t.PLOT
-        """
-        ecosubcd_col = "plt.ecosubcd"
-    else:
-        ecosubcd_join = ""
-        ecosubcd_col  = "NULL::VARCHAR AS ecosubcd"
+    # r7 D44 (C F6): ECOSUBCD lives in data_plot_eco (FIADB PLOT has no such column, so the old
+    # PLOT lookup was 100 % NULL); data_plot_eco is dbconn's D28 view (latest visit's location)
+    ecosubcd_col = "e.ecosubcd::VARCHAR AS ecosubcd"
 
     df = con.execute(f"""
         SELECT
@@ -130,6 +124,7 @@ def load_base_data(con) -> pl.DataFrame:
             t.RECONCILECD::INTEGER                 AS rc_obs,
             t.age_source                           AS _age_source,     -- r3 I4
             t.age_domain                           AS _age_domain,
+            t.age_stratum                          AS _age_stratum,    -- D46
             ROUND(t.estimated_age)::INTEGER        AS age_calc,
             (t.DRYBIO_AG * t.TPA_UNADJ
              * {LBS_ACRE_TO_G_M2})::DOUBLE         AS agb,
@@ -146,7 +141,6 @@ def load_base_data(con) -> pl.DataFrame:
             AND e.unitcd   = t.UNITCD
             AND e.countycd = t.COUNTYCD
             AND e.plot     = t.PLOT
-        {ecosubcd_join}
         LEFT JOIN REF_SPECIES r
             ON  r.SPCD = t.spcd_resolved
         WHERE
@@ -168,37 +162,126 @@ def load_base_data(con) -> pl.DataFrame:
 
 
 # =============================================================================
-# Step 2: subplot-level disturbance flag
+# Step 2: disturbance events (r7 D41: ONE definition) + the subplot flag
 # =============================================================================
+# A DISTURBANCE DEATH is a death (tree_fate 'dead') with AGENTCD in DISTURBANCE_AGENTS
+# (10 insect, 20 disease, 30 fire, 40 animal, 50 weather) OR a condition DSTRBCD1-3 at that
+# record that is present and not 0 / 60 (60 = vegetation / competition, r3 M4). 70 unknown and
+# 80 silvicultural are not disturbance agents (80 = harvest, classified upstream as a cut).
+# The SAME definition drives:
+#   * subp_has_dstrb (Sim A, Sim B, tree_trajectories: build_subp_has_dstrb),
+#   * cohort_tracking's n_disturbance_dead (curated_cohorts),
+#   * tree_trajectories' terminal_fate 'dead_disturbance',
+#   * the Sim B drops (cohort_disturbance: a removal counts only at its event visit).
+DISTURBANCE_AGENTS = (10, 20, 30, 40, 50)
+NON_DISTURBANCE_DSTRBCD = (0, 60)
+HARVEST_FATES = ("harvest_explicit", "harvest_inferred")
 
-def build_subp_has_dstrb(con) -> pl.DataFrame:
-    """
-    subp_has_dstrb = True for any subplot where at least one cohort was ever
-    harvested or suffered disturbance-related mortality (from curated_cohorts).
 
-    This flag is conservative: once True it never resets, so all measurements
-    of a disturbed subplot are excluded when Julia applies skip_disturbances=true.
-    """
-    cohorts = con.execute("""
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP,
-               ever_harvested, ever_disturbed_dead
-        FROM curated_cohorts
+def disturbance_death_sql(alias: str = "") -> str:
+    """SQL boolean: the record's death is a disturbance death (D41); `alias` = table alias."""
+    a = f"{alias}." if alias else ""
+    ag = ", ".join(map(str, DISTURBANCE_AGENTS))
+    nd = ", ".join(map(str, NON_DISTURBANCE_DSTRBCD))
+    return (f"(COALESCE({a}AGENTCD IN ({ag}), FALSE)"
+            + "".join(f" OR COALESCE({a}DSTRBCD{i} NOT IN ({nd}), FALSE)" for i in (1, 2, 3)) + ")")
+
+
+def disturbance_death_expr() -> pl.Expr:
+    """polars twin of disturbance_death_sql (columns AGENTCD, DSTRBCD1-3)."""
+    e = pl.col("AGENTCD").is_in(list(DISTURBANCE_AGENTS)).fill_null(False)
+    for i in (1, 2, 3):
+        c = pl.col(f"DSTRBCD{i}")
+        e = e | (c.is_not_null() & ~c.is_in(list(NON_DISTURBANCE_DSTRBCD))).fill_null(False)
+    return e
+
+
+def disturbance_events(con, states=None) -> pl.DataFrame:
+    """r7 D41 / D38: one row per tree with a disturbance REMOVAL event (TREE_ID + event_measdate,
+    event_kind, first_record_dead). The event is
+      * 'cut' / 'disturbance_death': the tree's FIRST dead / cut record (misrecorded deaths, D26,
+        are not records of death; a first record that is a re-record, PREV_STATUS_CD = 2, is not
+        an event: the death preceded the record's interval), with tree_fate harvest_explicit /
+        harvest_inferred, or tree_fate 'dead' under the disturbance definition above. A cut on
+        now-nonforest land is 'diverted_landuse' (r3 M6), not a cut event.
+      * 'inferred_removal': final_tree_fate 'disappeared_inferred_removal' (alive at the last
+        record, the subplot revisited without it; death_cause harvest_inferred) at the FIRST
+        scaffold visit after the tree's last record.
+    first_record_dead (D38, from curated_trees) is carried so consumers can exclude first-seen
+    deaths from mortality and drops."""
+    import dbconn
+    dbconn.require_tables(con, "curated_trees", "clean_subplot_years")
+    need = {"first_record_dead", "misrecorded_death", "rerecord_dead", "final_tree_fate"}
+    miss = need - dbconn.column_names(con, "curated_trees")
+    if miss:
+        raise SystemExit(f"curated_trees lacks {sorted(miss)} (r7 D38 / D41 need them; rerun step 1)")
+    ws = dbconn.state_filter(states, col="STATECD", prefix="AND")
+    harv = ", ".join(f"'{f}'" for f in HARVEST_FATES)
+    return con.execute(f"""
+        WITH fd AS (
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE, tree_fate,
+                   COALESCE(rerecord_dead, FALSE) AS _rerec,
+                   COALESCE(first_record_dead, FALSE) AS first_record_dead,
+                   {disturbance_death_sql()} AS _dist
+            FROM curated_trees
+            WHERE STATUSCD IN (2, 3) AND NOT COALESCE(misrecorded_death, FALSE) {ws}
+            QUALIFY row_number() OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
+                                       ORDER BY MEASDATE) = 1),
+        ev_dead AS (
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS event_measdate,
+                   CASE WHEN tree_fate IN ({harv}) THEN 'cut' ELSE 'disturbance_death' END AS event_kind,
+                   first_record_dead
+            FROM fd
+            WHERE NOT _rerec AND (tree_fate IN ({harv}) OR (tree_fate = 'dead' AND _dist))),
+        dis AS (
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, max(MEASDATE) AS _last
+            FROM curated_trees
+            WHERE final_tree_fate = 'disappeared_inferred_removal' AND NOT COALESCE(misrecorded_death, FALSE) {ws}
+            GROUP BY ALL),
+        ev_dis AS (
+            SELECT d.STATECD, d.UNITCD, d.COUNTYCD, d.PLOT, d.SUBP, d.TREE, min(v.MEASDATE) AS event_measdate,
+                   'inferred_removal' AS event_kind, FALSE AS first_record_dead
+            FROM dis d JOIN clean_subplot_years v
+              ON v.STATECD = d.STATECD AND v.UNITCD = d.UNITCD AND v.COUNTYCD = d.COUNTYCD
+             AND v.PLOT = d.PLOT AND v.SUBP = d.SUBP AND v.MEASDATE > d._last
+            GROUP BY ALL)
+        SELECT * FROM ev_dead UNION ALL SELECT * FROM ev_dis
+        ORDER BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
     """).pl()
 
-    subp_flag = (
-        cohorts
-        .group_by(SUBPLOT_ID)
-        .agg(
-            (pl.col("ever_harvested").cast(pl.Boolean).any() |
-             pl.col("ever_disturbed_dead").cast(pl.Boolean).any())
-            .alias("subp_has_dstrb")
-        )
-    )
 
+def build_subp_has_dstrb(con, states=None) -> pl.DataFrame:
+    """
+    subp_has_dstrb (r7 D41) = True for a subplot with at least one disturbance event
+    (disturbance_events: a cut, a disturbance death, or an inferred removal) dated AFTER the
+    subplot's first scaffold visit. Trees without a live / aged record (no cohort) count too,
+    so a tree first seen dead or cut after the first visit sets the flag (C F17); a tree
+    already dead at the subplot's first visit is not an observed event.
+    first_record_dead events are NOT excluded here: the flag marks disturbed subplots, it is
+    not mortality attributed to an interval (D38 governs mortality and drops).
+
+    One definition for Sim A, Sim B and tree_trajectories (it used to come from curated_cohorts'
+    DSTRBCD-only deaths, while the drops used AGENTCD too, so 8-32 % of drop rows sat on
+    "undisturbed" subplots, C F1). Conservative: once True it never resets, so all
+    measurements of a disturbed subplot are excluded when Julia applies skip_disturbances=true.
+    Returns SUBPLOT_ID + subp_has_dstrb for every scaffold subplot.
+    """
+    import dbconn
+    ev = disturbance_events(con, states)
+    ws = dbconn.state_filter(states, col="STATECD", prefix="WHERE")
+    first = con.execute(f"""SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, min(MEASDATE) AS _first_visit
+                            FROM clean_subplot_years {ws} GROUP BY ALL""").pl()
+    flagged = (ev.join(first, on=SUBPLOT_ID, how="inner")
+                 .filter(pl.col("event_measdate") > pl.col("_first_visit"))
+                 .select(SUBPLOT_ID).unique().with_columns(pl.lit(True).alias("subp_has_dstrb")))
+    subp_flag = (first.select(SUBPLOT_ID).join(flagged, on=SUBPLOT_ID, how="left")
+                 .with_columns(pl.col("subp_has_dstrb").fill_null(False)))
     n_total = subp_flag.height
     n_dstrb = subp_flag.filter(pl.col("subp_has_dstrb")).height
-    print(f"[step2] subp_has_dstrb: {n_dstrb:,}/{n_total:,} subplots disturbed "
-          f"({100 * n_dstrb / max(n_total, 1):.1f}%)")
+    by_kind = dict(ev.group_by("event_kind").len().iter_rows())
+    print(f"[step2] subp_has_dstrb (D41): {n_dstrb:,}/{n_total:,} subplots disturbed "
+          f"({100 * n_dstrb / max(n_total, 1):.1f}%); events by kind {by_kind}, "
+          f"{ev.filter(pl.col('first_record_dead')).height:,} on first_record_dead trees")
     return subp_flag
 
 
@@ -686,6 +769,16 @@ def scaffold_visits(df: pl.DataFrame, ctx) -> pl.DataFrame:
             .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"}))
 
 
+def nonforest_for(is_sap: pl.Expr, fill: bool = False) -> pl.Expr:
+    """r7 C F4: the (n) nonforest test of a visit for a tree: sapling debuts (microplot) look at
+    the microplot forest proportion only, other trees at subplot + microplot. `fill`: a visit
+    missing from the scaffold counts as nonforest."""
+    micro, comb = pl.col("_micro_prop"), pl.col("_forest_prop")
+    if fill:
+        micro, comb = micro.fill_null(0), comb.fill_null(0)
+    return pl.when(is_sap).then(micro <= 0).otherwise(comb <= 0)
+
+
 def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) -> pl.DataFrame:
     """Drop candidate phantom slots per the rules above. `prior` carries SUBPLOT_ID, the
     debut MEASDATE (D), prior_measdate and the BF_FLAGS; `key` identifies a slot and
@@ -698,11 +791,14 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
     prior = prior.filter(~pl.col("_bf_none"))
     n_none = n0 - prior.height
 
-    # (n) nonforest: latest entirely-nonforest scaffold visit before D (full scaffold, M1)
-    nf = visit.filter(pl.col("_forest_prop") <= 0).select(SUBPLOT_ID + [pl.col("prior_measdate").alias("_nfd")])
-    last_nf = (prior.select(list(dict.fromkeys(owner + ["MEASDATE"]))).unique()
+    # (n) nonforest: latest entirely-nonforest scaffold visit before D (full scaffold, M1).
+    # r7 D44 (C F4): a SAPLING debut (tallied on the microplot) tests the MICROPLOT forest
+    # proportion alone (a microplot sapling cannot have been a forest tree where the microplot
+    # was entirely nonforest, even if the subplot was not); other trees test subplot + microplot.
+    nf = visit.select(SUBPLOT_ID + [pl.col("prior_measdate").alias("_nfd"), "_forest_prop", "_micro_prop"])
+    last_nf = (prior.select(list(dict.fromkeys(owner + ["MEASDATE", "_bf_sap"]))).unique()
                .join(nf, on=SUBPLOT_ID, how="inner")
-               .filter(pl.col("_nfd") < pl.col("MEASDATE"))
+               .filter((pl.col("_nfd") < pl.col("MEASDATE")) & nonforest_for(pl.col("_bf_sap")))
                .group_by(owner).agg(pl.col("_nfd").max().alias("_last_nf")))
     prior = prior.join(last_nf, on=owner, how="left")
     n1 = prior.height
@@ -775,6 +871,16 @@ def tree_prior_candidates(df: pl.DataFrame, ctx, rule_c: bool = True) -> pl.Data
     return apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"], rule_c=rule_c)
 
 
+def report_phantom_floor(missing: pl.DataFrame, col: str, floor: float, unit: str, tag: str) -> None:
+    """r7 C F5: the floor log counts the two causes separately (r6 printed every floored row as
+    'no sapling rate'): no rate for the tree's species / group, or the decay reached the floor."""
+    at = pl.col(col) == floor
+    n_nr = missing.filter(at & pl.col("_no_rate")).height
+    n_dec = missing.filter(at & ~pl.col("_no_rate")).height
+    print(f"[{tag}] phantom floor {floor} {unit}: {n_nr:,} slots without a sapling rate, "
+          f"{n_dec:,} slots decayed to the floor (of {missing.height:,})")
+
+
 def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFrame:
     """prior_agb = min(agb, max(MIN_BACKFILL_AGB, agb * (1 - rate * years_back)))."""
     # Sim A agb is TPA-expanded (g/m2); the rates are recorded once (tree pass) as sapling_growth_rates
@@ -787,6 +893,7 @@ def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFr
         .join(glb_rates.rename({"rate": "_r_glb"}), on="spgrpcd",                    how="left")
         .with_columns(pl.coalesce(["_r_sp", "_r_grp", "_r_glb"]).alias("_rate"))
         .drop(["_r_sp", "_r_grp", "_r_glb"])
+        .with_columns(pl.col("_rate").is_null().alias("_no_rate"))
         .with_columns(
             pl.when(pl.col("_rate").is_not_null())
             .then(
@@ -803,10 +910,8 @@ def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFr
         )
         .drop("_rate")
     )
-    n_no_rate = missing.filter(pl.col("prior_agb") == MIN_BACKFILL_AGB).height
-    if n_no_rate > 0:
-        print(f"[{tag}] {n_no_rate:,} slots used MIN_BACKFILL_AGB floor (no sapling rate)")
-    return missing
+    report_phantom_floor(missing, "prior_agb", MIN_BACKFILL_AGB, "g/m2", tag)
+    return missing.drop("_no_rate")
 
 
 def _to_synthetic(missing: pl.DataFrame) -> pl.DataFrame:
@@ -902,7 +1007,9 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
                .filter((pl.col("_cdate") > pl.col("prior_measdate")) & (pl.col("_cdate") <= pl.col("MEASDATE")))
                .select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
                .with_columns(pl.lit(True).alias("_cen")))
-        forest = ctx["visit"].select(SUBPLOT_ID + ["prior_measdate", "_forest_prop"])
+        forest = ctx["visit"].select(SUBPLOT_ID + ["prior_measdate", "_forest_prop", "_micro_prop"])
+        sap = df.select(TREE_ID + ["_bf_sap"]).sort(TREE_ID + ["_bf_sap"]).unique(subset=TREE_ID, keep="first") if "_bf_sap" in df.columns \
+            else df.select(TREE_ID).unique().with_columns(pl.lit(False).alias("_bf_sap"))
         dd = (cand.select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
               .join(ctx["dead"], on=TREE_ID, how="inner")
               .filter((pl.col("_dd") >= pl.col("prior_measdate")) & (pl.col("_dd") <= pl.col("MEASDATE")))
@@ -910,9 +1017,12 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
               .with_columns(pl.lit(True).alias("_dead_between")))
         cand = (cand.join(cen, on=TREE_ID + ["prior_measdate", "MEASDATE"], how="left")
                 .join(dd, on=TREE_ID + ["prior_measdate", "MEASDATE"], how="left")
-                .join(forest, on=SUBPLOT_ID + ["prior_measdate"], how="left"))
+                .join(forest, on=SUBPLOT_ID + ["prior_measdate"], how="left")
+                .join(sap, on=TREE_ID, how="left"))
+        # r7 C F4: a sapling member needs a forest MICROPLOT at p (same rule as (n))
         gap_ok = ((pl.col("prior_measdate") > pl.col("_D")) & pl.col("_cen").is_null()
-                  & pl.col("_dead_between").is_null() & (pl.col("_forest_prop").fill_null(0) > 0))
+                  & pl.col("_dead_between").is_null()
+                  & ~nonforest_for(pl.col("_bf_sap").fill_null(False), fill=True))
     else:
         gap_ok = pl.lit(True)
     surv = cand.filter(
@@ -942,24 +1052,94 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
     return pl.concat([df, synthetic.select(df.columns)], how="vertical"), sources
 
 
-def add_procedural_break(con, table: str) -> None:
-    """Append `procedural_break` (BOOL) to a cohort table: TRUE on rows whose (plot,
-    measdate) is a procedural re-tally visit (STATUSCD=0 + RC8 closures on the plot), so
-    consumers can tell a re-tally from cohort death + establishment (audit I4). Appended
-    as the LAST column (idempotent), so readers of the old schema are unaffected."""
+def set_visit_flag(con, table: str, col: str, visits_sql: str, what: str) -> None:
+    """Set a per-(plot, measdate) BOOL `col` on a cohort table: TRUE on rows whose plot visit is in
+    `visits_sql` (STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE). An existing column is replaced IN
+    PLACE (its position kept, so step reruns never reorder the schema: r7 D F9); a new one is
+    APPENDED as the last column, so readers of the old schema are unaffected."""
     import dbconn
-    dbconn.require_tables(con, "procedural_breaks", table)
-    keep = "c.* EXCLUDE (procedural_break)" if "procedural_break" in dbconn.column_names(con, table) else "c.*"
+    have = dbconn.column_names(con, table)
+    flag = f"(b.PLOT IS NOT NULL) AS {col}"
+    sel = f"c.* REPLACE ({flag})" if col.lower() in have else f"c.*, {flag}"
     con.execute(f"""
         CREATE OR REPLACE TABLE {table} AS
-        SELECT {keep}, (b.PLOT IS NOT NULL) AS procedural_break
+        SELECT {sel}
         FROM {table} c
-        LEFT JOIN (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM procedural_breaks) b
+        LEFT JOIN (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM ({visits_sql})) b
           ON b.STATECD=c.statecd AND b.UNITCD=c.unitcd AND b.COUNTYCD=c.countycd
          AND b.PLOT=c.plot AND b.MEASDATE=c.measdate
     """)
-    n = con.execute(f"SELECT count(*) FILTER (WHERE procedural_break), count(*) FROM {table}").fetchone()
-    print(f"[procedural_break] {table}: {n[0]:,}/{n[1]:,} rows at a procedural re-tally visit")
+    n = con.execute(f"SELECT count(*) FILTER (WHERE {col}), count(*) FROM {table}").fetchone()
+    print(f"[{col}] {table}: {n[0]:,}/{n[1]:,} rows at {what}")
+
+
+def add_procedural_break(con, table: str) -> None:
+    """`procedural_break` (BOOL): TRUE on rows whose (plot, measdate) is a procedural re-tally
+    visit (procedural_breaks), so consumers can tell a re-tally from cohort death +
+    establishment (audit I4)."""
+    import dbconn
+    dbconn.require_tables(con, "procedural_breaks", table)
+    set_visit_flag(con, table, "procedural_break", "SELECT * FROM procedural_breaks",
+                   "a procedural re-tally visit")
+
+
+def add_rc7_withdrawn_flag(con, table: str) -> None:
+    """r7 D39: `all_live_withdrawn_rc7` (BOOL): TRUE on rows at a plot visit whose live trees FIA
+    all withdrew as erroneously tallied (RC7; the flag comes from curated_trees). Such a visit
+    keeps its dead / cut tally and its scaffold row, so its cohort rows are phantoms only; the
+    visit is NOT dropped (consumers decide, e.g. genveg treats it as incomplete)."""
+    import dbconn
+    dbconn.require_tables(con, "curated_trees", table)
+    if "all_live_withdrawn_rc7" not in dbconn.column_names(con, "curated_trees"):
+        raise SystemExit("curated_trees lacks all_live_withdrawn_rc7 (r7 D39; rerun step 1)")
+    src = "SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM curated_trees WHERE all_live_withdrawn_rc7"
+    if dbconn.table_exists(con, "rc7_withdrawn_visits"):   # step 1's visit list: also visits left with no record
+        src += " UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM rc7_withdrawn_visits"
+    set_visit_flag(con, table, "all_live_withdrawn_rc7", src,
+                   "a visit whose live trees were all withdrawn (RC7)")
+
+
+def add_visit_flags(con, table: str) -> None:
+    """The cohort tables' visit metadata, in schema order: procedural_break, then (r7)
+    all_live_withdrawn_rc7."""
+    add_procedural_break(con, table)
+    add_rc7_withdrawn_flag(con, table)
+
+
+def plot_land_use_sql(con) -> str:
+    """r7 D44 (C F10) / D43: THE 2-way land_use per plot, for every table (Sim A, _stdorg, Sim B,
+    tree_trajectories): 'artificial' iff any condition of the plot's PRODUCT visits has
+    STDORGCD = 1, else 'natural' (plots without any STDORGCD get no row -> NULL land_use).
+    Only the COND rows whose PLT_CN is a visit of the curated product count (`product_visits`,
+    step 1; the same visit set export_reference_tables copies): a periodic plot that reused the
+    key (KY 1986-88) no longer flips natural plots to artificial (D43).
+    Columns: statecd, unitcd, countycd, plot, land_use."""
+    # the literal state list lets the scan of the (FIADB-wide) COND view prune by STATECD
+    st = ",".join(str(int(r[0])) for r in con.execute(
+        "SELECT DISTINCT STATECD FROM product_visits ORDER BY 1").fetchall()) or "NULL"
+    return f"""
+        SELECT c.STATECD AS statecd, c.UNITCD AS unitcd, c.COUNTYCD AS countycd, c.PLOT AS plot,
+               CASE WHEN MAX(c.STDORGCD) = 1 THEN 'artificial' ELSE 'natural' END AS land_use
+        FROM COND c
+        WHERE c.STATECD IN ({st}) AND c.STDORGCD IS NOT NULL
+          AND CAST(c.PLT_CN AS VARCHAR) IN (SELECT PLT_CN FROM product_visits)
+        GROUP BY ALL"""
+
+
+def record_rate_scope(con) -> None:
+    """r7 D44 (C F13): the sapling growth rates pool every tree in the DB (species x L3, then
+    species group x L3, then species group), so phantom biomass depends on the run's state set;
+    record that pool in run_scope.sapling_rate_scope (= the STATECDs [and county subset] of the
+    run, i.e. run_scope itself)."""
+    import dbconn
+    if not dbconn.table_exists(con, "run_scope"):
+        raise SystemExit("run_scope missing (written by step 1)")
+    st = ",".join(str(r[0]) for r in con.execute(
+        "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall())
+    con.execute("ALTER TABLE run_scope ADD COLUMN IF NOT EXISTS sapling_rate_scope VARCHAR")
+    con.execute("UPDATE run_scope SET sapling_rate_scope = ? || COALESCE('|counties=' || CAST(counties AS VARCHAR), '')",
+                [f"pooled over all trees of states {st}"])
+    print("[rate scope]", con.execute("SELECT sapling_rate_scope FROM run_scope").fetchall())
 
 
 # =============================================================================
@@ -1226,7 +1406,7 @@ if __name__ == "__main__":
     a = dbconn.add_db_args(argparse.ArgumentParser(description="curated_cohorts_landis")).parse_args()
     dbconn.check_args(a)
     con = dbconn.connect(a.out_db, a.fiadb)
-    dbconn.require_tables(con, "curated_trees", "curated_cohorts", "clean_subplot_years")
+    dbconn.require_tables(con, "curated_trees", "clean_subplot_years")
     print(f"DB: {a.out_db}")
 
     cohorts = build_cohorts_landis(con)
@@ -1244,6 +1424,7 @@ if __name__ == "__main__":
         con.register("_rate_view", RATE_TABLES["simA"])
         con.execute("CREATE OR REPLACE TABLE sapling_growth_rates_simA AS SELECT * FROM _rate_view")
         con.unregister("_rate_view")
+    record_rate_scope(con)   # r7 C F13
     con.unregister("_src_view")
     tsrc = PHANTOM_TREE_SOURCES if PHANTOM_TREE_SOURCES is not None else pl.DataFrame(
         schema={**{k: pl.Int64 for k in TREE_ID}, "prior_measdate": pl.Date,

@@ -69,7 +69,7 @@ def build(con) -> pl.DataFrame:
 
     df = df.rename({"STATECD": "statecd", "UNITCD": "unitcd", "COUNTYCD": "countycd",
                     "PLOT": "plot", "SUBP": "subp", "MEASDATE": "measdate"}).select(
-        OUT_COLS + ["_age_source", "_age_domain"])
+        OUT_COLS + ["_age_source", "_age_domain", "_age_stratum"])   # D46: _age_stratum for IS_NATURAL_MODEL
 
     # Aggregate into cohorts: sum agb over trees sharing (subplot, species, age, visit).
     # r3 I4: + n_trees_natural_treeage_scale, AGB-weighted share_natural_treeage_scale and the
@@ -108,7 +108,7 @@ if __name__ == "__main__":
     print(f"OUT: {a.out_db}\nCURATED: {a.curated_db} (read-only)\nFIA: {a.fiadb} (read-only)")
     # temp views: raw tables -> FIADB, curated tables -> the curated DB (never FIADB's old ones)
     con = dbconn.connect(a.out_db, a.fiadb, curated_db=a.curated_db)
-    dbconn.require_tables(con, "curated_trees", "curated_cohorts", "base_subplot_cond")
+    dbconn.require_tables(con, "curated_trees", "clean_subplot_years", "base_subplot_cond", "COND", "product_visits")
 
     cohorts = build(con)
 
@@ -116,19 +116,17 @@ if __name__ == "__main__":
     con.execute(f"CREATE OR REPLACE TABLE {TABLE}_base AS SELECT * FROM _simB_view")
     con.unregister("_simB_view")
 
-    # Attach land_use (STDORGCD 2-way, same rule as build_stdorg) + cycle (per plot,measdate).
+    # Attach land_use (STDORGCD 2-way: the shared c1.plot_land_use_sql rule, r7 D43 / D44: the
+    # curated visits' COND rows only, a LEFT join exactly as Sim A's) + cycle (per plot, measdate).
     con.execute(f"""
     CREATE OR REPLACE TABLE {TABLE} AS
-    WITH stdorg AS (
-        SELECT statecd, unitcd, countycd, plot,
-               CASE WHEN MAX(STDORGCD)=1 THEN 'artificial' ELSE 'natural' END AS lu
-        FROM COND WHERE STDORGCD IS NOT NULL GROUP BY 1,2,3,4),
+    WITH stdorg AS ({c1.plot_land_use_sql(con)}),
     plot_cycle AS (
         SELECT STATECD AS statecd, UNITCD AS unitcd, COUNTYCD AS countycd, PLOT AS plot,
                MEASDATE AS measdate, MAX(CYCLE) AS cycle
         FROM base_subplot_cond GROUP BY 1,2,3,4,5)
     SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major, n_trees_known_bias, share_known_bias),
-           s.lu AS land_use, cy.cycle,
+           s.land_use, cy.cycle,
            c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major, c.n_trees_known_bias, c.share_known_bias
     FROM {TABLE}_base c
     LEFT JOIN stdorg s USING (statecd, unitcd, countycd, plot)

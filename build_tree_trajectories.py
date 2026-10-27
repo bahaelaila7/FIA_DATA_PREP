@@ -10,20 +10,23 @@ filled two ways:
   - mid-trajectory interpolation (intro_type='gap_interpolated') — tree missed at
         one visit then re-tallied later; linearly interpolated between brackets
 
-Each trajectory carries how it ended (terminal_fate / death_cause), the condition
-disturbance/cut-event class (pre_commercial_thin / commercial_thin / clear_cut),
-and stratification markers: ecoregion, cycle, ownership / forest-type /
-physiographic / reserved, plus a DERIVED land_use marker.
+Each trajectory carries how it ended (terminal_fate / death_cause), the subplot
+disturbance/cut-event class (pre_commercial_thin / commercial_thin / clear_cut; r7: keyed by
+subplot), and stratification markers: ecoregion, cycle, ownership / forest-type /
+physiographic / reserved, the 2-way STDORGCD land_use (r7: the rule shared with every cohort
+table) and the DERIVED 4-way management class land_use_4way (per subplot).
+r7 D44 (C F3): phantom and gap-interpolated rows carry THEIR OWN visit's cycle / INVYR / condid /
+COND stratifiers (condid = the subplot's single forest condition at that visit, else NULL), never
+the debut's or the previous record's; their estimated_age is the tree's propagated age there.
 
 Biomass is the per-tree above-ground dry biomass DRYBIO_AG in grams (`drybio_g`),
 NOT TPA-expanded per-area — these are individual-tree trajectories.
 
-Reuses cohorts_landis: compute_sim_year_ages, estimate_sapling_growth_rates,
-MIN_BACKFILL_AGB, and the key lists.
+Reuses cohorts_landis: compute_sim_year_ages, estimate_sapling_growth_rates, the backfill blocks,
+the D41 disturbance definition / subp_has_dstrb, the land_use rule and the key lists.
 
 Usage:
-    .venv/bin/python build_tree_trajectories.py ../FIASQLITE2PGSQL/FIADB.duckdb
-    .venv/bin/python build_tree_trajectories.py <db> 37        # smoke test: STATECD=37 only
+    python build_tree_trajectories.py --out-db <curated.duckdb> --fiadb <FIADB.duckdb> [--states 37]
 """
 
 import os as _os, sys as _sys  # curation-fix: sibling modules resolve under `python -I`
@@ -36,7 +39,12 @@ import polars as pl
 from fia_curation_v3 import _next_visit   # shared next-visit / nonforest lookup (r2 M6)
 from cohorts_landis import (
     PLOT_KEY, SUBPLOT_ID, TREE_ID,
-    MIN_BACKFILL_AGB,
+    MIN_BACKFILL_DRYBIO_G,       # r7 C F5: the per-tree (grams) phantom floor
+    disturbance_death_expr,      # r7 D41: one disturbance definition (cohorts_landis)
+    build_subp_has_dstrb,
+    plot_land_use_sql,
+    add_rc7_withdrawn_flag,
+    report_phantom_floor,
     compute_sim_year_ages,
     sim_year_map,
     estimate_sapling_growth_rates,
@@ -52,10 +60,9 @@ BA_FT2 = 0.005454
 # DRYBIO_AG is per-tree above-ground dry biomass in POUNDS → grams (per tree).
 LBS_TO_G = 453.592
 
-# Death-cause: FIA AGENTCD codes treated as "disturbance" agents (else natural).
-#   10 insect · 20 disease · 30 fire · 40 animal · 50 weather
-#   (60 vegetation/competition, 70 unknown, 80 human=harvest → NOT disturbance here)
-DISTURBANCE_AGENTS = [10, 20, 30, 40, 50]
+# Death-cause: DISTURBANCE_AGENTS / disturbance_death_expr come from cohorts_landis (r7 D41):
+#   AGENTCD 10 insect · 20 disease · 30 fire · 40 animal · 50 weather, or a condition DSTRBCD
+#   other than 0 / 60 (60 vegetation/competition, 70 unknown, 80 human=harvest → NOT disturbance)
 
 # Cut-event thresholds
 CLEARCUT_BA_FRAC   = 0.85   # ≥ this fraction of pre-cut live BA removed → clear_cut
@@ -65,6 +72,8 @@ PRECOMMERCIAL_AGE  = 20     # mean cut-tree age < this (and not clear_cut) → p
 PURITY_FRAC        = 0.80   # dominant-species live-BA share ≥ this → "pure" stand
 
 COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
+# visit-level attributes a synthetic (phantom / gap) row takes from ITS OWN visit (r7 C F3)
+VISIT_ATTRS = ["CYCLE", "INVYR", "CONDID", "owngrpcd", "fortypcd", "physclcd", "reservcd", "cond_stdorgcd"]
 
 
 # =============================================================================
@@ -75,24 +84,14 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
     """
     One row per tree x measurement visit, ALL statuses (alive/dead/harvest).
     curated_trees is already restricted to longitudinal subplots upstream.
-    Joins eco (data_plot_eco + PLOT.ecosubcd), REF_SPECIES, and the four raw
+    Joins eco (data_plot_eco: epa_l3 / epa_l4 / ecosubcd), REF_SPECIES, and the four raw
     stratifier markers from COND.
     """
     cycle_col   = "t.CYCLE" if _has_column(con, "curated_trees", "CYCLE") else "NULL::INTEGER AS CYCLE"
     has_l4      = _has_column(con, "data_plot_eco", "epa_l4")
     epa_l4_expr = "e.epa_l4" if has_l4 else "NULL::VARCHAR AS epa_l4"
-    has_eco     = _has_column(con, "PLOT", "ECOSUBCD")
-    if has_eco:
-        ecosubcd_join = """
-        LEFT JOIN (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, FIRST(ECOSUBCD) AS ecosubcd
-            FROM PLOT GROUP BY STATECD, UNITCD, COUNTYCD, PLOT
-        ) plt ON plt.STATECD=t.STATECD AND plt.UNITCD=t.UNITCD
-            AND plt.COUNTYCD=t.COUNTYCD AND plt.PLOT=t.PLOT
-        """
-        ecosubcd_col = "plt.ecosubcd"
-    else:
-        ecosubcd_join, ecosubcd_col = "", "NULL::VARCHAR AS ecosubcd"
+    # r7 D44 (C F6): ECOSUBCD from data_plot_eco (FIADB PLOT has no ECOSUBCD: it was 100 % NULL)
+    ecosubcd_col = "e.ecosubcd::VARCHAR AS ecosubcd"
 
     where_state = f"AND t.STATECD IN ({','.join(map(str, states))})" if states else ""
 
@@ -107,6 +106,7 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
             t.STATUSCD, t.tree_fate, t.AGENTCD, t.RECONCILECD,
             t.reconcile_new::INTEGER AS reconcile_new,          -- curation-fix 2026-10-26
             t.rerecord_dead,
+            COALESCE(t.first_record_dead, FALSE) AS first_record_dead,   -- r7 D38
             t.RECONCILECD::INTEGER   AS rc_obs,
             t.censor_measdate, t.censor_reason,
             t.censor_last_measdate, t.censor_last_reason,
@@ -136,7 +136,6 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
         LEFT JOIN data_plot_eco e
             ON e.statecd=t.STATECD AND e.unitcd=t.UNITCD
             AND e.countycd=t.COUNTYCD AND e.plot=t.PLOT
-        {ecosubcd_join}
         LEFT JOIN REF_SPECIES rr ON rr.SPCD = t.spcd_resolved
         LEFT JOIN REF_SPECIES ro ON ro.SPCD = t.SPCD
         LEFT JOIN COND c
@@ -153,12 +152,9 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
     df = df.with_columns([
         (pl.col("dia").pow(2) * BA_FT2 * pl.col("tpa")).alias("ba"),
         (pl.col("drybio_ag") * LBS_TO_G).alias("agb"),
-        # disturbed-condition flag at this row (any DSTRBCD present & not 0/60)
-        (
-            ((pl.col("DSTRBCD1").is_not_null()) & (~pl.col("DSTRBCD1").is_in([0, 60]))) |
-            ((pl.col("DSTRBCD2").is_not_null()) & (~pl.col("DSTRBCD2").is_in([0, 60]))) |
-            ((pl.col("DSTRBCD3").is_not_null()) & (~pl.col("DSTRBCD3").is_in([0, 60])))
-        ).alias("row_disturbed"),
+        # r7 D41: the ONE disturbance-death definition at this record (AGENTCD 10-50, or a
+        # condition DSTRBCD other than 0 / 60), shared with subp_has_dstrb / curated_cohorts / drops
+        disturbance_death_expr().alias("dist_death_def"),
     ])
 
     print(f"[load] {df.height:,} tree-measurements (all statuses) "
@@ -242,16 +238,19 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
         .join(grp_rates.rename({"rate": "_rg"}), on=["spgrpcd",        "epa_l3"], how="left")
         .join(glb_rates.rename({"rate": "_rb"}), on="spgrpcd",                    how="left")
         .with_columns(pl.coalesce(["_rs", "_rg", "_rb"]).alias("_rate")).drop(["_rs", "_rg", "_rb"])
+        .with_columns(pl.col("_rate").is_null().alias("_no_rate"))
         .with_columns(
             pl.when(pl.col("_rate").is_not_null())
             .then((pl.col("agb") *
                    (1.0 - pl.col("_rate") *
                     (pl.col("age_calc").cast(pl.Float64) - pl.col("prior_age").cast(pl.Float64))))
-                  .clip(MIN_BACKFILL_AGB, None))
-            .otherwise(pl.lit(MIN_BACKFILL_AGB))
+                  .clip(MIN_BACKFILL_DRYBIO_G, None))
+            .otherwise(pl.lit(MIN_BACKFILL_DRYBIO_G))
             .clip(upper_bound=pl.col("agb"))   # r5 M-8: never above the debut value
             .alias("prior_agb")).drop("_rate")
     )
+    report_phantom_floor(missing, "prior_agb", MIN_BACKFILL_DRYBIO_G, "g/tree", "backfill")
+    missing = missing.drop("_no_rate")
     synthetic = (
         missing.drop(["MEASDATE", "age_calc", "agb", "sim_year"])
         .rename({"prior_measdate": "MEASDATE", "prior_age": "age_calc",
@@ -444,7 +443,7 @@ def add_alt_age_axes(body: pl.DataFrame) -> pl.DataFrame:
     sim_year grid as `age_calc`:
         age_<src> = round(<src> at debut) + (sim_year − debut_sim_year)
     Null where the tree never had that source. Because every source is linearly
-    propagated per tree, the debut value fully determines the axis.
+    propagated per tree, the debut value fully determines the axis. Values < 1 are NULL (r7).
     """
     debut = (
         body.filter(pl.col("intro_type") == "real")
@@ -454,8 +453,12 @@ def add_alt_age_axes(body: pl.DataFrame) -> pl.DataFrame:
                 [pl.col(src).round(0, mode="half_away_from_zero").alias(f"_d_{out}") for src, out in ALT_AGE_SOURCES])
     )
     body = body.join(debut, on=TREE_ID, how="left")
+    # r7 D44 (C F12): an alternate axis is >= 1 or NULL (a phantom slot before the source's own
+    # implied birth would otherwise get an age <= 0)
     body = body.with_columns([
-        (pl.col(f"_d_{out}") + pl.col("sim_year") - pl.col("_dsy0"))
+        pl.when((pl.col(f"_d_{out}") + pl.col("sim_year") - pl.col("_dsy0")) >= 1)
+        .then(pl.col(f"_d_{out}") + pl.col("sim_year") - pl.col("_dsy0"))
+        .otherwise(pl.lit(None))
         .cast(pl.Int32).alias(out)
         for _, out in ALT_AGE_SOURCES
     ])
@@ -473,7 +476,7 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
     # r3 I1: the terminal record is the FIRST dead/cut record when the tree has one (later
     # dead records are re-records of the same death); otherwise the last (live) record
     cols = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "AGENTCD",
-                      "row_disturbed", "censor_last_measdate", "censor_last_reason"]
+                      "dist_death_def", "censor_last_measdate", "censor_last_reason"]
     first_dead = (full.filter(pl.col("STATUSCD").is_in([2, 3]))
                   .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first").select(cols))
     last_live = (full.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last").select(cols)
@@ -495,7 +498,7 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
     diverted = pl.col("_later_visit") & (pl.col("_lu_exit").fill_null(False) |
                                          pl.col("_next_nonforest").fill_null(False))
 
-    is_dist = pl.col("AGENTCD").is_in(DISTURBANCE_AGENTS) | pl.col("row_disturbed")
+    is_dist = pl.col("dist_death_def")   # r7 D41 (cohorts_landis.disturbance_death_expr)
 
     last = last.with_columns(
         pl.when(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred", "diverted_landuse"]))
@@ -538,29 +541,33 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
 
 
 # =============================================================================
-# Step 5: cut-event classification (condition x cut visit)
+# Step 5: cut-event classification (subplot x cut visit)
 # =============================================================================
 
 def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     """
-    For each (condition, cut visit) classify the removal:
-      clear_cut          if removed BA ≥ CLEARCUT_BA_FRAC of pre-cut live BA
+    For each (SUBPLOT, cut visit) classify the removal (r7 D44 / C F11: keyed by subplot; r6 keyed
+    it by CONDID, but 6 % of cut trees carry a cut-record CONDID other than their last-alive one
+    and 15 % of events found no pre-cut denominator, so they could never be clear_cut):
+      clear_cut          if removed BA ≥ CLEARCUT_BA_FRAC of the subplot's pre-cut live BA
       pre_commercial_thin if mean cut-tree age < PRECOMMERCIAL_AGE (and not clear_cut)
       commercial_thin     otherwise
-    pre-cut BA of a cut tree = its BA at its last alive visit.
+    pre-cut BA of a cut tree = its BA at its last alive visit; denominator = the subplot's live
+    BA at the latest visit before the cut. A cut tree is its first cut record (re-records are not
+    cut events, r3 I1); r7 D38: a first_record_dead cut (no observed live tree) is not an event.
     """
-    # cut trees: harvest fate; cut happens at the harvest record's MEASDATE
     cut_rows = (
         full.filter(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred"])
-                    & ~pl.col("rerecord_dead"))      # r3 I1: re-records are not cut events
-        .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
-        .select(TREE_ID + ["CONDID", "MEASDATE"])
+                    & ~pl.col("rerecord_dead").fill_null(False)
+                    & ~pl.col("first_record_dead").fill_null(False))
+        .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+        .select(TREE_ID + ["MEASDATE"])
         .rename({"MEASDATE": "cut_measdate"})
     )
     if cut_rows.height == 0:
         print("[cut] no harvest records")
         return pl.DataFrame(schema={
-            **{c: pl.Int64 for c in COND_ID}, "cut_measdate": pl.Date,
+            **{c: pl.Int64 for c in SUBPLOT_ID}, "cut_measdate": pl.Date,
             "cut_event_type": pl.Utf8, "cut_pct_ba_removed": pl.Float64,
             "cut_mean_age": pl.Float64})
 
@@ -575,27 +582,26 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     cut = cut_rows.join(last_alive, on=TREE_ID, how="left")
 
     removed = (
-        cut.group_by(COND_ID + ["cut_measdate"])
+        cut.group_by(SUBPLOT_ID + ["cut_measdate"])
         .agg(pl.col("_precut_ba").sum().alias("removed_ba"),
              pl.col("_precut_age").mean().alias("cut_mean_age"))
     )
 
-    # live BA per (condition, visit) — denominator candidate is the visit
-    # immediately before the cut
+    # live BA per (subplot, visit) — denominator is the visit immediately before the cut
     live_ba = (
         full.filter(pl.col("STATUSCD") == 1)
-        .group_by(COND_ID + ["MEASDATE"])
+        .group_by(SUBPLOT_ID + ["MEASDATE"])
         .agg(pl.col("ba").sum().alias("live_ba"))
     )
     denom = (
-        removed.join(live_ba, on=COND_ID, how="left")
+        removed.join(live_ba, on=SUBPLOT_ID, how="left")
         .filter(pl.col("MEASDATE") < pl.col("cut_measdate"))
-        .sort(COND_ID + ["cut_measdate", "MEASDATE"])
-        .group_by(COND_ID + ["cut_measdate"]).agg(pl.col("live_ba").last().alias("precut_live_ba"))
+        .sort(SUBPLOT_ID + ["cut_measdate", "MEASDATE"])
+        .group_by(SUBPLOT_ID + ["cut_measdate"]).agg(pl.col("live_ba").last().alias("precut_live_ba"))
     )
 
     ev = (
-        removed.join(denom, on=COND_ID + ["cut_measdate"], how="left")
+        removed.join(denom, on=SUBPLOT_ID + ["cut_measdate"], how="left")
         .with_columns(
             pl.when(pl.col("precut_live_ba").is_not_null() & (pl.col("precut_live_ba") > 0))
             .then((pl.col("removed_ba") / pl.col("precut_live_ba")).clip(0.0, 1.0))
@@ -610,54 +616,57 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
             .otherwise(pl.lit("commercial_thin"))
             .alias("cut_event_type")
         )
-        .select(COND_ID + ["cut_measdate", "cut_event_type",
-                           "cut_pct_ba_removed", "cut_mean_age"])
+        .select(SUBPLOT_ID + ["cut_measdate", "cut_event_type",
+                              "cut_pct_ba_removed", "cut_mean_age"])
         # r2 M2: float sums depend on thread summation order — round for determinism
         .with_columns(pl.col("cut_pct_ba_removed").round(9), pl.col("cut_mean_age").round(9))
     )
-    print("[cut] cut-event classification:")
+    print(f"[cut] cut-event classification (per subplot; {ev.filter(pl.col('cut_pct_ba_removed').is_null()).height:,} "
+          f"of {ev.height:,} events without a pre-cut denominator):")
     for t, n in ev.group_by("cut_event_type").len().sort("len", descending=True).iter_rows():
         print(f"        {str(t):20s}: {n:>8,} events")
     return ev
 
 
 # =============================================================================
-# Step 6: land_use derivation (per condition)
+# Step 6: land_use_4way derivation (per subplot)
 # =============================================================================
 
 def derive_land_use(full: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
-    """Derive a land_use marker per condition from management history +
-    forest-type purity, keeping the component markers."""
+    """Derive the 4-way management class `land_use_4way` per SUBPLOT (r7: the cut events are per
+    subplot, C F11; r6 derived it per condition and called it land_use) from management history +
+    forest-type purity, keeping the component markers. The 2-way `land_use` is the STDORGCD rule
+    (cohorts_landis.plot_land_use_sql), attached in build_tree_trajectories."""
     # management history from cut events
     hist = (
-        events.group_by(COND_ID).agg([
+        events.group_by(SUBPLOT_ID).agg([
             (pl.col("cut_event_type") == "clear_cut").any().alias("has_clearcut"),
             (pl.col("cut_event_type") == "commercial_thin").any().alias("has_commercial_thin"),
             (pl.col("cut_event_type") == "pre_commercial_thin").any().alias("has_precommercial_thin"),
         ])
     )
-    # planted / reserved per condition
+    # planted / reserved per subplot (over the conditions of its records)
     cond_attr = (
-        full.group_by(COND_ID).agg([
+        full.group_by(SUBPLOT_ID).agg([
             (pl.col("cond_stdorgcd") == 1).any().alias("is_planted"),
             pl.col("reservcd").max().alias("reservcd_max"),
         ])
     )
-    # dominant-species live-BA share per condition (peak purity across visits)
+    # dominant-species live-BA share per subplot (peak purity across visits)
     sp_ba = (
         full.filter(pl.col("STATUSCD") == 1)
-        .group_by(COND_ID + ["MEASDATE", "spcd"]).agg(pl.col("ba").sum().alias("sp_ba"))
+        .group_by(SUBPLOT_ID + ["MEASDATE", "spcd"]).agg(pl.col("ba").sum().alias("sp_ba"))
     )
     purity = (
-        sp_ba.group_by(COND_ID + ["MEASDATE"])
+        sp_ba.group_by(SUBPLOT_ID + ["MEASDATE"])
         .agg((pl.col("sp_ba").max() / pl.col("sp_ba").sum()).alias("_top_share"))
-        .group_by(COND_ID).agg(pl.col("_top_share").max().round(9).alias("dominant_species_frac"))
+        .group_by(SUBPLOT_ID).agg(pl.col("_top_share").max().round(9).alias("dominant_species_frac"))
     )
 
     lu = (
         cond_attr
-        .join(hist, on=COND_ID, how="left")
-        .join(purity, on=COND_ID, how="left")
+        .join(hist, on=SUBPLOT_ID, how="left")
+        .join(purity, on=SUBPLOT_ID, how="left")
         .with_columns([
             pl.col("has_clearcut").fill_null(False),
             pl.col("has_commercial_thin").fill_null(False),
@@ -673,13 +682,61 @@ def derive_land_use(full: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
             .when(pl.col("has_clearcut") | pl.col("has_commercial_thin") | pl.col("has_precommercial_thin"))
                 .then(pl.lit("managed"))
             .otherwise(pl.lit("natural"))
-            .alias("land_use")
+            .alias("land_use_4way")
         )
     )
-    print("[land_use] distribution (per condition):")
-    for u, n in lu.group_by("land_use").len().sort("len", descending=True).iter_rows():
-        print(f"        {str(u):14s}: {n:>8,} conditions")
+    print("[land_use_4way] distribution (per subplot):")
+    for u, n in lu.group_by("land_use_4way").len().sort("len", descending=True).iter_rows():
+        print(f"        {str(u):14s}: {n:>8,} subplots")
     return lu
+
+
+# =============================================================================
+# Step 6b: synthetic rows take their own visit's attributes (r7 D44 / C F3)
+# =============================================================================
+
+def visit_attributes(con, states: list[int] | None = None) -> pl.DataFrame:
+    """Per subplot visit (SUBPLOT_ID + MEASDATE): its INVYR and CYCLE, and its condition when the
+    subplot has exactly ONE forest condition (COND_STATUS_CD 1) there (else NULL: the tree's
+    condition at an unobserved slot is unknown), with that condition's COND stratifiers."""
+    ws = f"AND b.STATECD IN ({','.join(map(str, states))})" if states else ""
+    st = ",".join(str(int(r[0])) for r in con.execute(
+        f"SELECT DISTINCT STATECD FROM base_subplot_cond b WHERE TRUE {ws} ORDER BY 1").fetchall()) or "NULL"
+    return con.execute(f"""
+        WITH v AS (
+            SELECT b.STATECD, b.UNITCD, b.COUNTYCD, b.PLOT, b.SUBP, b.MEASDATE,
+                   min(b.INVYR) AS INVYR, max(b.CYCLE) AS CYCLE,
+                   count(DISTINCT b.CONDID) FILTER (WHERE b.COND_STATUS_CD = 1) AS _nf,
+                   min(b.CONDID) FILTER (WHERE b.COND_STATUS_CD = 1) AS _cid
+            FROM base_subplot_cond b WHERE TRUE {ws} GROUP BY ALL)
+        SELECT v.STATECD, v.UNITCD, v.COUNTYCD, v.PLOT, v.SUBP, v.MEASDATE,
+               v.INVYR::INTEGER AS _v_INVYR, v.CYCLE AS _v_CYCLE,
+               CASE WHEN v._nf = 1 THEN v._cid END AS _v_CONDID,
+               c.OWNGRPCD AS _v_owngrpcd, c.FORTYPCD AS _v_fortypcd, c.PHYSCLCD AS _v_physclcd,
+               c.RESERVCD AS _v_reservcd, c.STDORGCD AS _v_cond_stdorgcd
+        FROM v LEFT JOIN (SELECT * FROM COND WHERE STATECD IN ({st})) c   -- prune the FIADB-wide view
+          ON v._nf = 1 AND c.STATECD = v.STATECD AND c.UNITCD = v.UNITCD AND c.COUNTYCD = v.COUNTYCD
+         AND c.PLOT = v.PLOT AND c.INVYR = v.INVYR AND c.CONDID = v._cid
+    """).pl()
+
+
+def restamp_synthetic_rows(body: pl.DataFrame, vattr: pl.DataFrame) -> pl.DataFrame:
+    """Phantom / gap rows: VISIT_ATTRS from their own visit (visit_attributes), and estimated_age
+    = the tree's propagated age at that date (debut real estimated_age + elapsed years). Real
+    rows are unchanged."""
+    debut = (body.filter(pl.col("intro_type") == "real").sort(TREE_ID + ["MEASDATE"])
+             .unique(subset=TREE_ID, keep="first")
+             .select(TREE_ID + [pl.col("MEASDATE").alias("_d_md"), pl.col("estimated_age").alias("_d_age")]))
+    syn = pl.col("intro_type") != "real"
+    body = body.join(vattr, on=SUBPLOT_ID + ["MEASDATE"], how="left").join(debut, on=TREE_ID, how="left")
+    body = body.with_columns(
+        [pl.when(syn).then(pl.col(f"_v_{c}").cast(body.schema[c])).otherwise(pl.col(c)).alias(c) for c in VISIT_ATTRS]
+        + [pl.when(syn).then(pl.col("_d_age") + (pl.col("MEASDATE") - pl.col("_d_md")).dt.total_days() / 365.25)
+             .otherwise(pl.col("estimated_age")).alias("estimated_age")])
+    n = body.filter(syn).height
+    print(f"[restamp] {n:,} synthetic rows take their own visit's cycle / INVYR / condid / COND attributes "
+          f"({body.filter(syn & pl.col('CONDID').is_null()).height:,} without a single forest condition -> condid NULL)")
+    return body.drop([f"_v_{c}" for c in VISIT_ATTRS] + ["_d_md", "_d_age"])
 
 
 # =============================================================================
@@ -694,7 +751,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     full   = load_tree_history(con, states)
     visits = subplot_visit_scaffold(con, states)
 
-    # condition-level attributes derived from the FULL record set
+    # subplot-level attributes derived from the FULL record set (r7: cut events per subplot)
     events = classify_cut_events(full)
     import dbconn as _db
     _db.require_tables(con, "tree_landuse_exits")
@@ -721,6 +778,9 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     # alternate per-source age axes (TOTAGE / STDAGE / estage / model)
     body = add_alt_age_axes(body)
 
+    # r7 C F3: phantom / gap rows take their own visit's cycle / INVYR / condid / COND attributes
+    body = restamp_synthetic_rows(body, visit_attributes(con, states))
+
     # was_gap_interpolated flag per row
     body = body.with_columns(
         (pl.col("intro_type") == "gap_interpolated").alias("was_gap_interpolated"))
@@ -731,25 +791,26 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     body = body.join(last_slot, on=TREE_ID, how="left").with_columns(
         (pl.col("MEASDATE") == pl.col("_last_slot")).alias("is_terminal")).drop("_last_slot")
 
-    # attach per-row condition cut-event (event landing on this measdate/condition)
+    # attach per-row subplot cut-event (event landing on this measdate/subplot; r7 C F11)
     ev_join = events.rename({"cut_measdate": "MEASDATE"})
-    body = body.join(ev_join, left_on=COND_ID + ["MEASDATE"],
-                     right_on=COND_ID + ["MEASDATE"], how="left")
+    body = body.join(ev_join, on=SUBPLOT_ID + ["MEASDATE"], how="left")
 
-    # attach land_use + components per condition
-    body = body.join(lu.select(COND_ID + [
-        "land_use", "is_planted", "has_clearcut", "has_commercial_thin",
-        "has_precommercial_thin", "is_pure", "dominant_species_frac", "reservcd_max",
-    ]), on=COND_ID, how="left")
+    # attach land_use_4way + components per subplot (r7)
+    body = body.join(lu.select(SUBPLOT_ID + [
+        "land_use_4way", "is_planted", "has_clearcut", "has_commercial_thin",
+        "has_precommercial_thin", "is_pure", "dominant_species_frac",
+    ]), on=SUBPLOT_ID, how="left")
+    # r7 D44 (C F10): `land_use` is the 2-way STDORGCD rule shared by every cohort table
+    plu = con.execute(plot_land_use_sql(con)).pl().rename(
+        {"statecd": "STATECD", "unitcd": "UNITCD", "countycd": "COUNTYCD", "plot": "PLOT"})
+    body = body.join(plu.with_columns([pl.col(k).cast(body.schema[k]) for k in PLOT_KEY]), on=PLOT_KEY, how="left")
 
-    # subplot disturbance flag (from terminal fates within the subplot)
-    subp_dstrb = (
-        body.group_by(SUBPLOT_ID).agg(
-            (pl.col("terminal_fate").is_in(
-                ["harvest_explicit", "harvest_inferred", "dead_disturbance",
-                 "disappeared_inferred_removal"]).any()).alias("subp_has_dstrb"))
-    )
-    body = body.join(subp_dstrb, on=SUBPLOT_ID, how="left")
+    # subplot disturbance flag: the ONE D41 definition (cohorts_landis.build_subp_has_dstrb), the
+    # same as Sim A / Sim B (r6 used the trajectories' own terminal fates, a third definition)
+    sflag = build_subp_has_dstrb(con, states)
+    body = (body.join(sflag.with_columns([pl.col(k).cast(body.schema[k]) for k in SUBPLOT_ID]),
+                      on=SUBPLOT_ID, how="left")
+                .with_columns(pl.col("subp_has_dstrb").fill_null(False)))
 
     # plot / subplot measurement counts
     plot_n = (body.select(PLOT_KEY + ["MEASDATE"]).unique()
@@ -785,7 +846,6 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
         "STATECD": "statecd", "UNITCD": "unitcd", "COUNTYCD": "countycd",
         "PLOT": "plot", "SUBP": "subp", "TREE": "tree", "MEASDATE": "measdate",
         "CONDID": "condid", "CYCLE": "cycle", "agb": "drybio_g",
-        "reservcd_max": "reservcd_cond",
     }).select([
         "plt_cn", "statecd", "unitcd", "countycd", "plot", "subp", "tree",
         "measdate", "cycle", "sim_year", "age_calc", "estimated_age", "age_source",
@@ -802,6 +862,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
         "has_precommercial_thin", "is_pure", "dominant_species_frac",
         "subp_has_dstrb", "plot_meas_num", "subp_meas_num",
         "reconcile_new", "censor_reason",                  # curation-fix 2026-10-26
+        "land_use_4way",                                   # r7 C F10 (land_use is 2-way)
     ]).sort(["statecd", "unitcd", "countycd", "plot", "subp", "tree", "measdate"])
 
     # summary
@@ -829,6 +890,7 @@ if __name__ == "__main__":
 
     con.register("_traj_view", traj)
     con.execute("CREATE OR REPLACE TABLE tree_trajectories AS SELECT * FROM _traj_view")
+    add_rc7_withdrawn_flag(con, "tree_trajectories")   # r7 D39: visit metadata (appended)
     import cohorts_landis as _c1
     if "traj" in _c1.RATE_TABLES:   # r6 R1: the trajectory sapling growth rates (per-tree basis)
         con.register("_rate_view", _c1.RATE_TABLES["traj"])
