@@ -428,3 +428,130 @@ decided and how to reverse it.
 - **Chosen:** (a). It is the same treatment FIA's own re-tallies get (RC8 / silent re-tally), and the matched trees keep their continuity.
   - The verifier re-derives both parts independently: link breaks in rule (b), and check (n14) "every end tree is continued or censored". `procedural_relink` also counts as censoring in the (b) sapling census.
 - **Reverse:** remove the `_relink` block in `sql_excluded_trees` and `_brk_link` in cohorts_landis.
+
+## D36–D45 — Round-7 audit (2026-10-27, coordinator; 6 slices, reports in scratchpad/curation_audit_r7/rep_{A..F}.md)
+The chosen option comes first; rejected options follow "Rejected".
+
+### D36 — Tree identity at reused numbers and coordinate links (F7-1 IMPORTANT, A7-1, F7-2, F14)
+- A record starts a new tree when PREV_TRE_CN is null and RECONCILECD is a new-tree code (RC 1 ingrowth / 2 through-growth / 3 missed / 4 shrank-in). This applies whatever the previous same-number record's status was, live or dead (A7-1 extends D7).
+- Any key censored `procedural_relink` (D35) is closed: a later record under that number is a new tree.
+- Censor and status-0 events are keyed by the post-split tree id. Split trees never inherit the old id's censoring (F7-2, C-F14).
+- The verifier re-derives the split independently. n14 also checks that relink-censored keys never reappear and that continued trees are not censored.
+- Rejected: keeping the live-predecessor exception (it merges physically different trees: species relabelled, bogus cohorts).
+
+### D37 — Duplicate same-INVYR visits at identical coordinates (A7-3 / F7-7)
+- Two plot-visits with the same INVYR, identical LAT/LON and a D29 tree share ≥ 30 % are one physical visit: keep the visit with more live records and drop the other's records, logged in `plot_key_remap` with reason `duplicate_visit`. Only AL 1/3/61/71 vs 87 qualifies in R4.
+- The collision guard otherwise stays.
+- The D29 share's denominator is live SUBP ≤ 4 trees, as in the D35 census (F7-6 / A7-8). No R4 link flips.
+
+### D38 — Link-start semantics (F7-8)
+- At a D29 link start on a KINDCD 3 (replacement) plot, dead records are first-seen deaths (`first_record_dead`). They are not mortality attributed to the link interval and produce no drop.
+- `first_record_dead` generalises `dead_at_first_visit` to any tree whose first record is dead (A7-11).
+
+### D39 — Visits whose live trees were all withdrawn (A7-4)
+- Flagged per visit (`all_live_withdrawn_rc7`) in curated_trees and in the cohort tables' visit metadata.
+- Not dropped: the dead tally may be valid. Consumers decide; genveg's G51.1 treats such a visit as incomplete.
+- RC7 dropping of earlier records stays as D34 (A7-5 noted).
+
+### D40 — Ages (B I-1 / I-2 IMPORTANT, M-1 / M-6 / M-7 / M-8 / M-9 / M-10 / M-11)
+- **Mapping.** The TreeAge → field mapping is fitted and selected on PLANTED rows only, because it is applied only to planted rows (D5). The pooled fallback is a planted-only pool. Natural rows never enter calibration. The stratum "split" decision is therefore moot and removed.
+- **Mapping is enforced.** When calibration returns None (fewer than 200 planted rows), planted estage is flagged `unmapped_estage` and the verifier FAILs unless the cell is listed (M-6).
+- **Recalibration acceptance**, pre-registered now: the isotonic recalibration is applied per stratum × DIA-class cell only if the nested out-of-fold MAE decreases. Otherwise that cell is identity (M-7).
+- **Determinism and variance.**
+  - Training rows are sorted by CN.
+  - HGBT gets an explicit random_state and a seeded validation split.
+  - The model is a 5-seed bagged ensemble (mean of members), which cuts the chaotic sensitivity.
+  - The verifier's determinism check covers step 2 on a one-county subset at threads 1 vs 3.
+  - Rejected: a single model, whose 1-row perturbation moved ages up to 9.9 yr.
+- **Nesting fixes.** Inner-fold mapping excludes inner calibration plots; outlier thresholds are computed per training fold; categoricals are passed as `categorical_features` (M-8).
+- **Support flag.** Natural saplings under 5 in get `out_of_support` (M-9).
+- **Stand resets.** Loss is measured across the subplot's CONDIDs, so trees alive in another CONDID are not loss (M-10).
+- **Model feature.** It follows `age_stratum` (M-11).
+- **KNOWN values are re-measured** after the restart, under the R4 fit scope. This was already planned in D24 and is required anyway because the model changed.
+  - The drift guard compares SIGNED values (M-3 / E17).
+  - The 1-yr band is unchanged.
+- **H_MIN_VISITS = 50** (M-4 / E15) is recorded here as set after seeing KY fail (commit 4b71262). It stays as a reliability floor. A below-floor cell that exceeds its limit is printed `FAIL-SMALL` and counts as a FAIL unless it has an explicit KNOWN entry with a reason. Rejected: a silent INFO.
+
+### D41 — Disturbance deaths, one definition (C F1 IMPORTANT, F17, F7)
+- `subp_has_dstrb` and `dead_disturbance` use ONE shared definition: AGENTCD in {10…50} or a condition DSTRBCD other than 0 / 60. It also counts deaths and cuts of trees first seen after the subplot's first visit.
+- Drop attribution requires the removal visit to be the tree's first dead / cut record.
+- Rejected: two definitions (8–32 % of drop rows sat on "undisturbed" subplots).
+
+### D42 — Full removals and the Pan export (C F2 IMPORTANT)
+- cohort_disturbance also emits full-removal rows (`full_removal = TRUE`, drop 1.0) instead of dropping `n_survivors == 0`.
+- Consumer item for the Pan rebuild, alongside D30 / D32: Pan must read the curated cohort_disturbance (D31 drops and full removals). It must not use landis_hbad4/tools/export_cohort_disturbance.py, which re-implements pre-D19 / D25 / D26 / D31 rules and imports the main checkout.
+
+### D43 — Reference-table contamination by reused periodic plot keys (D F1 IMPORTANT)
+- export_reference_tables copies only PLOT / COND rows whose PLT_CN belongs to a visit in the curated product, plus the canonical remap's raw visits.
+- STDORGCD / SITECLCD / land_use use only those rows.
+- The verifier checks for absent extra rows: n12 / slim_guard post test that there are no foreign PLT_CNs.
+
+### D44 — Product correctness hardening (cohorts C F3–F16, chain D F3–F15, trees A7-2 / A7-7 / A7-10, F7-3 / F7-4 / F7-10–12)
+- **Synthetic rows.** Phantom and gap rows get their own visit's cycle / condid / INVYR / COND stratifiers, or NULL; never the debut's or the previous row's (C F3).
+- **Sapling phantoms** test the MICROPLOT forest proportion (C F4).
+- **MIN_BACKFILL_AGB** has explicit units per table (C F5).
+- **ecosubcd** comes from data_plot_eco (C F6 / D F12).
+- **land_use** is 2-way everywhere; the 4-way classification is `land_use_4way` (C F10).
+- **Cut events** are keyed by subplot (C F11).
+- **Age axes.** Alternate age axes are ≥ 1 or NULL (C F12).
+- **Rate scope.** Sapling-rate pooling is recorded in run_scope (C F13).
+- **Stale code paths refuse to run:** cohort_disturbance --attach, the cohorts_landis2 full build, and the DAMSEV pct_biomass_damaged column, which is removed (C F9, F7-10, E25).
+- **Viz notebooks** take explicit DB paths (C F15).
+- **Determinism.** MODE ties are broken deterministically (min) (A7-7 / F7-3); joins before cum_sum keep order explicitly (F7-4).
+- **Trees.** Land-use exits use the first exit after the tree's last curated record (A7-2). The status-0 read filters P2A / COND (A7-10).
+- **Keys.** Key types are INTEGER (F7-11).
+- **Collision loop.** Its root is recomputed (F7-12). The D26 land-use path matches by the PREV_TRE_CN → CN link.
+- **Chain** (D F3–F11):
+  - correct log counts;
+  - FROM_STEP compared numerically;
+  - FROM_STEP=11 without SLIM_OUT refused;
+  - paths made absolute before the cd;
+  - `--states` passed to every step and refused when it mismatches run_scope;
+  - the slim carries run_scope / plot_key_remap / plot_location plus a run id that slim_guard checks across curated / simB / slim;
+  - partial outputs cleaned on failure;
+  - Julia / slim_guard DuckDB capped;
+  - Sim A / B land_use joins made consistent (D F15);
+  - column order kept on step-6 reruns (D F9).
+- **run_scope.counties** is VARCHAR (E29).
+
+### D45 — Verifier: from consistency checker to independent re-derivation (E1–E30, F7-9, C F8, B M-5 / M-14 / M-15)
+- **Exit status.** The verifier exits non-zero on any FAIL (E1).
+- **Display-only invariants become checks** (E2 / E3):
+  - record-level live coverage (1c = 0);
+  - lost dead records;
+  - SUBP > 4 rows;
+  - CN uniqueness;
+  - negative ages;
+  - nonforest phantoms in the PRODUCT tables.
+- **Completeness in both directions** (E4 / E5 / E6): product phantoms are checked against the provenance tables and the D-rules; the drop set and `subp_has_dstrb` (D41) are re-derived independently from raw FIADB and compared in both directions; (a) uses a left join.
+- **Values re-derived from raw** (E7 / E8 / E9 / E10):
+  - sim_year from MEASDATE by the D18 rule;
+  - Sim B drop magnitudes from raw biomass;
+  - real-row AGB / TPA / drybio from raw DRYBIO_AG · TPA;
+  - censoring reasons and final fates from raw STATUSCD 0 / RECONCILECD.
+- **Tightened checks** (E11 / E12 / E13 / E14 / E16):
+  - n5 requires that no natural tree is mapped;
+  - (c1) requires exact agreement and tests the harvest_inferred rule;
+  - (b), n7 and "aged and attributed ⇒ flagged" are enforced;
+  - a check on an empty set where data is expected FAILs, and skipped sections print SKIP;
+  - tolerances are tightened to observed values plus a margin. Tightening after seeing data is conservative, and recorded here.
+- **More coverage** (E20 / E21 / E22 / E23 / E24 / E18 / E19 / E26 / E27 / E28 / E30):
+  - D28 is fully checked;
+  - n11 asserts the basis;
+  - determinism covers steps 1–10 on a subset at two thread counts;
+  - product attributes are checked;
+  - slim content equals the curated tables (counts and hashes);
+  - fixtures are strengthened (D19 shrink branch, zombie interpolation, D26(b), the D31 formula);
+  - `arg_min_null` is used;
+  - output is ordered;
+  - the canonical walk gets a cycle guard;
+  - the SITETREE key linkage is investigated and fixed if wrong;
+  - circular checks are re-derived where cheap.
+- **Other verifier fixes:** (d) 0/0 FAILs (M-5); n11 compares at every level (M-14); the (j) gate and statistic use one unit (M-15); n8 re-derives `dropped` (F7-9).
+
+### Doc items
+- The D-numbers are made unique: the "Generalisation" entry becomes D31-G.
+- Stale numbers are corrected: D27 GA 64; D26(a) NC records vs trees; D29 AL; D30 AL 8.6 %; R2 COND counts.
+- The D28 county wording; county subsets are by canonical county (F7-13).
+- D24's mechanism text is corrected (M-2).
+- The age_imputation docstrings (M-16).
