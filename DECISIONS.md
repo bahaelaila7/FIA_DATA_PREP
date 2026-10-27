@@ -557,3 +557,24 @@ The chosen option comes first; rejected options follow "Rejected".
 - The D28 county wording; county subsets are by canonical county (F7-13).
 - D24's mechanism text is corrected (M-2).
 - The age_imputation docstrings (M-16).
+
+## D46 — Mapping acceptance per curve (ages implementer f76c872 outcome; coordinator, 2026-10-27)
+**Outcome.** With D40's planted-only mapping, KY planted out-of-fold error is MAE 9.11 / bias +0.96. That is better than the old mapping (10.69 / +5.46) but still worse in MAE than raw TreeAge (8.58 / +2.33). It wins at 9+ in (8.86 vs 10.58) and loses at 5–9 in.
+
+**Decision.** Each mapping curve (spgrpcd → major group → global) is applied only if its nested out-of-fold MAE on that curve's planted calibration rows is strictly lower than raw TreeAge's. Otherwise the curve is identity, and the rows fall through to the next level only if that level passes the same test.
+- This uses the same acceptance form as D40's recalibration rule, now applied to the mapping.
+- It is recorded as decided AFTER seeing the KY result.
+- The test can only make the mapping less aggressive; it never tunes a curve.
+- The per-curve decisions go in `estage_calibration`.
+
+**Options considered:**
+- (a) chosen: per-curve acceptance;
+- (b) accept the KY result as is; rejected, because the mapping would add error where it should remove it;
+- (c) a per-state on/off switch; rejected as too coarse, since in KY the 9+ in mapping helps;
+- (d) DIA-class-specific curves; rejected as a new model, not a guard.
+
+**Runtime.** Step 2 is now about 5× slower (130 HGBT fits). Accepted.
+
+**Also required:**
+- **Cohorts:** D11's "natural model ages" share must count natural `out_of_support` rows too (M-9 moved natural saplings to out_of_support).
+- **Verifier:** read `age_recal_cells`, the `final` rows of age_model_cv, `unmapped_estage`, the per-curve acceptance, and the M-9 support rule. `planted_split_used` has been dropped.
