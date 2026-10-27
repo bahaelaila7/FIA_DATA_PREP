@@ -578,3 +578,12 @@ The chosen option comes first; rejected options follow "Rejected".
 **Also required:**
 - **Cohorts:** D11's "natural model ages" share must count natural `out_of_support` rows too (M-9 moved natural saplings to out_of_support).
 - **Verifier:** read `age_recal_cells`, the `final` rows of age_model_cv, `unmapped_estage`, the per-curve acceptance, and the M-9 support rule. `planted_split_used` has been dropped.
+
+**D46 outcome (b7572de; coordinator).** In KY, none of the 4 curves beats raw TreeAge out of fold, so KY planted estage is raw TreeAge (0 of 1,317 mapped).
+- On the honest metric, the out-of-fold error on planted calibration rows against field STDAGE, raw is best in MAE: 8.58 vs 9.11 (D40) and 9.51 (D46 nested).
+- On live records, the final-minus-field comparison favours D40 at 9+ in: MAE 5.87 vs 9.27. That comparison is largely IN-SAMPLE for the D40 mapping, because those records sit on the calibration plots. It is therefore not used as evidence.
+- The decision stands as written, with no further iteration. A third post-hoc change would make the rule meaningless.
+- **Known residual:** raw TreeAge on KY planted 9+ in carries a bias of +7.5 yr out of fold (n = 506). It is reported in the verifier as INFO under (h) / (k), and is a candidate for DIA-class curves in a later model version (option (d), deferred).
+- **Verifier contract:**
+  - an unmapped scope (`level = 'unmapped'`, fewer than 200 rows) is distinct from a rejected scope (curve rows with `applied = false`);
+  - a planted row must be mapped exactly when the curve reaching it was applied.
