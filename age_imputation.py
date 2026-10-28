@@ -817,21 +817,23 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
 # then overrides the model-age values above). The bias depends on the FIT SCOPE (the age model
 # and the TreeAge mapping are fitted once over all states in the DB), so each rule names the fit
 # scopes it was measured on = the sorted, comma-joined STATECDs of the DB (FIT_SCOPE).
-# Rule: (age_domain value, STATECD, planted?, age sources, minimum DIA, fit scopes).
-# planted = the tree's age_stratum (r5 M-5).
+# Rule: (age_domain value, STATECD, planted?, age sources, minimum DIA, fit scopes, maximum DIA
+# (exclusive; None = no upper bound)). planted = the tree's age_stratum (r5 M-5).
 #   (known_bias_ky_natural_treeage: retired by D13 — natural (k) is INFO by wood group)
-#   (known_bias_fl_planted_model_15plus: retired in r5 — the single-state FL fit now passes
-#    (j) at -1.6 yr)
-#   known_bias_fl_planted_model_10plus  FL planted MODEL ages, DIA >= 10 in, under the pooled
-#                                       FL + KY + MS fit: (j) model minus mapped TreeAge
-#                                       10-15 in -3.2 / 15+ in -3.8 yr (r5); only trees without
-#                                       a TreeAge record take the model age. Against FIELD truth
-#                                       the gap sits largely on the mapped side (audit r7 M-2),
-#                                       so this is not simply model regression to the mean.
-#                                       Measured with the pre-D40 model and mapping: it must be
-#                                       re-measured (D40) together with the verifier entries.
+#   (known_bias_fl_planted_model_10plus: retired by D47 — under the D40 / D46 age model the pooled
+#    FL 10-15 in cell passes (-2.9 yr); only 15+ in stays excepted)
+# r8 D47.5, re-measured 2026-10-28 on the D40 / D46 model ((j) model minus mapped TreeAge; only
+# trees without a TreeAge record take the model age, so the flags mark MODEL ages):
+#   known_bias_fl_planted_model_15plus   FL planted, DIA >= 15 in: pooled 12,21,28 -4.3 yr,
+#                                        single-state 12 -3.7 yr (regression to the mean)
+#   known_bias_ky_planted_model_10to15   KY planted, 10 <= DIA < 15 in: single-state 21 -4.9 yr
+#                                        (D46 raw-TreeAge residual), pooled +4.2 yr (sign flips
+#                                        with the fit scope: not stable to the training set)
+#   known_bias_tn_planted_model_15plus   TN planted, DIA >= 15 in: single-state 47 -3.1 yr
 KNOWN_BIAS_FLAGS = [
-    ("known_bias_fl_planted_model_10plus", 12, True, ("model",), 10.0, ("12,21,28",)),
+    ("known_bias_fl_planted_model_15plus", 12, True, ("model",), 15.0, ("12", "12,21,28"), None),
+    ("known_bias_ky_planted_model_10to15", 21, True, ("model",), 10.0, ("21", "12,21,28"), 15.0),
+    ("known_bias_tn_planted_model_15plus", 47, True, ("model",), 15.0, ("47",), None),
 ]
 FIT_SCOPE = None   # set in __main__ from the DB's states
 
@@ -840,12 +842,14 @@ def flag_known_bias(df: pl.DataFrame) -> pl.DataFrame:
     if "age_domain" not in df.columns:
         df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("age_domain"))
     planted = PLANTED
-    for val, st, pl_, srcs, min_dia, scopes in KNOWN_BIAS_FLAGS:
+    for val, st, pl_, srcs, min_dia, scopes, max_dia in KNOWN_BIAS_FLAGS:
         if FIT_SCOPE not in scopes:
             continue
         m = (pl.col("STATECD") == st) & (planted if pl_ else ~planted) & pl.col("age_source").is_in(list(srcs))
         if min_dia is not None:
             m = m & (pl.col("DIA") >= min_dia)
+        if max_dia is not None:
+            m = m & (pl.col("DIA") < max_dia)
         df = df.with_columns(pl.when(m.fill_null(False)).then(pl.lit(val)).otherwise(pl.col("age_domain"))
                              .alias("age_domain"))
     return df

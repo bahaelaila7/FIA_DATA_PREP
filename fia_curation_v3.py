@@ -402,9 +402,11 @@ def sql_excluded_trees(con, scope: str = ""):
     # procedural_breaks row (break_kind 'coord_link') that blocks backfill across it.
     # r7 D38: on a KINDCD 3 (replacement plot) start only a LIVE start record continues an end
     # tree; a dead / cut record there is a first-seen death (a new tree, first_record_dead), so
-    # the end tree is censored here, not killed in the link interval. r7 D37: the end visit can be
-    # a dropped duplicate visit, so the end / start trees are read from the raw TREE table and the
-    # (canonical) plot key from the start visit.
+    # the end tree is censored here, not killed in the link interval. The end / start trees are
+    # read from the raw TREE table and the (canonical) plot key from the start visit.
+    # r8 D47.1: an end visit DROPPED as a D37 duplicate (plot_dup_visits) is the same physical
+    # visit as the kept start, not a link end: its trees are never censored 'procedural_relink'
+    # (the kept visit's trees continue normally).
     if dbconn_has_links(con):
         con.execute(f"""
         CREATE OR REPLACE TEMP TABLE _relink AS
@@ -423,6 +425,7 @@ def sql_excluded_trees(con, scope: str = ""):
                NULL::INTEGER AS RC, 'procedural_relink' AS reason, T.TREE AS TREE_RAW
         FROM _relink l JOIN fia.main.TREE T ON T.PLT_CN = l.end_cn
         WHERE T.STATUSCD = 1 AND T.SUBP <= 4
+          AND CAST(l.end_cn AS VARCHAR) NOT IN (SELECT CN FROM plot_dup_visits)   -- r8 D47.1
           AND NOT EXISTS (SELECT 1 FROM fia.main.TREE u WHERE u.PLT_CN = l.start_cn AND u.SUBP = T.SUBP
                           AND u.TREE = T.TREE AND u.SPCD = T.SPCD AND u.DIA >= T.DIA
                           AND (l.start_kindcd IS DISTINCT FROM 3 OR u.STATUSCD = 1))
