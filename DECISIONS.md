@@ -713,3 +713,17 @@ Validation-only development gave:
 4. Fit w on VAL.
 5. Score TEST once against A1–A3. Then run P1–P3 on every production imputation.
 6. Report everything, pass or fail.
+
+**D49 outcome (TEST scored once, 2026-10-28; /workspace/FIA/nimiwae_r8/final/bench_report_test.json).** NOT ACCEPTED: the rule stays the production backfill.
+- **A1 (unbiased) FAIL.** Overall log AGB +0.019 and log DIA +0.011 pass. But at 1–2 in, log AGB is **+0.18** (log DIA +0.07), and softwoods (major group 1) are log AGB **+0.16**. Every other cell is within ±0.07.
+- **A2 (calibrated) FAIL.** Overall 80 % coverage is 0.800 and 2–3 in is 0.845, but 1–2 in is **0.70**.
+- **A3 (totals) PASS:** median subplot-total ratio 1.06.
+- **P1 (monotone) PASS:** 0 / 0 / 0 violations.
+- **Accuracy:** MAE log AGB 0.83, log DIA 0.32.
+- **Context only:** the current rule on the same test has bias log AGB **+0.47** and a median subplot-total ratio of **1.51**. It would fail A1 and A3 by a wide margin.
+
+**Diagnosis.** The failure is concentrated in the smallest trees and in biomass, not diameter: DIA bias is small, and the AGB bias comes from the allometry, which is log-linear in DIA and HT and too stiff at the smallest sizes. Over training, the validation bias drifts monotonically (+0.26 → −0.24), so the selected epoch is a zero-crossing, not a converged optimum.
+
+**Status.** TEST has now been used. Any revised model needs a FRESH held-out set. Options:
+- a new plot split, with this test set retired;
+- a different state held out.

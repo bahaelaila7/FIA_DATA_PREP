@@ -16,7 +16,8 @@ Semantics (D49 + amendments; review fixes 1–7):
     given z, so each importance sample is a monotone path.
   * Outputs (fix 4/5): posterior-mean log DIA / log HT / log AGB; linear-scale posterior mean AGB (for totals); predictive samples of
     log AGB (mixture over the weighted paths + allometry noise) for interval coverage. Capped at the first observed value.
-  * Epoch selection on the VAL benchmark (D49 amendment 2): minimise |median bias log AGB| + |80 % coverage − 0.8|. TEST scored once.
+  * Epoch selection on the VAL benchmark: minimise |median bias log AGB|; then one interval width factor w fitted on VAL so the 80 %
+    interval covers 0.80 there, frozen into the checkpoint (D49 amendment 3). TEST scored once by nimiwae_bench.py.
 Usage: python -I nimiwae_train.py --data DIR [--epochs N] [--k K]"""
 import argparse, json, math, time
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
@@ -154,7 +155,7 @@ def batches(n, bs, rng):
 def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 
 @torch.no_grad()
-def impute(model, B, K=100, bs=2048, nsamp=200):
+def impute(model, B, K=100, bs=2048, nsamp=200, w_int=1.0):
     """Posterior summaries per slot: mean log DIA / log HT / log AGB, linear mean AGB, and 10 % / 90 % predictive quantiles of log AGB.
     Capped at the tree's first observed value (the rule's cap)."""
     res = {k: [] for k in ('lD', 'lH', 'lA', 'A', 'q10', 'q90')}
@@ -169,6 +170,7 @@ def impute(model, B, K=100, bs=2048, nsamp=200):
         n_ = ks.shape[0]; ar = torch.arange(n_)[:, None]
         smu = muA.permute(1, 0, 2)[ar, ks]; ssd = torch.exp(lsA.permute(1, 0, 2)[ar, ks])        # [n, nsamp, T]
         draw = smu + ssd * torch.randn_like(smu)
+        draw = eA[:, None] + w_int * (draw - eA[:, None])                                       # interval width factor (fitted on VAL, D49 am. 3)
         q = torch.quantile(draw, torch.tensor([0.1, 0.9]), dim=1)                              # [2, n, T]
         res['lD'].append(cap(eD, b['lD'])); res['lH'].append(cap(eH, b['lH'])); res['lA'].append(cap(eA, b['lA']))
         res['A'].append(torch.minimum(A, torch.exp(b['lA'].gather(1, f[:, None])))); res['q10'].append(q[0]); res['q90'].append(q[1])
@@ -181,11 +183,11 @@ def monotone_violations(lX, B, tol=1e-6):
     d = lX[:, 1:] - lX[:, :-1]; pair = pre[:, 1:] & pre[:, :-1]
     return int(((d < -tol) & pair).any(1).sum())
 
-def bench_eval(model, data, split, atab, K=100):
+def bench_eval(model, data, split, atab, K=100, w_int=1.0):
     bb = pd.read_parquet(f'{data}/bench.parquet'); bb = bb[bb.split == split].copy()
     bb['obs'] = ~bb['hidden']; bb['thr_in'] = 3.0
     B, _, seq = build(bb, model.vocab, atab)
-    R = impute(model, B, K)
+    R = impute(model, B, K, w_int=w_int)
     hid = B['hid'].bool()
     eA = (R['lA'] - B['lA'])[hid].numpy(); eD = (R['lD'] - B['lD'])[hid].numpy()
     cov = ((B['lA'] >= R['q10']) & (B['lA'] <= R['q90']))[hid].float().numpy()
@@ -196,6 +198,14 @@ def bench_eval(model, data, split, atab, K=100):
     return dict(mae_lA=float(np.abs(eA).mean()), bias_lA=float(np.median(eA)), bias_lD=float(np.median(eD)), bias_lH=float(np.median(eH)),
                 bias_allom_true_size=float(np.median(eAl)), cov80=float(cov.mean()),
                 viol=(monotone_violations(R['lD'], B), monotone_violations(R['lH'], B), monotone_violations(R['lA'], B))), B, R, seq
+
+def fit_width(model, data, atab, grid=np.arange(1.0, 12.01, 0.05)):
+    """Smallest interval width factor whose VAL 80 % coverage reaches 0.80 (split-conformal style, D49 amendment 3)."""
+    torch.manual_seed(7)
+    for w in grid:
+        r, *_ = bench_eval(model, data, 'val', atab, w_int=float(w))
+        if r['cov80'] >= 0.80: return float(w)
+    return float(grid[-1])
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); ap.add_argument('--epochs', type=int, default=6)
@@ -217,13 +227,17 @@ def main():
             opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step()
             tot += loss.item(); nb += 1
         r, *_ = bench_eval(model, a.data, 'val', atab)
-        score = abs(r['bias_lA']) + abs(r['cov80'] - 0.8)
+        score = abs(r['bias_lA'])                                                             # (D49 am. 3: coverage is set by the VAL width factor)
         hist.append(dict(epoch=ep, loss=tot / nb, **{f'val_{k}': v for k, v in r.items()}, select=score, field_miss=float(torch.sigmoid(model.leps)), proc_sd=float(torch.exp(model.lsP))))
         print(json.dumps(hist[-1]), f'{time.time() - t0:.0f}s', flush=True)
         if score < best[0]:
             best = (score, ep); torch.save({'state': model.state_dict(), 'vocab': vocab, 'epoch': ep}, f'{a.data}/nimiwae.pt')
     json.dump(dict(hist=hist, best_epoch=best[1], best_select=best[0], args=vars(a)), open(f'{a.data}/train_log.json', 'w'), indent=1)
-    print(f'best epoch {best[1]} (|bias| + |cov − 0.8| = {best[0]:.4f}) -> {a.data}/nimiwae.pt')
+    print(f'best epoch {best[1]} (|median bias log AGB| = {best[0]:.4f}) -> {a.data}/nimiwae.pt')
+    ck = torch.load(f'{a.data}/nimiwae.pt', weights_only=False); model.load_state_dict(ck['state'])
+    w = fit_width(model, a.data, atab); ck['w_int'] = w; torch.save(ck, f'{a.data}/nimiwae.pt')
+    r, *_ = bench_eval(model, a.data, 'val', atab, w_int=w)
+    print(f'VAL width factor w = {w:.2f} -> VAL 80 % coverage {r["cov80"]:.3f}; frozen into {a.data}/nimiwae.pt')
 
 if __name__ == '__main__':
     main()
