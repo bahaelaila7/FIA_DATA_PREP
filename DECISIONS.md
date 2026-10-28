@@ -666,3 +666,12 @@ That is not-missing-at-random. NIMIWAE (Lim et al. 2021) models p(x, m) = ∫ p(
 If accepted, `backfill: nimiwae` becomes the default in cohorts_landis / build_tree_trajectories, with the rule kept as an option. If not, the rule stays and the result is recorded.
 
 **Limits (stated in advance):** the benchmark tests extrapolation below 3 in from trees seen above it. Production also extrapolates below 1 in, and below 5 in for subplot trees, where there is no truth.
+
+**D49 amendment — causality / monotone growth (user, 2026-10-28; recorded BEFORE any test scoring).**
+"NIMIWAE must maintain causality, it cannot suggest that diameter and height decreasing then increasing again."
+- **Model structure.** Each tree has a latent TRUE size path: log DIA at its last slot, plus non-negative growth increments back in time (softplus rate × elapsed years). The path is non-decreasing in time by construction.
+- **Observations** are the path plus measurement noise (σ learned). Imputations are the path itself, so each importance sample and their weighted mean are monotone.
+- **AGB** comes from a monotone allometry (log AGB = a_sp + softplus(b_sp) · log DIA). The unconstrained residual term is removed.
+- **Bounds.** An imputed value never exceeds the tree's first observed value, the same cap as the rule.
+- **Criterion 4 (hard), added:** 0 imputed trajectories with a decrease between consecutive slots or above the debut value, on the benchmark and in production.
+- **Evidence.** The discarded unconstrained first model drifted (val MAE 0.63 → 1.26 → 3.45 over 3 epochs, bias −2.3): the MNAR degenerate solution of explaining missingness with ever-smaller missing values. No test data was used.
