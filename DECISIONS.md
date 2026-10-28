@@ -627,3 +627,42 @@ The chosen option comes first; rejected options follow "Rejected".
 - (a) chosen: FIA-linked corrections only;
 - (b) pure composite key with no corrections; rejected, because it reintroduces reused-number "zombie" trees and breaks PREV_PLT_CN-linked renumbered plots;
 - (c) keep the links with a species-tolerant test; rejected, because coordinates are fuzzed and species is unreliable for saplings.
+
+## D49 — NIMIWAE phantom backfill: design and pre-registered benchmark (2026-10-28, coordinator; user: NIMIWAE before the Region 4 build)
+**Scope.** Only the SIZE of phantom slots, i.e. DIA and per-tree AGB at pre-debut visits. Which slots exist stays with the current rules (prior_age ≥ 1 and the D-rule blocks).
+
+**Why NIMIWAE.** A tree is missing at a visit *because* it was small:
+- below 1 in DBH for a microplot tree (debut TPA ≈ 74.965);
+- below 5 in for a subplot tree (debut TPA ≈ 6.018).
+
+That is not-missing-at-random. NIMIWAE (Lim et al. 2021) models p(x, m) = ∫ p(x | z) p(m | x) p(z) dz. It is trained with an importance-weighted bound, using K imputations x̃_m ~ p(x_m | z).
+
+**Model.**
+- Unit: one tree trajectory over its subplot's visits.
+- Covariates: species group, EPA L3, planted stratum, age at visit, years from the tree's first visit, and live BA of the subplot-visit.
+- x_t = (log DIA_t, log AGB_t).
+- Encoder: deep set over the observed visits plus covariates → q(z), with z ∈ ℝ⁴.
+- Decoder: log DIA(t) = f(z, covariates, age_t), Gaussian; log AGB = per-group allometry on log DIA, Gaussian.
+- Missingness: p(m_t = observed | x_t) = σ(γ · (log DIA_t − log thr) + b), with thr = 1 in (microplot tree) or 5 in (subplot tree). γ and b are learned, so the known tally limit is soft and field misses are learned.
+- Imputation: posterior mean over the importance-weighted samples.
+
+**Data and splits.**
+- Real records of tree_trajectories from the curated_r8 builds.
+- Plot-level split by crc32(plot key): 70 / 15 / 15 train / val / test.
+- Val is used for model choices (epochs, K, dimensions). Test is used once.
+
+**Benchmark (pre-registered; pseudo-censoring with known truth).**
+- Test trees: first real record is a microplot sapling below 3 in, there are ≥ 3 real visits, and at least one visit is below 3 in and a later one ≥ 3 in.
+- Their records below 3.0 in are hidden, as an MNAR analogue of the tally limits.
+- Both methods impute the hidden visits:
+  - the current rule (rate back-projection from the first visible record, rates estimated on train exactly as `estimate_sapling_growth_rates` with the per-tree basis, floor 2 g);
+  - NIMIWAE, trained on train under the true tally thresholds.
+
+**Acceptance on TEST (all three required):**
+1. MAE(log AGB) ≤ 0.9 × the rule's MAE.
+2. In every hidden DIA class (1–2, 2–3 in) and major species group with n ≥ 200, the |median bias of log AGB| ≤ the rule's.
+3. Median |relative error| of the subplot-visit hidden-AGB total ≤ the rule's.
+
+If accepted, `backfill: nimiwae` becomes the default in cohorts_landis / build_tree_trajectories, with the rule kept as an option. If not, the rule stays and the result is recorded.
+
+**Limits (stated in advance):** the benchmark tests extrapolation below 3 in from trees seen above it. Production also extrapolates below 1 in, and below 5 in for subplot trees, where there is no truth.
