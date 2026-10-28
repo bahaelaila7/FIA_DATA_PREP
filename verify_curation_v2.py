@@ -17,7 +17,7 @@ The OLD tables are read deliberately and fully qualified (old.* / fiaold.*) as t
 r7 (DECISIONS D36-D45): from consistency checker to independent RE-DERIVATION. The verifier
 imports only duckdb / os / sys (the n9 fixtures in selftest_fixtures.py import pipeline code: the
 documented exception) and re-derives from raw FIADB and the decision text: the canonical plot map
-with the D29 links, D35 relinks and D37 duplicate visits; tree identity (D36 split, n19); censoring
+(PREV_PLT_CN chains only since r8 D48); tree identity (D36 split, n19); censoring
 events and final / terminal fates (n20, c1, n21); the scaffold and the D18 time axis (n15, n16);
 record values and units (n17); phantom completeness (n18); the D41 disturbance events,
 subp_has_dstrb and every Sim B drop with its magnitude and the D42 full removals (n21, n22, n8);
@@ -176,34 +176,14 @@ con.execute(f"SET threads={os.environ.get('FIA_DUCKDB_THREADS', '3')}; "
 # in-memory catalog `f` holds one view per FIADB table, remapped where the table is plot-keyed.
 con.execute(f"ATTACH '{a.fiadb}' AS fraw (READ_ONLY)")
 con.execute("ATTACH ':memory:' AS f")
-# r6 S1 (D29): a chain start is also linked to an earlier chain end with IDENTICAL LAT/LON (same
-# state, earlier, different key) when >= 30 % of the end's live trees reappear at the start with
-# the same SUBP / TREE / SPCD and non-decreasing DIA (best end per start, each end once); a link
-# whose re-keyed chain would collide on a plot-INVYR is dropped. Re-derived here independently.
+# r8 D48: identity uses FIA's own links only: the canonical key follows the PREV_PLT_CN chain (the
+# r6 D29 coordinate links and the r7 D37 duplicate-visit collapse are removed)
 con.execute("""CREATE TABLE f.main._ap AS SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.LAT, P.LON,
     MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(P.MEASDAY,0),15) AS BIGINT)) md
     FROM fraw.main.PLOT P JOIN fraw.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'""")
-con.execute("""CREATE TABLE f.main._links AS
-WITH par AS (SELECT a.CN, a.PREV_PLT_CN FROM f.main._ap a SEMI JOIN f.main._ap b ON b.CN = a.PREV_PLT_CN),
-st AS (SELECT a.* FROM f.main._ap a ANTI JOIN par USING (CN)),
-en AS (SELECT a.* FROM f.main._ap a ANTI JOIN par ON par.PREV_PLT_CN = a.CN),
-pr AS (SELECT st.CN s, en.CN e, en.md emd FROM st JOIN en ON en.STATECD = st.STATECD AND en.LAT = st.LAT AND en.LON = st.LON
-       AND en.md < st.md AND en.CN <> st.CN AND (en.UNITCD, en.COUNTYCD, en.PLOT) IS DISTINCT FROM (st.UNITCD, st.COUNTYCD, st.PLOT)),
-tr AS (SELECT pr.s, pr.e, count(*) nl,
-              count(*) FILTER (WHERE EXISTS (SELECT 1 FROM fraw.main.TREE u WHERE u.PLT_CN = pr.s AND u.SUBP = t.SUBP
-                               AND u.TREE = t.TREE AND u.SPCD = t.SPCD AND u.DIA >= t.DIA)) nm
-       FROM pr JOIN fraw.main.TREE t ON t.PLT_CN = pr.e AND t.STATUSCD = 1 AND t.SUBP <= 4 GROUP BY ALL),   -- r7 D37: live SUBP <= 4
-ok AS (SELECT tr.*, pr.emd, nm / nl r FROM tr JOIN pr USING (s, e) WHERE nm >= 0.30 * nl)
-SELECT s, e FROM (SELECT * FROM ok QUALIFY row_number() OVER (PARTITION BY s ORDER BY r DESC, emd DESC, e) = 1)
-QUALIFY row_number() OVER (PARTITION BY e ORDER BY r DESC, s) = 1""")
-
-
-def _canon_walk(with_links):
-    lk = "UNION ALL SELECT s, e FROM f.main._links" if with_links else ""
-    con.execute(f"""CREATE OR REPLACE TABLE f.main._walk AS
-    WITH RECURSIVE ed AS (SELECT a.CN c, a.PREV_PLT_CN p FROM f.main._ap a SEMI JOIN f.main._ap b ON b.CN = a.PREV_PLT_CN
-                          WHERE a.CN NOT IN (SELECT s FROM f.main._links WHERE {str(with_links).upper()})
-                          {lk}),
+def _canon_walk():
+    con.execute("""CREATE OR REPLACE TABLE f.main._walk AS
+    WITH RECURSIVE ed AS (SELECT a.CN c, a.PREV_PLT_CN p FROM f.main._ap a SEMI JOIN f.main._ap b ON b.CN = a.PREV_PLT_CN),
     roots AS (SELECT CN FROM f.main._ap ANTI JOIN ed ON ed.c = CN),
     walk(CN, root, depth) AS (SELECT CN, CN, 0 FROM roots UNION ALL
                               SELECT ed.c, w.root, w.depth + 1 FROM walk w JOIN ed ON ed.p = w.CN WHERE w.depth < 200)
@@ -217,48 +197,14 @@ def _canon_walk(with_links):
         sys.exit(2)
 
 
-_canon_walk(False)
-con.execute("CREATE TABLE f.main._walk0 AS SELECT * FROM f.main._walk")
-# r7 D37 (re-derived): two plot-visits that collide on a canonical plot-INVYR with IDENTICAL LAT/LON
-# and the D29 share >= 30 % (the earlier visit's live SUBP <= 4 trees continued at the later one:
-# same SUBP / TREE / SPCD, DIA not decreasing) are ONE physical visit: the one with more live
-# SUBP <= 4 records is kept (tie: the later, which its successors link to) and the other's records
-# are dropped from every view; any other collision drops the coordinate link that caused it
-con.execute("CREATE TABLE f.main._dup_drop (cn VARCHAR, keep_cn VARCHAR)")
-for _it in range(20):
-    _canon_walk(True)
-    con.execute("""CREATE OR REPLACE TABLE f.main._coll AS
-        WITH k AS (SELECT w.CN, w.root, w0.root root0, a.STATECD, a.INVYR, a.LAT, a.LON, a.md, o.UNITCD, o.COUNTYCD, o.PLOT
-                   FROM f.main._walk w JOIN f.main._walk0 w0 USING (CN) JOIN f.main._ap a ON a.CN = w.CN
-                   JOIN f.main._ap o ON o.CN = w.root WHERE w.CN NOT IN (SELECT cn FROM f.main._dup_drop)),
-        d AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, count(*) n FROM k GROUP BY ALL HAVING count(*) > 1)
-        SELECT k.*, d.n FROM k JOIN d USING (STATECD, UNITCD, COUNTYCD, PLOT, INVYR)""")
-    if not con.execute("SELECT count(*) FROM f.main._coll").fetchone()[0]:
-        break
-    _dups = con.execute("""
-        WITH pr AS (SELECT a.CN e, b.CN s FROM f.main._coll a JOIN f.main._coll b USING (STATECD, UNITCD, COUNTYCD, PLOT, INVYR)
-                    WHERE a.n = 2 AND a.LAT = b.LAT AND a.LON = b.LON AND (a.md, a.CN) < (b.md, b.CN)),
-        lv AS (SELECT CAST(PLT_CN AS VARCHAR) cn, count(*) n FROM fraw.main.TREE
-               WHERE CAST(PLT_CN AS VARCHAR) IN (SELECT e FROM pr UNION SELECT s FROM pr) AND STATUSCD = 1 AND SUBP <= 4 GROUP BY 1),
-        sh AS (SELECT pr.e, pr.s, count(*) FILTER (WHERE EXISTS (SELECT 1 FROM fraw.main.TREE u WHERE CAST(u.PLT_CN AS VARCHAR) = pr.s
-                      AND u.SUBP = t.SUBP AND u.TREE = t.TREE AND u.SPCD = t.SPCD AND u.DIA >= t.DIA)) nm
-               FROM pr JOIN fraw.main.TREE t ON CAST(t.PLT_CN AS VARCHAR) = pr.e AND t.STATUSCD = 1 AND t.SUBP <= 4 GROUP BY ALL)
-        SELECT sh.e, sh.s, COALESCE(le.n, 0) ne, COALESCE(ls.n, 0) ns FROM sh LEFT JOIN lv le ON le.cn = sh.e LEFT JOIN lv ls ON ls.cn = sh.s
-        WHERE le.n > 0 AND sh.nm >= 0.30 * le.n ORDER BY 1, 2""").fetchall()
-    if _dups:
-        for _e, _s, _ne, _ns in _dups:
-            con.execute("INSERT INTO f.main._dup_drop VALUES (?, ?)", [_e, _s] if _ns >= _ne else [_s, _e])
-        continue
-    _bad = con.execute("SELECT DISTINCT root0 FROM f.main._coll WHERE root <> root0").fetchall()
-    if not _bad:
-        print("FATAL: canonical plot keys collide on a plot-INVYR without a coordinate link to drop or a D37 duplicate")
-        sys.exit(2)
-    con.executemany("DELETE FROM f.main._links WHERE s = ?", _bad)
-else:   # r7 E27: still colliding after 20 rounds -> the map is not trustworthy
-    print("FATAL: canonical-key collisions remain after 20 rounds")
+_canon_walk()
+# the canonical key must not collide on a plot-INVYR (two visits of one canonical plot in one INVYR)
+_ncoll = con.execute("""SELECT count(*) FROM (SELECT a.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT, a.INVYR FROM f.main._walk w
+    JOIN f.main._ap a ON a.CN = w.CN JOIN f.main._ap o ON o.CN = w.root GROUP BY ALL HAVING count(*) > 1)""").fetchone()[0]
+if _ncoll:
+    print(f"FATAL: canonical plot keys collide on {_ncoll} plot-INVYRs")
     sys.exit(2)
-print(f"canonical map: {con.execute('SELECT count(*) FROM f.main._links').fetchone()[0]} coordinate links, "
-      f"{con.execute('SELECT count(*) FROM f.main._dup_drop').fetchone()[0]} D37 duplicate visits dropped")
+print("canonical map: PREV_PLT_CN chains only (r8 D48: no coordinate links, no duplicate-visit collapse)")
 con.execute("""CREATE TABLE f.main._canon AS
 SELECT w.CN, r.UNITCD, r.COUNTYCD, r.PLOT, a.UNITCD AS unitcd_raw, a.COUNTYCD AS countycd_raw, a.PLOT AS plot_raw
 FROM f.main._walk w JOIN f.main._ap a ON a.CN = w.CN JOIN f.main._ap r ON r.CN = w.root
@@ -270,15 +216,13 @@ for _tn, _cn, _dt in con.execute("""SELECT table_name, column_name, data_type FR
 for (_t,) in con.execute("SELECT table_name FROM duckdb_tables() WHERE database_name='fraw'").fetchall():
     _k = _kt.get(_t, {})
     _on = "t.CN" if _t == "PLOT" else ("t.PLT_CN" if "PLT_CN" in _k else None)
-    # r7 D37: the records of a dropped duplicate visit are in no view
-    _dupf = f" WHERE CAST({_on} AS VARCHAR) NOT IN (SELECT cn FROM f.main._dup_drop)" if _on and _t == _t.upper() else ""
     if _t == _t.upper() and _on and {"UNITCD", "COUNTYCD", "PLOT"} <= set(_k):
         _rep = ", ".join(f"CASE WHEN m.CN IS NULL THEN t.{x} ELSE CAST(m.{x} AS {_k[x]}) END AS {x}"
                          for x in ("UNITCD", "COUNTYCD", "PLOT"))
         con.execute(f'CREATE VIEW f.main."{_t}" AS SELECT t.* REPLACE ({_rep}) FROM fraw.main."{_t}" t '
-                    f'LEFT JOIN f.main._canon m ON m.CN = CAST({_on} AS VARCHAR){_dupf}')
+                    f'LEFT JOIN f.main._canon m ON m.CN = CAST({_on} AS VARCHAR)')
     else:
-        con.execute(f'CREATE VIEW f.main."{_t}" AS SELECT t.* FROM fraw.main."{_t}" t{_dupf}')
+        con.execute(f'CREATE VIEW f.main."{_t}" AS SELECT t.* FROM fraw.main."{_t}" t')
 con.execute(f"ATTACH '{a.curated_db}' AS new (READ_ONLY)")
 FIT_SCOPE = ",".join(str(int(r[0])) for r in con.execute(
     "SELECT DISTINCT STATECD FROM new.curated_trees ORDER BY 1").fetchall())
@@ -406,8 +350,8 @@ WITH raw AS (
 SELECT raw.STATUSCD, raw.tpa_null, raw.cs IN (3,4) AS on_water, count(*) raw_n, count(n.CN) in_curated
 FROM raw LEFT JOIN new.curated_trees n ON n.CN = raw.CN GROUP BY ALL ORDER BY ALL""")
 # r7 E3: ENFORCED — no dead/cut record of a reference tree is lost (records that precede an RC7
-# "erroneously tallied" record of the same tree are dropped by the documented rule; D37 duplicate
-# visits are dropped as a whole)
+# "erroneously tallied" record of the same tree are dropped by the documented rule;
+# r8 D48: no duplicate visits are dropped any more)
 r = con.execute(f"""
 WITH raw AS (
   SELECT T.CN, T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, P.CN pcn,
@@ -421,7 +365,7 @@ WITH raw AS (
     AND P.PLOT_STATUS_CD < 3 AND COALESCE(SU.SUBP_STATUS_CD, -1) <> 3)
 SELECT count(*), count(*) FILTER (WHERE n.CN IS NULL)
 FROM raw LEFT JOIN rc7 USING (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE) LEFT JOIN new.curated_trees n ON n.CN = raw.CN
-WHERE NOT (rc7.d7 IS NOT NULL AND raw.md < rc7.d7) AND CAST(raw.pcn AS VARCHAR) NOT IN (SELECT cn FROM f.main._dup_drop)""").fetchone()
+WHERE NOT (rc7.d7 IS NOT NULL AND raw.md < rc7.d7)""").fetchone()
 check_n("1e. (f) no dead/cut record of a raw-reference tree is lost", r[1] == 0, r[0], f"({r[1]:,} of {r[0]:,} lost)")
 r = con.execute("""SELECT count(*) FROM ref_trees rt ANTI JOIN (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE
                    FROM new.curated_trees) n USING (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE)""").fetchone()[0]
@@ -504,10 +448,6 @@ _ub = con.execute("""SELECT (SELECT count(*) FROM ub),
                            WHERE break_kind='unrecorded' OR n_unrecorded_saplings > 0))""").fetchone()
 check("(b) raw re-tally candidate set = pipeline procedural_breaks (unrecorded part; r7 E13: enforced)",
       _ub[1] == 0 and _ub[2] == 0, f"(raw {_ub[0]:,}; pipeline-only {_ub[1]:,}; raw-only {_ub[2]:,})")
-# r6 D35: coordinate-linked chain starts (verifier's own _links) are procedural breaks for EVERY debut
-con.execute("""CREATE TEMP TABLE lb AS SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT,
-    MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(P.MEASDAY,0),15) AS BIGINT)) bd
-    FROM f.main._links l JOIN f.PLOT P ON CAST(P.CN AS VARCHAR) = l.s""")
 # member debut (first live record meeting the cohort-table filter)
 con.execute(f"""
 CREATE TEMP TABLE deb AS
@@ -548,9 +488,7 @@ def block_reasons(src_sql, rule_c=True):
                     OR EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=j.STATECD AND ub.UNITCD=j.UNITCD AND ub.COUNTYCD=j.COUNTYCD
                              AND ub.PLOT=j.PLOT AND ub.bd > j.p AND ub.bd <= j.D)))
       OR (COALESCE(j.drn = 8, FALSE) AND EXISTS (SELECT 1 FROM rb WHERE rb.STATECD=j.STATECD AND rb.UNITCD=j.UNITCD
-                             AND rb.COUNTYCD=j.COUNTYCD AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D))
-      OR EXISTS (SELECT 1 FROM lb WHERE lb.STATECD=j.STATECD AND lb.UNITCD=j.UNITCD AND lb.COUNTYCD=j.COUNTYCD
-                 AND lb.PLOT=j.PLOT AND lb.bd > j.p AND lb.bd <= j.D) AS r_b,
+                             AND rb.COUNTYCD=j.COUNTYCD AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D)) AS r_b,
       {"(j.ddia >= 5 AND COALESCE(j.drc NOT IN (2,3,7,8), TRUE) AND EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=j.STATECD AND rv.UNITCD=j.UNITCD AND rv.COUNTYCD=j.COUNTYCD AND rv.PLOT=j.PLOT AND rv.SUBP=j.SUBP AND rv.md >= j.p AND rv.md < j.D AND rv.fmic > 0))" if rule_c else "FALSE"} AS r_c
     FROM j"""
 
@@ -750,20 +688,7 @@ for _lab, _act, _rc in (
 #   (a) q is dead/cut and r.PREV_TRE_CN is NULL                         (D7 / r3 M3)
 #   (b) r.PREV_TRE_CN is set and is not q's CN                          (r3 M3)
 #   (c) r.PREV_TRE_CN is NULL and r.RECONCILECD is a new-tree code 1-4  (D36, A7-1)
-#   (d) r is at a D29 link start, PREV_TRE_CN NULL, q live, and SPCD differs or DIA decreased (D29)
-#   (e) the key was censored 'procedural_relink' at a link start L and q < L <= r (D36, F7-1)
-con.execute(f"""
-CREATE TEMP TABLE relk AS
-SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, T.SUBP, T.TREE rtree, lb.bd L
-FROM f.main._links l JOIN f.PLOT P ON CAST(P.CN AS VARCHAR) = l.s
-JOIN lb ON lb.STATECD = P.STATECD AND lb.UNITCD = P.UNITCD AND lb.COUNTYCD = P.COUNTYCD AND lb.PLOT = P.PLOT
-     AND lb.bd = MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(P.MEASDAY,0),15) AS BIGINT))
-JOIN f.TREE T ON CAST(T.PLT_CN AS VARCHAR) = l.e
-WHERE T.STATUSCD = 1 AND T.SUBP <= 4 AND {scope('P')}
-  AND NOT EXISTS (SELECT 1 FROM f.TREE u WHERE CAST(u.PLT_CN AS VARCHAR) = l.s AND u.SUBP = T.SUBP AND u.TREE = T.TREE
-                  AND u.SPCD = T.SPCD AND u.DIA >= T.DIA
-                  AND (P.KINDCD IS DISTINCT FROM 3 OR u.STATUSCD = 1))   -- D38: on a KINDCD 3 start a dead record continues nothing
-""")
+# (r8 D48: the D29 link-start rule and the D35 relink-closed rule are removed)
 con.execute(f"""
 CREATE TEMP TABLE myseg AS
 WITH r AS (SELECT CAST(c.CN AS VARCHAR) cn, c.STATECD, c.UNITCD, c.COUNTYCD, c.PLOT, c.SUBP, c.TREE ptree, c.MEASDATE md,
@@ -775,12 +700,9 @@ q AS (SELECT r.*, lag(cn) OVER w qcn, lag(st) OVER w qst, lag(sp) OVER w qsp, la
 s AS (SELECT q.*,
         COALESCE(qst IN (2,3) AND ptc IS NULL, FALSE) s_dead,
         COALESCE(ptc IS NOT NULL AND ptc <> qcn, FALSE) s_other,
-        COALESCE(ptc IS NULL AND rc IN (1,2,3,4), FALSE) s_newrc,
-        COALESCE(ptc IS NULL AND qst = 1 AND pcn IN (SELECT s FROM f.main._links) AND (sp IS DISTINCT FROM qsp OR dia < qdia), FALSE) s_link,
-        EXISTS (SELECT 1 FROM relk k WHERE k.STATECD = q.STATECD AND k.UNITCD = q.UNITCD AND k.COUNTYCD = q.COUNTYCD
-                AND k.PLOT = q.PLOT AND k.SUBP = q.SUBP AND k.rtree = q.rtree AND q.qmd < k.L AND k.L <= q.md) s_closed
+        COALESCE(ptc IS NULL AND rc IN (1,2,3,4), FALSE) s_newrc
       FROM q),
-g AS (SELECT s.*, qcn IS NOT NULL AND (s_dead OR s_other OR s_newrc OR s_link OR s_closed) newseg FROM s)
+g AS (SELECT s.*, qcn IS NOT NULL AND (s_dead OR s_other OR s_newrc) newseg FROM s)
 SELECT g.*, CAST(sum(newseg::INT) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree ORDER BY md, cn
                                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS BIGINT) seg
 FROM g""")
@@ -788,31 +710,15 @@ con.execute("""CREATE OR REPLACE TEMP TABLE myseg AS SELECT *, rtree + 100000 * 
                   max(seg) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree) > 0 myflag FROM myseg""")
 r = con.execute("""SELECT count(*), count(*) FILTER (WHERE mytree <> ptree), count(*) FILTER (WHERE myflag IS DISTINCT FROM pflag),
        count(DISTINCT (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree)) FILTER (WHERE mytree <> ptree),
-       sum(s_dead::INT) FILTER (WHERE newseg), sum(s_other::INT) FILTER (WHERE newseg), sum(s_newrc::INT) FILTER (WHERE newseg),
-       sum(s_link::INT) FILTER (WHERE newseg), sum(s_closed::INT) FILTER (WHERE newseg) FROM myseg""").fetchone()
+       sum(s_dead::INT) FILTER (WHERE newseg), sum(s_other::INT) FILTER (WHERE newseg), sum(s_newrc::INT) FILTER (WHERE newseg)
+       FROM myseg""").fetchone()
 check_n("(n19) D36: tree ids (TREE + 100000 k) and tree_key_split = the split rule re-derived from raw TREE (every record)",
         r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} records; id differs {r[1]:,} on {r[3]} raw keys; flag differs {r[2]:,}; "
-                                      f"segment starts dead {r[4]} / other-link {r[5]} / new-tree RC {r[6]} / link-start {r[7]} / relink-closed {r[8]})")
+                                      f"segment starts dead {r[4]} / other-link {r[5]} / new-tree RC {r[6]})")
 if r[1]:
     show("(n19) first id differences", """SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree, md, st, sp, dia, rc, ptc IS NULL no_prev, ptree, mytree,
-        s_dead, s_other, s_newrc, s_link, s_closed FROM myseg WHERE (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree) IN
+        s_dead, s_other, s_newrc FROM myseg WHERE (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree) IN
         (SELECT (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree) FROM myseg WHERE mytree <> ptree LIMIT 4) ORDER BY ALL LIMIT 30""")
-# n14 extensions (D36): a relink-censored key is CLOSED (no later record under the censored tree id)
-# and a CONTINUED end tree is never censored at the link
-r = con.execute(f"""
-WITH ce AS (SELECT * FROM new.tree_censor_events WHERE reason = 'procedural_relink' AND {scope()})
-SELECT (SELECT count(*) FROM ce),
-       (SELECT count(*) FROM ce JOIN new.curated_trees c USING (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE) WHERE c.MEASDATE >= ce.MEASDATE),
-       (SELECT count(*) FROM ce WHERE NOT EXISTS (SELECT 1 FROM relk k WHERE k.STATECD = ce.STATECD AND k.UNITCD = ce.UNITCD
-               AND k.COUNTYCD = ce.COUNTYCD AND k.PLOT = ce.PLOT AND k.SUBP = ce.SUBP AND k.rtree = ce.TREE % 100000 AND k.L = ce.MEASDATE))""").fetchone()
-_nlk = con.execute("SELECT count(*) FROM relk").fetchone()[0]
-if r[0] or _nlk:
-    check("(n14) D36: relink-censored tree ids never reappear; every relink censoring is a re-derived non-continued end tree",
-          r[1] == 0 and r[2] == 0, f"({r[0]} relink censorings, re-derived {_nlk}; {r[1]} records at/after the censoring under the same id; "
-                                   f"{r[2]} on a continued / non-end tree)")
-else:
-    info("(n14) D36: no coordinate links in scope", "(nothing to test)")
-
 # ---- r7 E10 / D36: censoring events and final fates re-derived from raw STATUSCD 0 records -------
 # events are keyed by the post-split tree id: the segment of the raw key whose FIRST record is the
 # latest one strictly before the event date (the tree the event closes); before every record of
@@ -840,18 +746,11 @@ WITH e AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, md MEASDATE,
                           ELSE 'not_in_sample' END reason
            FROM rs0 WHERE RC IS DISTINCT FROM 7),
 p AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE, reason FROM new.tree_censor_events
-      WHERE reason NOT IN ('procedural_unrecorded', 'procedural_relink') AND {scope()})
+      WHERE reason <> 'procedural_unrecorded' AND {scope()})
 SELECT (SELECT count(*) FROM e), (SELECT count(*) FROM (SELECT * FROM e EXCEPT ALL SELECT * FROM p)),
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT ALL SELECT * FROM e))""").fetchone()
 check_n("(n20) E10 / D36: STATUSCD 0 censoring events (shrank / moved / procedural / nonsampled / not_in_sample) = raw, "
         "keyed by the post-split tree id", r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} raw events; missing {r[1]}, extra {r[2]})")
-# relink censorings belong to the END tree (the segment before the link)
-r = con.execute(f"""WITH e AS ({_rekey("SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree, L FROM relk", "L")})
-    SELECT count(*), count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM new.tree_censor_events c WHERE c.reason = 'procedural_relink'
-        AND c.STATECD = e.STATECD AND c.UNITCD = e.UNITCD AND c.COUNTYCD = e.COUNTYCD AND c.PLOT = e.PLOT AND c.SUBP = e.SUBP
-        AND c.TREE = e.TREE AND c.MEASDATE = e.L)) FROM e""").fetchone()
-if r[0]:
-    check("(n20) D36: every re-derived relink censoring is keyed by the end tree's post-split id", r[1] == 0, f"({r[1]} of {r[0]} missing)")
 # final_tree_fate re-derived (trees without a dead/cut record; the dead/cut ones are (c1)): the
 # last record (a misrecorded death counts as alive there), then 'censored_<reason>' if the last
 # censoring follows it, else — if the subplot is revisited — 'diverted_landuse' when the tree is
@@ -905,32 +804,26 @@ check_n("(n20) D36: curated_trees censored / censor_* = the tree's own (post-spl
 
 # ---- (b) silent re-tally: residual unrecorded saplings by state x MANUAL transition ----------
 # (pv / pv2 / us: built from RAW FIADB above, with the block-rule re-derivation)
-# r7 E10: a sapling counts as censored only by the reason its own re-derivation gives it:
-# 'procedural_relink' at a coordinate-link start (lb), 'procedural_unrecorded' elsewhere; censor
-# events are keyed by the POST-split tree id (D36), taken from the curated record of the sapling
+# r7 E10: a sapling counts as censored only by 'procedural_unrecorded' (r8 D48: no relink censoring);
+# censor events are keyed by the POST-split tree id (D36), taken from the curated record of the sapling
 con.execute("""
 CREATE TEMP TABLE us2 AS
-WITH u AS (SELECT us.*, COALESCE(ct.TREE, us.TREE) ctree,
-                  EXISTS (SELECT 1 FROM lb WHERE lb.STATECD=us.STATECD AND lb.UNITCD=us.UNITCD AND lb.COUNTYCD=us.COUNTYCD
-                          AND lb.PLOT=us.PLOT AND lb.bd=us.nmd) at_link
+WITH u AS (SELECT us.*, COALESCE(ct.TREE, us.TREE) ctree
            FROM us LEFT JOIN new.curated_trees ct ON CAST(ct.CN AS VARCHAR) = us.pcn)
-SELECT u.*, (e.TREE IS NOT NULL AND (CASE WHEN u.at_link THEN e.rl ELSE e.pu END)) AS censored_unrec, COALESCE(e.pu, FALSE) AS censored_pu
-FROM u LEFT JOIN (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,MEASDATE, bool_or(reason = 'procedural_unrecorded') pu,
-                         bool_or(reason = 'procedural_relink') rl
+SELECT u.*, (e.TREE IS NOT NULL AND e.pu) AS censored_unrec, COALESCE(e.pu, FALSE) AS censored_pu
+FROM u LEFT JOIN (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,MEASDATE, bool_or(reason = 'procedural_unrecorded') pu
                    FROM new.tree_censor_events
-                   WHERE reason IN ('procedural_unrecorded', 'procedural_relink') GROUP BY ALL) e   -- r6 D35
+                   WHERE reason = 'procedural_unrecorded' GROUP BY ALL) e
   ON e.STATECD=u.STATECD AND e.UNITCD=u.UNITCD AND e.COUNTYCD=u.COUNTYCD AND e.PLOT=u.PLOT
  AND e.SUBP=u.SUBP AND e.TREE=u.ctree AND e.MEASDATE=u.nmd""")
 # r7 E10: the 'procedural_unrecorded' censoring events re-derived (an unrecorded sapling at a
-# raw re-tally plot-visit, ub) equal the pipeline's, in both directions (link starts excluded: there
-# the relink censoring of n14 applies)
+# raw re-tally plot-visit, ub) equal the pipeline's, in both directions
 r = con.execute("""
 WITH e AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,ctree TREE,nmd MEASDATE FROM us2
-           WHERE unrec AND NOT at_link AND EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=us2.STATECD AND ub.UNITCD=us2.UNITCD
+           WHERE unrec AND EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=us2.STATECD AND ub.UNITCD=us2.UNITCD
                  AND ub.COUNTYCD=us2.COUNTYCD AND ub.PLOT=us2.PLOT AND ub.bd=us2.nmd)),
 p AS (SELECT DISTINCT c.STATECD,c.UNITCD,c.COUNTYCD,c.PLOT,c.SUBP,c.TREE,c.MEASDATE FROM new.tree_censor_events c
-      WHERE c.reason = 'procedural_unrecorded' AND NOT EXISTS (SELECT 1 FROM lb WHERE lb.STATECD=c.STATECD AND lb.UNITCD=c.UNITCD
-            AND lb.COUNTYCD=c.COUNTYCD AND lb.PLOT=c.PLOT AND lb.bd=c.MEASDATE))
+      WHERE c.reason = 'procedural_unrecorded')
 SELECT (SELECT count(*) FROM e), (SELECT count(*) FROM (SELECT * FROM e EXCEPT SELECT * FROM p)),
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM e))""").fetchone()
 if r[0] or r[2]:
@@ -1282,7 +1175,7 @@ con.execute(f"""CREATE TEMP TABLE pvis AS
 SELECT DISTINCT CAST(P.CN AS VARCHAR) cn, P.STATECD statecd, P.UNITCD unitcd, P.COUNTYCD countycd, P.PLOT plot, P.INVYR, P.CYCLE, P.KINDCD,
        MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) measdate
 FROM f.PLOT P JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
-WHERE {scope('P')} AND CAST(P.CN AS VARCHAR) NOT IN (SELECT cn FROM f.main._dup_drop)
+WHERE {scope('P')}
   AND EXISTS (SELECT 1 FROM rv WHERE rv.STATECD = P.STATECD AND rv.UNITCD = P.UNITCD AND rv.COUNTYCD = P.COUNTYCD AND rv.PLOT = P.PLOT
               AND rv.md = MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)))""")
 # D43: the allowed reference visits = the product's annual scaffold visits (pvis) plus the canonical
@@ -1304,17 +1197,16 @@ for _t, _db in _TABS:
             r[1] == 0, r[0], f"({r[1]:,} of {r[0]:,} rows differ; {r[2]:,} not artificial / natural)")
 _tc = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE database_name='new' AND table_name='tree_trajectories'").fetchall()}
 check("(n23) D44 C F10: tree_trajectories keeps the 4-way management class as land_use_4way", "land_use_4way" in _tc, "")
-# procedural_breaks re-derived: RC8 closure visits (rb), silent re-tallies (ub), coordinate-link starts (lb)
+# procedural_breaks re-derived: RC8 closure visits (rb), silent re-tallies (ub) (r8 D48: no coord_link breaks)
 r = con.execute(f"""
-WITH e AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM rb UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM ub
-           UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM lb WHERE {scope()}),
+WITH e AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM rb UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM ub),
 p AS (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE bd FROM new.procedural_breaks WHERE {scope()})
 SELECT (SELECT count(*) FROM e), (SELECT count(*) FROM (SELECT * FROM e EXCEPT SELECT * FROM p)),
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM e))""").fetchone()
-check_n("(n23) procedural_breaks = re-derived (RC8 closures, silent re-tallies, coordinate-link starts; both directions)",
+check_n("(n23) procedural_breaks = re-derived (RC8 closures, silent re-tallies; both directions)",
         r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} re-derived plot-visits; missing {r[1]}, extra {r[2]})")
 con.execute(f"""CREATE TEMP TABLE pbx AS SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, bd measdate FROM rb
-                UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM ub UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM lb""")
+                UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM ub""")
 for _t, _db in _TABS:
     if _t == "tree_trajectories":
         continue
@@ -2009,21 +1901,25 @@ FROM new.curated_trees ct JOIN f.TREE ft ON CAST(ft.CN AS VARCHAR) = CAST(ct.CN 
 JOIN fraw.main.TREE rt ON rt.CN = ft.CN AND rt.STATECD = ft.STATECD WHERE {scope('ct')} AND {scope('ft')}""").fetchone()
 check("(n6) M-2: curated plot keys = canonical keys (PREV_PLT_CN chain), *_raw = as recorded", r[0] == 0 and r[1] == 0,
       f"({r[0]} key / {r[1]} raw-key mismatches; {r[2]:,} records on {r[3]} renumbered plots remapped)")
-# r7 D37: the re-derived duplicate visits = plot_key_remap's 'duplicate_visit' rows, and none of
-# their records is curated
-_nd = con.execute(f"SELECT count(*) FROM f.main._dup_drop d JOIN fraw.main.PLOT P ON CAST(P.CN AS VARCHAR) = d.cn WHERE {scope('P')}").fetchone()[0]
+# r8 D48: the coordinate-link layer is removed — no link / relink / duplicate-visit artefact remains
 _pkr = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE database_name='new' AND table_name='plot_key_remap'").fetchall()}
-if "reason" in _pkr:
-    r = con.execute(f"""
-    WITH e AS (SELECT d.cn, d.keep_cn FROM f.main._dup_drop d JOIN fraw.main.PLOT P ON CAST(P.CN AS VARCHAR) = d.cn WHERE {scope('P')}),
-    p AS (SELECT CAST(CN AS VARCHAR) cn, CAST(kept_cn AS VARCHAR) keep_cn FROM new.plot_key_remap WHERE reason = 'duplicate_visit'
-          AND {scope()})   -- (plot_key_remap is national: the run's scope only, as e)
-    SELECT (SELECT count(*) FROM (SELECT * FROM e EXCEPT SELECT * FROM p)), (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM e)),
-           (SELECT count(*) FROM new.curated_trees c JOIN fraw.main.TREE T ON CAST(T.CN AS VARCHAR) = CAST(c.CN AS VARCHAR) WHERE CAST(T.PLT_CN AS VARCHAR) IN (SELECT cn FROM e))""").fetchone()
-    check("(n6) D37: duplicate same-INVYR visits re-derived = plot_key_remap 'duplicate_visit' (dropped / kept), none curated",
-          r[0] == 0 and r[1] == 0 and r[2] == 0, f"({_nd} re-derived; missing {r[0]}, extra {r[1]}; curated records of dropped visits {r[2]})")
-else:
-    check("(n6) D37: plot_key_remap carries reason / kept_cn", False, f"(missing; {_nd} re-derived duplicate visits)")
+r = con.execute(f"""SELECT
+    (SELECT count(*) FROM new.tree_censor_events WHERE reason = 'procedural_relink'),
+    (SELECT count(*) FROM new.procedural_breaks WHERE break_kind = 'coord_link'),
+    (SELECT count(*) FROM new.plot_key_remap WHERE {"reason IS DISTINCT FROM 'prev_plt_cn'" if "reason" in _pkr else "FALSE"}
+            AND {scope()}),   -- (plot_key_remap is national: the run's scope only)
+    (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'new' AND table_name = 'plot_key_coord_links')""").fetchone()
+check("(n6) D48: no coordinate-link artefacts (procedural_relink censorings, coord_link breaks, coord_link / duplicate_visit "
+      "remaps, plot_key_coord_links)", r == (0, 0, 0, 0) and "kept_cn" not in _pkr,
+      f"(relink censorings {r[0]}, coord_link breaks {r[1]}, non-prev_plt_cn remaps {r[2]}, plot_key_coord_links {r[3]}, "
+      f"kept_cn column {'present' if 'kept_cn' in _pkr else 'absent'})")
+# every raw annual visit's records are in the views (no visit is dropped as a duplicate any more)
+r = con.execute(f"""SELECT count(*) FROM fraw.main.TREE T JOIN fraw.main.PLOT P ON P.CN = T.PLT_CN
+    JOIN fraw.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y' WHERE {scope('P')}""").fetchone()[0], \
+    con.execute(f"""SELECT count(*) FROM f.TREE T JOIN f.PLOT P ON P.CN = T.PLT_CN
+    JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y' WHERE {scope('P')}""").fetchone()[0]
+check("(n6) D48: the canonical views drop no raw annual TREE record (no duplicate-visit collapse)", r[0] == r[1],
+      f"(raw {r[0]:,}, views {r[1]:,})")
 # n7 (suspected, not confirmed in r5): tree-number splits through a dropped STATUSCD 0 record
 # without evidence of a different tree (same species, no DIA drop, no dead/cut record before)
 r = con.execute(f"""
@@ -2039,33 +1935,6 @@ FROM f1 LEFT JOIN fraw.main.TREE T ON CAST(T.CN AS VARCHAR) = f1.prev_tre_cn""")
 check("(n7) tree-number splits linked through a STATUSCD 0 record WITHOUT evidence of a different tree = 0", r[2] == 0,
       f"(segments {r[0]} / linked through a STATUSCD 0 record {r[1]} / of those without evidence {r[2]})")
 
-# n14 (D35): every live tree of a coordinate-linked chain end is either continued at the start
-# (same SUBP / TREE / SPCD, DIA not decreasing) or censored 'procedural_relink' there
-r = con.execute(f"""
-WITH lk AS (SELECT l.s, l.e, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.KINDCD, lb.bd FROM f.main._links l
-            JOIN f.PLOT P ON CAST(P.CN AS VARCHAR) = l.s JOIN lb USING (STATECD, UNITCD, COUNTYCD, PLOT)
-            WHERE lb.bd = MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON,0),6) AS BIGINT), CAST(COALESCE(NULLIF(P.MEASDAY,0),15) AS BIGINT))
-              AND {scope('P')}),
-et AS (SELECT lk.*, T.SUBP, T.TREE, T.SPCD, T.DIA,
-              EXISTS (SELECT 1 FROM f.TREE u WHERE CAST(u.PLT_CN AS VARCHAR) = lk.s AND u.SUBP = T.SUBP AND u.TREE = T.TREE
-                      AND u.SPCD = T.SPCD AND u.DIA >= T.DIA
-                      AND (lk.KINDCD IS DISTINCT FROM 3 OR u.STATUSCD = 1)) cont   -- r7 D38
-       FROM lk JOIN f.TREE T ON CAST(T.PLT_CN AS VARCHAR) = lk.e WHERE T.STATUSCD = 1 AND T.SUBP <= 4)
-SELECT count(DISTINCT s), count(*), count(*) FILTER (WHERE cont),
-       count(*) FILTER (WHERE NOT cont AND NOT EXISTS (SELECT 1 FROM new.tree_censor_events c WHERE c.STATECD = et.STATECD
-              AND c.UNITCD = et.UNITCD AND c.COUNTYCD = et.COUNTYCD AND c.PLOT = et.PLOT AND c.SUBP = et.SUBP
-              AND c.TREE % 100000 = et.TREE AND c.MEASDATE = et.bd AND c.reason = 'procedural_relink')),
-       -- r7 D36: a CONTINUED end tree is never censored at the link
-       count(*) FILTER (WHERE cont AND EXISTS (SELECT 1 FROM new.tree_censor_events c WHERE c.STATECD = et.STATECD
-              AND c.UNITCD = et.UNITCD AND c.COUNTYCD = et.COUNTYCD AND c.PLOT = et.PLOT AND c.SUBP = et.SUBP
-              AND c.TREE % 100000 = et.TREE AND c.MEASDATE = et.bd AND c.reason = 'procedural_relink'))
-FROM et""").fetchone()
-if r[0]:
-    check("(n14) D35 / D36: every live end tree of a coordinate link is continued or relink-censored, never both",
-          r[3] == 0 and r[4] == 0, f"({r[0]} links; {r[1]} end trees: {r[2]} continued, {r[1]-r[2]-r[3]} censored, "
-                                   f"{r[3]} neither, {r[4]} continued AND censored)")
-else:
-    info("(n14) D35: no coordinate-linked chain starts in scope", "(nothing to test)")
 # n10 (R2): every Sim A / Sim B / trajectory (canonical key, measdate) visit has its PLOT row and
 # >= 1 COND row in the curated DB (export_reference_tables) and in the slim DB
 def _visit_cov(cat):
