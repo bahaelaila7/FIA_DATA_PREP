@@ -587,3 +587,20 @@ The chosen option comes first; rejected options follow "Rejected".
 - **Verifier contract:**
   - an unmapped scope (`level = 'unmapped'`, fewer than 200 rows) is distinct from a rejected scope (curve rows with `applied = false`);
   - a planted row must be mapped exactly when the curve reaching it was applied.
+
+## D47 — R8 whole-state validation findings (2026-10-28, coordinator; run at a0c5465, outputs /workspace/FIA/curated_r8)
+1. **D35 × D37 (AL, n14; pipeline defect).** A visit dropped as a duplicate by D37 is not a coordinate-link end. Its trees are not censored `procedural_relink`. The kept visit's trees continue normally.
+2. **The verifier's raw disturbance re-derivation (n21) applies the D34 RC7 exclusion.** Records of trees FIA withdrew as erroneously tallied (STATUSCD 0 / RECONCILECD 7) are not raw events. This is a verifier defect; the pipeline was right.
+3. **The verifier's phantom block rule (n18) is NULL-safe.** A NULL debut RECONCILECD must not blank the r_a term (COALESCE). Verifier defect.
+4. **The verifier's n5 distinguishes rejected from unmapped scopes (D46 contract).** Unmapped = a `level='unmapped'` row. Rejected = curve rows with `applied = false`, which are identity and not flagged. Verifier defect.
+5. **KNOWN cells after the D40 / D46 age model** (the user's standing choice for age-bias failures is "accept + flag"):
+   - Re-baseline the pooled scope "12,21,28" to the values measured on 2026-10-28: FL planted 15+ = −4.3. FL planted 10–15 passes now (−2.9), so its entry is retired.
+   - Add new per-scope entries, each with its reason and the same ±1-yr signed drift guard:
+     - scope "12", FL planted 15+ = −3.7 (regression to the mean, as the pooled FL cell);
+     - scope "21", KY planted 10–15 = −4.9 (D46 raw-TreeAge residual);
+     - scope "47", TN planted 15+ = −3.1;
+     - pooled-scope KY planted 10–15 = +4.2.
+   - Update KNOWN_BIAS_FLAGS to match.
+   - **Recorded instability:** KY planted 10–15 in flips sign with the fit scope (−4.9 single-state vs +4.2 pooled). The ages of those 227 trees are not stable to the training set. They stay flagged by age_domain and are a target for the deferred DIA-class model (D46 option d).
+   - Rejected: leaving them as FAILs (the verifier would never exit 0, which hides new failures); widening tolerances (post hoc).
+6. **Empty or near-tied (d) cells** (KY: no planted top-25 species with ≥ 50 records per class; TN: a < 0.05-yr inversion) are data outcomes. They get KNOWN entries with that reason, keyed by scope and cell, so any NEW (d) failure still FAILs.
