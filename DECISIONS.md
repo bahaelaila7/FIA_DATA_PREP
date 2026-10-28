@@ -605,3 +605,25 @@ The chosen option comes first; rejected options follow "Rejected".
    - Rejected: leaving them as FAILs (the verifier would never exit 0, which hides new failures); widening tolerances (post hoc).
 6. **Empty or near-tied (d) cells** (KY: no planted top-25 species with ≥ 50 records per class; TN: a < 0.05-yr inversion) are data outcomes. They get KNOWN entries with that reason, keyed by scope and cell, so any NEW (d) failure still FAILs.
 - **Implementation note (r8, D47.5).** The new `KNOWN_BIAS_FLAGS` rules change `age_domain` (step 2) and the cohort known-bias columns (steps 4+), and the verifier's (l) re-derives the flags exactly. So the scopes whose flags changed (12, 21, 47 and 12,21,28) are rebuilt from step 2 (FROM_STEP=2, plus the slim and the 4–10 determinism rerun). GA, MS, NC and SC carry no flag in any version and are re-verified on their existing DBs. Options: verify-only everywhere (rejected: the old DBs lack the new flags, so (l) would FAIL); a full rerun from step 1 (rejected: step 1 is unchanged for these scopes).
+
+## D48 — Remove the coordinate-link layer (user decision 2026-10-28; supersedes D29, D35, D37 and D47.1)
+**User:** "I don't think coordinate link is a good idea, because we know coordinates are fuzzed, and it's probably a stretch to do that, especially when it comes to relying on species to actually keep the identity."
+
+**Decision.** Plot and tree identity use only FIA's identifiers and FIA's own links:
+- the composite key (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE);
+- PREV_PLT_CN, for renumbered plots (canonical key, D15 / M-2);
+- PREV_TRE_CN and RECONCILECD, for reused tree numbers (M3, D36 rules other than the link rule).
+
+**Removed:**
+- **D29:** coordinate + tree-continuity links of chain starts to chain ends.
+- **D35:** `procedural_relink` censoring and the `coord_link` break.
+- **D37:** the duplicate-visit collapse.
+- **D36's link-start split rule:** the species / DIA test at link starts.
+- **D47.1:** moot.
+
+**Consequence, accepted.** The 18 R4 coordinate-linked plot pairs (e.g. AL 1/3/61/71 vs 87, a KINDCD 3 replacement plot with the same stand; GA 87/45 → 87/146; MS 163/84 → 163/101; SC 19/74 → 19/279, 19/101 → 19/280) stay separate plots. Their pre-link history is not joined. The AL 2010 stand appears as two plot-visits in that year.
+
+**Options:**
+- (a) chosen: FIA-linked corrections only;
+- (b) pure composite key with no corrections; rejected, because it reintroduces reused-number "zombie" trees and breaks PREV_PLT_CN-linked renumbered plots;
+- (c) keep the links with a species-tolerant test; rejected, because coordinates are fuzzed and species is unreliable for saplings.
