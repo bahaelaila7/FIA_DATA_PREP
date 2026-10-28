@@ -675,3 +675,18 @@ If accepted, `backfill: nimiwae` becomes the default in cohorts_landis / build_t
 - **Bounds.** An imputed value never exceeds the tree's first observed value, the same cap as the rule.
 - **Criterion 4 (hard), added:** 0 imputed trajectories with a decrease between consecutive slots or above the debut value, on the benchmark and in production.
 - **Evidence.** The discarded unconstrained first model drifted (val MAE 0.63 → 1.26 → 3.45 over 3 epochs, bias −2.3): the MNAR degenerate solution of explaining missingness with ever-smaller missing values. No test data was used.
+
+**D49 amendment 2 — absolute acceptance criteria; the rule is not a yardstick (user, 2026-10-28; recorded before the size-dependent run's results and before any test scoring).**
+"Assume the baseline is wrong. You can't judge NIMIWAE this way." Criteria 1–3, which were relative to the rule, are REPLACED. The rule's numbers are reported for context only and decide nothing.
+
+**NIMIWAE is accepted only if it passes all of the following on the TEST benchmark (pseudo-censoring at 3 in, true values known):**
+- **A1, unbiased.** |median error of log AGB| ≤ 0.10 (≈ 10 %) overall, and in every hidden DIA class (1–2, 2–3 in) and major species group with n ≥ 200. The same holds for log DIA.
+- **A2, calibrated.** The empirical coverage of the model's central 80 % predictive interval of log AGB, over hidden visits, is between 0.75 and 0.85, overall and per DIA class.
+- **A3, totals.** The median of the subplot-visit hidden-AGB total, sum predicted / sum true, is within [0.9, 1.1].
+
+**And on every production imputation (all phantom slots of all 8 states):**
+- **P1, monotone.** 0 trajectories decrease between consecutive slots up to the debut, or exceed the debut value (the former criterion 4).
+- **P2, consistent with the tally.** Imputed DIA below the tree's tally limit at every missing slot: < 1 in for microplot debuts, < 5 in for subplot debuts. Tolerance: ≥ 99 % of slots.
+- **P3, physically plausible growth.** Implied annual DIA increments between imputed slots, by species group, lie inside the 1st–99th percentile range of the OBSERVED annual increments of remeasured microplot saplings (train plots, real records), for ≥ 98 % of slots.
+
+**Accuracy is reported, not gated:** MAE of log AGB and log DIA. A1–A3 are checked on VAL for model choices; TEST is scored once.
