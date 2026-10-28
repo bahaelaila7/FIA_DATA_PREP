@@ -690,3 +690,26 @@ If accepted, `backfill: nimiwae` becomes the default in cohorts_landis / build_t
 - **P3, physically plausible growth.** Implied annual DIA increments between imputed slots, by species group, lie inside the 1st–99th percentile range of the OBSERVED annual increments of remeasured microplot saplings (train plots, real records), for ≥ 98 % of slots.
 
 **Accuracy is reported, not gated:** MAE of log AGB and log DIA. A1–A3 are checked on VAL for model choices; TEST is scored once.
+
+**D49 amendment 3 — final protocol (2026-10-28; recorded before any test scoring).**
+Validation-only development gave:
+- unbiased point estimates (log AGB +0.03, log DIA +0.02, log HT +0.03);
+- monotone paths;
+- intervals too narrow (80 % coverage 0.49), because the growth process noise learned from the observed 5-yr intervals understates 10–20-yr back-extrapolation.
+
+**Model, as frozen:**
+- a monotone height path (size-dependent backward growth ODE with log-normal process noise);
+- DIA = c_sp e^{ζ(z)} (HT − 4.5 ft)_+^{b_sp} + 0.01 in;
+- AGB monotone allometry in DIA and HT;
+- a near-step tally missingness (steepness 20 per log DIA) with a learned field-miss rate;
+- the leak-free first-observed-record age proxy.
+
+**Interval calibration:** one width factor w on the log-AGB predictive deviations, fitted on the VAL benchmark so the central 80 % interval covers 0.80 there (split-conformal style). It is frozen into the model. The A2 bar (0.75–0.85 on TEST) is unchanged.
+
+**Final run:**
+1. Prep on all 8 curated_r8 states (D48 builds).
+2. Train on train plots.
+3. Select the epoch on VAL by |median bias log AGB| (coverage is handled by w).
+4. Fit w on VAL.
+5. Score TEST once against A1–A3. Then run P1–P3 on every production imputation.
+6. Report everything, pass or fail.
