@@ -101,11 +101,34 @@ KNOWN_DRIFT = 1.0
 # passes at -1.6.
 _FL_RTM = ("FL: model vs mapped TreeAge regression to the mean under the pooled fit; only trees "
            "WITHOUT a TreeAge record take the model age")
+# r8 D47.5 / D47.6: re-measured 2026-10-28 on the D40 / D46 age model (whole-state r8 runs). The
+# pooled FL 10-15 in entry is retired (-2.9, passes); the others are new, with the same signed
+# +-KNOWN_DRIFT guard. (d) entries are keyed by stratum and species (or "empty"), so a NEW (d)
+# failure still FAILS.
+_KY_D46 = ("KY: D46 rejected every TreeAge mapping curve, so planted estage is raw TreeAge (+7.5 yr out of fold at "
+           "9+ in, D46 residual); the 10-15 in gap flips sign with the fit scope (-4.9 single-state, +4.2 pooled): "
+           "those ages are not stable to the training set (D47; deferred DIA-class model, D46 option d)")
+_TN_RTM = ("TN: model vs mapped TreeAge regression to the mean at 15+ in planted (266 trees); only trees WITHOUT a "
+           "TreeAge record take the model age (D47)")
 KNOWN_EXCEPTIONS = {
-    ("12,21,28", "j", 12, "planted", "10-15"): dict(
-        observed=-3.2, limit=3.0, flag="known_bias_fl_planted_model_10plus", reason=_FL_RTM),
     ("12,21,28", "j", 12, "planted", "15+"): dict(
-        observed=-3.8, limit=3.0, flag="known_bias_fl_planted_model_10plus", reason=_FL_RTM),
+        observed=-4.3, limit=3.0, flag="known_bias_fl_planted_model_15plus", reason=_FL_RTM),
+    ("12,21,28", "j", 21, "planted", "10-15"): dict(
+        observed=+4.2, limit=3.0, flag="known_bias_ky_planted_model_10to15", reason=_KY_D46),
+    ("12", "j", 12, "planted", "15+"): dict(
+        observed=-3.7, limit=3.0, flag="known_bias_fl_planted_model_15plus",
+        reason=_FL_RTM.replace("under the pooled fit", "under the single-state fit")),
+    ("21", "j", 21, "planted", "10-15"): dict(
+        observed=-4.9, limit=3.0, flag="known_bias_ky_planted_model_10to15", reason=_KY_D46),
+    ("47", "j", 47, "planted", "15+"): dict(
+        observed=-3.1, limit=3.0, flag="known_bias_tn_planted_model_15plus", reason=_TN_RTM),
+    # (d): value = number of species tested for "empty"; the largest median inversion (yr) for a species
+    ("21", "d", "planted", "empty"): dict(
+        observed=0.0, limit=0.0, flag="none",
+        reason="KY: no planted top-25 species has >= 50 records in every DIA class (data outcome, D47.6)"),
+    ("47", "d", "planted", 132): dict(
+        observed=0.0, limit=0.0, flag="none",
+        reason="TN: planted Virginia pine (132) 5-7 vs 7-9 in medians 22.799 vs 22.796 yr, a < 0.05-yr near-tie (data outcome, D47.6)"),
 }
 FIT_SCOPE = None   # set after the curated DB is attached
 KNOWN = []
@@ -511,10 +534,11 @@ def block_reasons(src_sql, rule_c=True):
       (j.p < j.D) AS pre_debut,
       EXISTS (SELECT 1 FROM zdead z WHERE z.STATECD=j.STATECD AND z.UNITCD=j.UNITCD AND z.COUNTYCD=j.COUNTYCD AND z.PLOT=j.PLOT
               AND z.SUBP=j.SUBP AND z.TREE=j.TREE AND z.zmd >= j.p AND z.zmd < j.D) AS r_z,
-      (COALESCE(j.drn IN (6,9), FALSE)
+      -- r8 D47.3: NULL-safe (a NULL debut RECONCILECD must not blank the term)
+      COALESCE(COALESCE(j.drn IN (6,9), FALSE)
        OR (j.drc = 3 AND j.ddia >= 5 AND EXISTS (SELECT 1 FROM rclo WHERE rclo.STATECD=j.STATECD AND rclo.UNITCD=j.UNITCD
             AND rclo.COUNTYCD=j.COUNTYCD AND rclo.PLOT=j.PLOT AND rclo.SUBP=j.SUBP AND rclo.md=j.D
-            AND rclo.SPCD=j.dsp AND abs(rclo.PREVDIA-j.ddia)<=2))) AS r_a,
+            AND rclo.SPCD=j.dsp AND abs(rclo.PREVDIA-j.ddia)<=2)), FALSE) AS r_a,
       -- r7 D44 (C F4): a SAPLING phantom tests the MICROPLOT forest proportion
       EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=j.STATECD AND rv.UNITCD=j.UNITCD AND rv.COUNTYCD=j.COUNTYCD
               AND rv.PLOT=j.PLOT AND rv.SUBP=j.SUBP AND rv.md >= j.p AND rv.md < j.D
@@ -1078,12 +1102,17 @@ WHERE g.comp IN ('CUT','MORTALITY','DIVERSION') GROUP BY ALL ORDER BY 1, 3 DESC"
 # harvest_inferred) or a disturbance death; diversions and natural deaths are not events; a tree
 # that disappeared (final fate disappeared_inferred_removal, D19 DISTURB_FATES) is removed at the
 # first scaffold visit after its last record. Misrecorded deaths (D26) are not records of death.
+# r8 D47.2 (D34): records BEFORE the tree's RC7 "erroneously tallied" record (rc7.d7) are withdrawn
+# by FIA, so they are not raw events
 con.execute("""
 CREATE TEMP TABLE myev AS
 SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, ctree TREE, md ev_md,
        CASE WHEN cls IN ('harvest_explicit', 'harvest_inferred') THEN 'cut' ELSE 'disturbance_death' END kind
 FROM rawcls
-WHERE is_first AND NOT rr AND (cls IN ('harvest_explicit', 'harvest_inferred')
+WHERE is_first AND NOT rr
+  AND NOT EXISTS (SELECT 1 FROM rc7 WHERE rc7.STATECD = rawcls.STATECD AND rc7.UNITCD = rawcls.UNITCD AND rc7.COUNTYCD = rawcls.COUNTYCD
+                  AND rc7.PLOT = rawcls.PLOT AND rc7.SUBP = rawcls.SUBP AND rc7.TREE = rawcls.TREE AND rawcls.md < rc7.d7)
+  AND (cls IN ('harvest_explicit', 'harvest_inferred')
       OR (cls = 'dead' AND (COALESCE(AGENTCD IN (10, 20, 30, 40, 50), FALSE) OR COALESCE(DSTRBCD1 NOT IN (0, 60), FALSE)
                             OR COALESCE(DSTRBCD2 NOT IN (0, 60), FALSE) OR COALESCE(DSTRBCD3 NOT IN (0, 60), FALSE))))
 UNION ALL
@@ -1483,24 +1512,40 @@ def _mono(where):
     top AS (SELECT sp FROM l GROUP BY sp ORDER BY count(*) DESC, sp LIMIT 25),
     m AS (SELECT sp, k, count(*) n, median(a) med FROM l WHERE k IS NOT NULL AND sp IN (SELECT sp FROM top) GROUP BY ALL)
     SELECT sp, list(med ORDER BY k) meds, min(n) min_n, count(*) nk FROM m GROUP BY sp ORDER BY sp""").fetchall()
-    viol, tested = [], 0
+    viol, tested, inv = [], 0, {}
     for sp, meds, mn, nk in d:
         if nk < 4 or mn < 50:
             continue
         tested += 1
+        inv[sp] = max(meds[i] - meds[i + 1] for i in range(len(meds) - 1))   # > 0: an inversion (yr)
         if any(meds[i] > meds[i + 1] for i in range(len(meds) - 1)):
             viol.append((sp, [round(x, 1) for x in meds]))
-    return viol, tested
+    return viol, tested, inv
 for label, where, enforce in (("planted", "cond_stdorgcd = 1", True),
                               ("natural", "COALESCE(cond_stdorgcd, 0) <> 1", False),
                               ("pooled", "TRUE", False)):
-    viol, tested = _mono(where)
+    viol, tested, inv = _mono(where)
     print(f"\n=== (d) {label}: median age by DIA class 1-3/3-5/5-7/7-9 in: {tested} species tested, {len(viol)} non-monotone")
     for v in viol:
         print("    ", v)
     name = f"(d) {label}: median age monotone in DIA class (top-25 species, >= 50 records/class)"
     if enforce:   # r7 M-5: a vacuous 0/0 is a FAIL (check_n)
-        check_n(name, not viol, tested, f"({len(viol)}/{tested})")
+        # r8 D47.6: KNOWN (d) cells, keyed by fit scope + stratum + species (or "empty"); every
+        # other species is still enforced, and a known cell is drift-guarded on its inversion
+        _kd = {k[3] for k in KNOWN_EXCEPTIONS if k[0] == FIT_SCOPE and k[1] == "d" and k[2] == label}
+        for _sp in sorted((x for x in _kd if x != "empty"), key=str):
+            if _sp in inv:
+                check_known(("d", label, _sp), f"(d) {label}: species {_sp} median age monotone in DIA class",
+                            inv[_sp] <= 0, inv[_sp], f"(largest inversion {inv[_sp]:+.3f} yr)")
+            else:
+                info(f"(d) {label}: known exception for species {_sp} is attached but the species is not tested", "(re-measure / retire it)")
+        _new = [v for v in viol if v[0] not in _kd]
+        if tested == 0 and "empty" in _kd:
+            check_known(("d", label, "empty"), f"{name} [EMPTY]", False, 0.0, "(0 species tested)")
+        else:
+            if "empty" in _kd:
+                info(f"{name}: known exception 'empty' is attached but {tested} species are tested", "(consider retiring it)")
+            check_n(name, not _new, tested, f"({len(_new)}/{tested} outside the known cells)")
     else:
         info(name, f"({len(viol)}/{tested} non-monotone; not enforced)")
 show("(d) negative / < 1 yr live ages", f"""
@@ -1658,9 +1703,15 @@ for st_, pl_, n, b in con.execute("SELECT STATECD, COALESCE(planted,false), coun
 
 # ---- (l) r4 ACCEPT + FLAG: known-bias age_domain flags match their rules exactly ---------------
 # (flag, rule, fit scopes); outside its scopes a flag must not appear at all
-_kb_rules = {
-    "known_bias_fl_planted_model_10plus": ("STATECD=12 AND age_stratum='planted' AND age_source='model' AND DIA>=10",
-                                           ("12,21,28",)),
+_kb_rules = {   # r8 D47.5 (age_imputation.KNOWN_BIAS_FLAGS, re-derived here)
+    "known_bias_fl_planted_model_15plus": ("STATECD=12 AND age_stratum='planted' AND age_source='model' AND DIA>=15",
+                                           ("12", "12,21,28")),
+    "known_bias_ky_planted_model_10to15": ("STATECD=21 AND age_stratum='planted' AND age_source='model' AND DIA>=10 AND DIA<15",
+                                           ("21", "12,21,28")),
+    "known_bias_tn_planted_model_15plus": ("STATECD=47 AND age_stratum='planted' AND age_source='model' AND DIA>=15",
+                                           ("47",)),
+    # retired (D47): a stale flag must not appear in any scope
+    "known_bias_fl_planted_model_10plus": ("FALSE", ()),
 }
 for flag_, (rule_, scopes_) in _kb_rules.items():
     if FIT_SCOPE not in scopes_:
@@ -1882,18 +1933,20 @@ r = con.execute(f"""WITH t AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE, an
            count(*) FILTER (WHERE st = 'planted' AND nmap = 0) FROM t""").fetchone()
 check("(n5) D5: natural-stratum trees carry RAW TreeAge on every estage candidate (none mapped)", r[1] == 0,
       f"({r[1]:,} of {r[0]:,} natural trees have a mapped candidate)")
-_unmapped_scope = r[2] > 0 and r[4] == r[2]   # no planted candidate is mapped: no mapping exists
+_ecc = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE database_name='new' AND table_name='estage_calibration'").fetchall()}
+_unm_row = con.execute("SELECT count(*) FROM new.estage_calibration WHERE level = 'unmapped'").fetchone()[0] if _ecc else 0
+# r8 D47.4 (D46 contract): UNMAPPED = a level='unmapped' row (no mapping could be fitted). A scope
+# whose curves were all REJECTED (applied = false) is identity everywhere but NOT unmapped (not flagged)
+_unmapped_scope = _unm_row > 0
 _nflag = con.execute(f"""SELECT count(*) FILTER (WHERE age_domain = 'unmapped_estage'),
     count(*) FILTER (WHERE COALESCE(age_domain = 'unmapped_estage', FALSE) IS DISTINCT FROM
                            ({'TRUE' if _unmapped_scope else 'FALSE'} AND age_stratum = 'planted' AND age_source = 'estage'))
     FROM new.curated_trees WHERE {scope()}""").fetchone()
-_ecc = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE database_name='new' AND table_name='estage_calibration'").fetchall()}
 _appcol = next((c for c in ("applied", "curve_applied", "accepted") if c in _ecc), None)
-_unm_row = con.execute("SELECT count(*) FROM new.estage_calibration WHERE level = 'unmapped'").fetchone()[0] if _ecc else 0
-if _unmapped_scope or _unm_row:
+if _unmapped_scope:
     # D40 (M-6): no mapping at all (< 200 planted calibration rows): FAIL unless the scope is listed
     check(f"(n5) D40: no TreeAge mapping for fit scope {FIT_SCOPE}: allowed only if listed (UNMAPPED_ESTAGE_ALLOWED)",
-          FIT_SCOPE in UNMAPPED_ESTAGE_ALLOWED and _unmapped_scope and _unm_row > 0,
+          FIT_SCOPE in UNMAPPED_ESTAGE_ALLOWED and r[4] == r[2],   # listed, and no planted candidate mapped
           f"({r[2]:,} planted trees on the raw scale; {_nflag[0]:,} records flagged unmapped_estage; "
           f"estage_calibration 'unmapped' row {'present' if _unm_row else 'MISSING'})")
 elif _appcol:
