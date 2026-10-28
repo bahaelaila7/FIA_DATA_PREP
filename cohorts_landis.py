@@ -679,8 +679,7 @@ def load_backfill_context(con) -> dict:
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS break_date,
                bool_or(break_kind = 'rc8') AS _brk_rc8,
                bool_or(n_closed_rc8_prev_sapling > 0 OR break_kind = 'unrecorded'
-                       OR n_unrecorded_saplings > 0) AS _brk_sap,
-               bool_or(break_kind = 'coord_link') AS _brk_link      -- r6 D35
+                       OR n_unrecorded_saplings > 0) AS _brk_sap
         FROM procedural_breaks GROUP BY ALL
     """).pl()
     visit = con.execute("""
@@ -821,14 +820,12 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
     # (b) plot-level procedural break in (p, D]: the SAPLING part only for sapling re-tally
     # breaks (closed RC8 saplings, or unrecorded saplings: r2 M9), the RC8-entry part for
     # RC8 closure breaks
-    # r6 D35: a coordinate-link break (a plot re-keyed by D29) blocks EVERY tree's backfill across it
-    brk_link = (pl.col("_brk_link").fill_null(False) if "_brk_link" in breaks.columns else pl.lit(False))
     cand = prior.select(list(dict.fromkeys(key + ["MEASDATE", "_bf_sap", "_bf_rc8"]))).unique()
     crossed = (
         cand.join(breaks, on=PLOT_KEY, how="inner")
         .filter((pl.col("break_date") > pl.col("prior_measdate")) &
                 (pl.col("break_date") <= pl.col("MEASDATE")) &
-                ((pl.col("_bf_sap") & pl.col("_brk_sap")) | (pl.col("_bf_rc8") & pl.col("_brk_rc8")) | brk_link))
+                ((pl.col("_bf_sap") & pl.col("_brk_sap")) | (pl.col("_bf_rc8") & pl.col("_brk_rc8"))))
         .select(key).unique().with_columns(pl.lit(True).alias("_crossed"))
     )
     n2 = prior.height

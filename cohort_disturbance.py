@@ -19,8 +19,8 @@ curated_cohorts and the trajectories' terminal_fate: the tree's first dead / cut
 cut (harvest_explicit / harvest_inferred) or a disturbance death (AGENTCD 10-50 or a DSTRBCD other
 than 0 / 60), or an inferred removal (disappeared_inferred_removal, at the first scaffold visit
 after its last record). NATURAL deaths, censoring, diversions and misrecorded deaths never count.
-r7 D38: a removal whose event record is first_record_dead (a first-seen death, e.g. a dead record
-at a D29 link start on a replacement plot) is not counted either.
+r7 D38: a removal whose event record is first_record_dead (a first-seen death) is not counted
+either.
 
 r7 D42: FULL removals are emitted too: a cohort-visit with counted removals and no member left
 alive (no survivor and no member alive in any form) gets a row with full_removal = TRUE and

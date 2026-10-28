@@ -201,7 +201,7 @@ else:
     k.execute(f"ATTACH '{a.curated_db}' AS cur (READ_ONLY)")
     foreign = k.execute("""
         WITH ok AS (SELECT PLT_CN AS cn FROM cur.main.product_visits
-                    UNION SELECT CN FROM cur.main.plot_key_remap WHERE reason IS DISTINCT FROM 'duplicate_visit')
+                    UNION SELECT CN FROM cur.main.plot_key_remap)
         SELECT (SELECT count(*) FROM PLOT WHERE CAST(CN AS VARCHAR) NOT IN (SELECT cn FROM ok)),
                (SELECT count(*) FROM COND WHERE CAST(PLT_CN AS VARCHAR) NOT IN (SELECT cn FROM ok)),
                (SELECT count(DISTINCT (STATECD, UNITCD, COUNTYCD, PLOT)) FROM PLOT

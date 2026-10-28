@@ -291,11 +291,6 @@ def _sql_procedural_breaks(con, scope: str = ""):
     """)
 
 
-def dbconn_has_links(con) -> bool:
-    """dbconn's TEMP plot_coord_links (D29) exists on this connection."""
-    return con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'plot_coord_links'").fetchone()[0] > 0
-
-
 def build_tree_reconcile_events(con):
     """Per tree: the RC7 erroneous-tally date and the FIRST / LAST censoring event. Built from
     tree_status0_events / tree_censor_events, so after rekey_tree_events (r7 D36) it is keyed
@@ -395,52 +390,8 @@ def sql_excluded_trees(con, scope: str = ""):
          AND b.COUNTYCD=s.COUNTYCD AND b.PLOT=s.PLOT AND b.MEASDATE=s.next_md
     WHERE s.unrecorded
     """)
-    # r6 D35: a coordinate-linked chain start (D29) is a PROCEDURAL re-tally of the plot. Live
-    # trees of the earlier chain end that are NOT continued at the start (same SUBP / TREE / SPCD,
-    # DIA not decreasing — the D29 match) are censored 'procedural_relink' at the start visit
-    # (they were renumbered or not re-found, not removed), and the start visit becomes a
-    # procedural_breaks row (break_kind 'coord_link') that blocks backfill across it.
-    # r7 D38: on a KINDCD 3 (replacement plot) start only a LIVE start record continues an end
-    # tree; a dead / cut record there is a first-seen death (a new tree, first_record_dead), so
-    # the end tree is censored here, not killed in the link interval. The end / start trees are
-    # read from the raw TREE table and the (canonical) plot key from the start visit.
-    # r8 D47.1: an end visit DROPPED as a D37 duplicate (plot_dup_visits) is the same physical
-    # visit as the kept start, not a link end: its trees are never censored 'procedural_relink'
-    # (the kept visit's trees continue normally).
-    if dbconn_has_links(con):
-        con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE _relink AS
-        SELECT * FROM (
-            SELECT l.start_cn, l.end_cn, P0.STATECD, COALESCE(m.UNITCD, P0.UNITCD) AS UNITCD,
-                   COALESCE(m.COUNTYCD, P0.COUNTYCD) AS COUNTYCD, COALESCE(m.PLOT, P0.PLOT) AS PLOT,
-                   P0.KINDCD AS start_kindcd,
-                   MAKE_DATE(P0.MEASYEAR, COALESCE(NULLIF(CAST(P0.MEASMON AS INTEGER), 0), 6),
-                             COALESCE(NULLIF(CAST(P0.MEASDAY AS INTEGER), 0), 15)) AS start_md
-            FROM plot_coord_links l JOIN fia.main.PLOT P0 ON P0.CN = l.start_cn
-            LEFT JOIN plot_canon_map m ON m.CN = P0.CN) P
-        WHERE TRUE {scope}""")
-        con.execute("""
-        INSERT INTO tree_censor_events BY NAME
-        SELECT l.STATECD, l.UNITCD, l.COUNTYCD, l.PLOT, T.SUBP, T.TREE, l.start_md AS MEASDATE,
-               NULL::INTEGER AS RC, 'procedural_relink' AS reason, T.TREE AS TREE_RAW
-        FROM _relink l JOIN fia.main.TREE T ON T.PLT_CN = l.end_cn
-        WHERE T.STATUSCD = 1 AND T.SUBP <= 4
-          AND CAST(l.end_cn AS VARCHAR) NOT IN (SELECT CN FROM plot_dup_visits)   -- r8 D47.1
-          AND NOT EXISTS (SELECT 1 FROM fia.main.TREE u WHERE u.PLT_CN = l.start_cn AND u.SUBP = T.SUBP
-                          AND u.TREE = T.TREE AND u.SPCD = T.SPCD AND u.DIA >= T.DIA
-                          AND (l.start_kindcd IS DISTINCT FROM 3 OR u.STATUSCD = 1))
-          AND NOT EXISTS (SELECT 1 FROM tree_censor_events e WHERE e.STATECD = l.STATECD AND e.UNITCD = l.UNITCD
-                          AND e.COUNTYCD = l.COUNTYCD AND e.PLOT = l.PLOT AND e.SUBP = T.SUBP AND e.TREE = T.TREE
-                          AND e.MEASDATE = l.start_md)""")
-        con.execute("""
-        INSERT INTO procedural_breaks BY NAME
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, start_md AS MEASDATE, 0 AS n_closed_rc8,
-               0 AS n_closed_rc8_prev_sapling, 0 AS n_prev_saplings, 0 AS n_unrecorded_saplings,
-               NULL AS detect_tier, 'coord_link' AS break_kind
-        FROM _relink""")
-        nrl = con.execute("SELECT count(*) FROM tree_censor_events WHERE reason = 'procedural_relink'").fetchone()[0]
-        print(f"[step3b] coordinate-linked chain starts: {con.execute('SELECT count(*) FROM _relink').fetchone()[0]} "
-              f"(procedural breaks); {nrl:,} earlier live trees not continued -> censored 'procedural_relink'")
+    # r8 D48: the coordinate-link layer (D29 links, D35 procedural_relink censoring and the
+    # coord_link break, D37 duplicate visits) is removed: identity uses FIA's own links only
     build_tree_reconcile_events(con)
     # M6: live records on a NONFOREST / WATER own condition (excluded by the live rule): the
     # tree still exists but its land left forest -> terminal fate 'diverted_landuse'.
@@ -675,8 +626,7 @@ TREE_SPLIT_OFFSET = 100_000   # R4 TREE numbers are < 61,000
 NEW_TREE_RC = (1, 2, 3, 4)   # r7 D36: RECONCILECD new-tree codes (ingrowth, through-growth, missed live / dead)
 
 
-def split_reused_tree_numbers(df: pl.DataFrame, coord_start_cns: set | None = None,
-                              relink: pl.DataFrame | None = None) -> pl.DataFrame:
+def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
     """
     r3 M3 — tree-number reuse. A tree key (STATECD..SUBP, TREE) can be re-used for a new tree,
     e.g. a dead tree's number given to a new RC1 tree. Following the PREV_TRE_CN chain, a record
@@ -686,10 +636,8 @@ def split_reused_tree_numbers(df: pl.DataFrame, coord_start_cns: set | None = No
       * r7 D36 (A7-1): this record's PREV_TRE_CN is NULL and its RECONCILECD is a new-tree code
         (NEW_TREE_RC: 1 ingrowth / 2 through-growth / 3 missed live / 4 missed dead), whatever the
         previous record's status (a live predecessor used to merge two physically different
-        trees: species relabelled, ages and cohorts mixed, censoring lost), or
-      * r7 D36 (F7-1): the key was censored 'procedural_relink' (D35) at a coordinate-link start
-        (`relink`: raw key + relink_md) and this is its first record at or after that date: the
-        relinked key is CLOSED, a later record under that number is a new tree.
+        trees: species relabelled, ages and cohorts mixed, censoring lost).
+    r8 D48: the D29 link-start rule (species / DIA test) and the D35 relink-closed rule are removed.
     Later segments get TREE + k * TREE_SPLIT_OFFSET (k = 1, 2, ...); every record of a split key
     has tree_key_split = TRUE. The censoring / status-0 / land-use events are re-keyed to the
     segment they belong to afterwards (rekey_tree_events, r7 D36), so a split tree never inherits
@@ -700,42 +648,21 @@ def split_reused_tree_numbers(df: pl.DataFrame, coord_start_cns: set | None = No
         pl.col("STATUSCD").shift(1).over(TREE_ID).alias("_pst"),
         pl.col("MEASDATE").shift(1).over(TREE_ID).alias("_pmd"),
     ])
-    # r6 S1 (D29): at the first visit of a chain that was linked to an earlier chain by
-    # coordinates + tree continuity (dbconn plot_coord_links), FIA carries no PREV_TRE_CN; a
-    # record there whose same-number predecessor is live is the SAME tree only if the species
-    # matches and DIA did not decrease, otherwise it starts a new tree
-    d = d.with_columns(pl.col("SPCD").shift(1).over(TREE_ID).alias("_psp"),
-                       pl.col("DIA").shift(1).over(TREE_ID).alias("_pdia"))
-    if relink is not None and relink.height:
-        hit = (d.select(TREE_ID + [pl.col("CN").cast(pl.Utf8).alias("_cn"), "MEASDATE", "_pmd"])
-                .join(relink.select(TREE_ID + ["relink_md"]), on=TREE_ID, how="inner")
-                .filter((pl.col("_pmd") < pl.col("relink_md")) & (pl.col("relink_md") <= pl.col("MEASDATE")))
-                .select("_cn").unique().with_columns(pl.lit(True).alias("_closed")))
-        d = (d.with_columns(pl.col("CN").cast(pl.Utf8).alias("_cn")).join(hit, on="_cn", how="left")
-              .drop("_cn").sort(TREE_ID + ["MEASDATE"]))   # F7-4: the order is re-established after the join
-    else:
-        d = d.with_columns(pl.lit(None, dtype=pl.Boolean).alias("_closed"))
-    at_link = (pl.col("CN").cast(pl.Utf8).is_in(list(coord_start_cns or [])))
     no_link = pl.col("prev_tre_cn").is_null()
     r_dead = no_link & pl.col("_pst").is_in([2, 3])
     r_other = pl.col("prev_tre_cn").is_not_null() & (pl.col("prev_tre_cn") != pl.col("_pcn"))
     r_newrc = no_link & pl.col("RECONCILECD").cast(pl.Int32).is_in(list(NEW_TREE_RC))
-    r_closed = pl.col("_closed").fill_null(False)
-    r_link = (at_link & no_link & (pl.col("_pst") == 1) &
-              ((pl.col("SPCD") != pl.col("_psp")).fill_null(True) | (pl.col("DIA") < pl.col("_pdia")).fill_null(False)))
     has_prev = pl.col("_pcn").is_not_null()
     d = d.with_columns([(has_prev & r).fill_null(False).alias(n) for n, r in
-                        (("_s_dead", r_dead), ("_s_other", r_other), ("_s_newrc", r_newrc),
-                         ("_s_closed", r_closed), ("_s_link", r_link))])
-    new_seg = pl.any_horizontal("_s_dead", "_s_other", "_s_newrc", "_s_closed", "_s_link")
+                        (("_s_dead", r_dead), ("_s_other", r_other), ("_s_newrc", r_newrc))])
+    new_seg = pl.any_horizontal("_s_dead", "_s_other", "_s_newrc")
     d = d.with_columns(new_seg.cast(pl.Int64).cum_sum().over(TREE_ID).alias("_seg"))
     d = d.with_columns((pl.col("_seg").max().over(TREE_ID) > 0).alias("tree_key_split"))
     n_split = d.filter(pl.col("_seg") > 0).select(TREE_ID).unique().height
     n_rec = d.filter(pl.col("_seg") > 0).height
-    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_other", "_s_newrc", "_s_closed", "_s_link")]).row(0, named=True)
+    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_other", "_s_newrc")]).row(0, named=True)
     d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(
-        ["_pcn", "_pst", "_pmd", "_seg", "_psp", "_pdia", "_closed",
-         "_s_dead", "_s_other", "_s_newrc", "_s_closed", "_s_link"])
+        ["_pcn", "_pst", "_pmd", "_seg", "_s_dead", "_s_other", "_s_newrc"])
     print(f"[step4s] tree-number reuse: {n_split:,} keys split, {n_rec:,} records moved to a new tree id; "
           f"segment starts by rule (a record may meet several): {why}")
     return d.sort(TREE_ID + ["MEASDATE"])
@@ -1261,7 +1188,7 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
     df = df.join(dfirst, on=TREE_ID, how="left")
     # r7 D38 (A7-11): first_record_dead generalises dead_at_first_visit: the tree's FIRST record
     # is dead or cut (STATUSCD 2 / 3; a misrecorded death counts as alive) at ANY visit — a
-    # first-seen death (e.g. a dead record at a KINDCD 3 coordinate-link start), never observed
+    # first-seen death, never observed
     # mortality of a live tree, so it never produces a mortality interval or a drop
     frd = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
              .select(TREE_ID + [(pl.col("STATUSCD").is_in([2, 3]) & ~pl.col("misrecorded_death"))
@@ -2725,16 +2652,11 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
                 [",".join(str(int(x)) for x in sorted(states)) if states else None,
                  ",".join(f"{int(a)}:{int(b)}" for a, b in sorted(counties)) if counties else None,
                  uuid.uuid4().hex, _dt.datetime.now().replace(microsecond=0)])
-    # r6: the plot-key remaps (M-2 / D29) and the plot locations (D28) of this run, for reports
-    # and the verifier. r7 D37: `reason` ('prev_plt_cn' / 'coord_link' / 'duplicate_visit'); a
-    # duplicate_visit row is a visit whose records were dropped (kept_cn = the visit kept)
-    con.execute("""CREATE OR REPLACE TABLE plot_key_remap AS
-        SELECT *, NULL::VARCHAR AS kept_cn FROM plot_canon_map UNION ALL BY NAME SELECT * FROM plot_dup_map
-        ORDER BY ALL""")
-    con.execute("CREATE OR REPLACE TABLE plot_key_coord_links AS SELECT * FROM plot_coord_links")
+    # r6: the plot-key remaps (M-2, PREV_PLT_CN renumbers; reason 'prev_plt_cn') and the plot
+    # locations (D28) of this run, for reports and the verifier (r8 D48: no coordinate links /
+    # duplicate visits any more)
+    con.execute("CREATE OR REPLACE TABLE plot_key_remap AS SELECT * FROM plot_canon_map ORDER BY ALL")
     con.execute("CREATE OR REPLACE TABLE plot_location AS SELECT * FROM plot_loc_visit")
-    coord_start_cns = {r[0] for r in con.execute("""SELECT DISTINCT CAST(T.CN AS VARCHAR) FROM fia.main.TREE T
-                       JOIN plot_coord_links l ON CAST(T.PLT_CN AS VARCHAR) = l.start_cn""").fetchall()}
 
     sql_base_measurements(con, scope)
     sql_clean_subplot_years(con)
@@ -2767,12 +2689,9 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
                    forest_subpcond_prop, forest_micrcond_prop
             FROM clean_subplot_years WHERE STATECD = {int(st)}
         """).pl()
-        # r7 D36: split reused tree numbers first (D35 relink-censored keys are closed), then key
-        # every event by the post-split id and attach the censor columns from those events
-        relink = con.execute(f"""
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE_RAW AS TREE, MEASDATE AS relink_md
-            FROM tree_censor_events WHERE reason = 'procedural_relink' AND STATECD = {int(st)}""").pl()
-        df = split_reused_tree_numbers(df, coord_start_cns, relink)
+        # r7 D36: split reused tree numbers first, then key every event by the post-split id and
+        # attach the censor columns from those events
+        df = split_reused_tree_numbers(df)
         rekey_tree_events(con, df, st)
         df = attach_censor_columns(con, df, st)
         landuse_exits = con.execute(f"""

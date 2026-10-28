@@ -11,7 +11,7 @@ whole.
 
 r7 D43: COND and PLOT hold ONLY the rows of the product's plot visits — `product_visits`
 (written by step 1: the annual visits of the curated scaffold) plus the canonical remap's raw
-visits (plot_key_remap, except dropped duplicate visits) — of the --states (default: the
+visits (plot_key_remap) — of the --states (default: the
 states in curated_trees). The builder joins COND / PLOT to the cohort plots on the 4-part plot
 key only, so copying every row of the state let a 1986-88 periodic plot that reused an annual
 plot's key (KY: 700 plots) into the slim (location up to 64 km off, SITECLCD, land_use).
@@ -35,7 +35,7 @@ sl = ",".join(map(str, states))
 con.execute(f"""CREATE OR REPLACE TEMP TABLE _export_cn AS
     SELECT PLT_CN AS CN FROM product_visits WHERE STATECD IN ({sl})
     UNION
-    SELECT r.CN FROM plot_key_remap r WHERE r.STATECD IN ({sl}) AND r.reason IS DISTINCT FROM 'duplicate_visit'
+    SELECT r.CN FROM plot_key_remap r WHERE r.STATECD IN ({sl})
       -- (plot_key_remap is national: only the raw visits of the product's plots, so a county subset exports no other county's plots)
       AND EXISTS (SELECT 1 FROM product_visits v WHERE v.STATECD = r.STATECD AND v.UNITCD = r.UNITCD AND v.COUNTYCD = r.COUNTYCD AND v.PLOT = r.PLOT)""")
 for tab, where in (("COND", "WHERE CAST(PLT_CN AS VARCHAR) IN (SELECT CN FROM _export_cn)"),

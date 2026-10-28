@@ -840,6 +840,16 @@ The cohort, chain and verifier work:
   DIA class in one county), an artefact of the subset. Steps 1–10 are EXCEPT-identical at the two
   thread counts (35 curated + 3 Sim B tables). The 8-state validation is still to run.
 
+### Round-8 (2026-10-28; DECISIONS.md D47–D48)
+- **D48 (user): the coordinate-link layer is REMOVED.** D29 coordinate links, D35 `procedural_relink`
+  censoring and the `coord_link` break, D37 duplicate-visit collapse and D36's link-start split rule are
+  gone (D47.1 is moot). Identity = the composite key + PREV_PLT_CN (canonical key, M-2) + PREV_TRE_CN /
+  RECONCILECD tree splits. The D29 / D35 / D37 text in Round-6 / Round-7 above is historical; the 18 R4
+  coordinate-linked plot pairs are separate plots. `plot_key_remap.reason` is always `prev_plt_cn`, and
+  `plot_key_coord_links` is no longer written. The verifier asserts no link artefacts remain.
+- **D47:** verifier n21 applies the D34 RC7 exclusion, n18's r_a is NULL-safe, n5 tells a rejected scope
+  from an unmapped one; KNOWN cells and `KNOWN_BIAS_FLAGS` re-measured on the D40 / D46 age model.
+
 ---
 
 ## FIA data model — critical invariants
