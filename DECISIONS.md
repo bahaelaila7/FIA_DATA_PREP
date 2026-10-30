@@ -1091,3 +1091,15 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
   - converted lineages get the codes a subplot tree would show;
   - hidden ends drop their RECONCILECD / fate fields;
   - stand fields exclude the tree itself.
+
+**D54 amendment 1 (2026-10-30; before any D54 code or training): one mixed censored-end benchmark.**
+- **The flaw.** Benchmarks (iii) and (iv) were specified as separate subsets. Calibration of P(exists) on a subset whose truth is all "gone" (or all "alive") cannot be assessed: a per-decile reliability bar there only rewards predicting 0 (or 1).
+- **What production looks like.** Production's unknown ends are mainly procedural / non-sampled censoring (absence uninformative).
+- **The merged benchmark.** For every lineage on a scored plot with ≥ 2 visible real records before visit j, and a known state at j:
+  - j = the recorded death / cut visit (truth gone, cause known), or
+  - j = the last real visit of a tree alive there with ≥ 3 real records (truth alive, size known).
+- **How it is censored.** Hide everything from j on, procedural-style (absence uninformative, codes and fate hidden), and score slot j:
+  - **E2:** P(exists) reliability within ±0.05 per decile (n ≥ 200) on the merged set;
+  - **E3:** P(cut | gone) reliability among truly gone;
+  - **E4 (sizes):** A1 overall + major group, A2 overall, A3 among truly alive.
+- (ii) establishment is already mixed (hidden real visits TRUE, clean pre-debut FALSE) and keeps bar E1.
