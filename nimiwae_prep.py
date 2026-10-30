@@ -33,24 +33,40 @@ def load(db: str) -> pl.DataFrame:
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
 
+def resplit_r2(split: str, key: str) -> str:
+    """D50 fresh split: the old TEST is retired (-> train); the new TEST = old-train plots with crc32(key|r2) % 100 < 22; VAL unchanged."""
+    if split == 'test': return 'train'
+    if split == 'train' and zlib.crc32((key + '|r2').encode()) % 100 < 22: return 'test'
+    return split
+
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--out', required=True); ap.add_argument('dbs', nargs='+'); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument('--out', required=True); ap.add_argument('dbs', nargs='*')
+    ap.add_argument('--from-seq', help='re-split an existing seq.parquet instead of reading the DBs')
+    ap.add_argument('--scheme', default='d49', choices=['d49', 'r2']); a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    df = pl.concat([load(d) for d in a.dbs], how='vertical_relaxed')
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']
-    df = df.with_columns(
-        pl.concat_str([pl.col(c).cast(pl.Utf8) for c in k[:4]], separator='_').alias('plot_key'),
-        (pl.col('intro_type') == 'real').alias('obs'),
-        (pl.col('land_use') == 'artificial').alias('planted'))
-    keys = df.select('plot_key').unique()
-    keys = keys.with_columns(pl.col('plot_key').map_elements(split_of, return_dtype=pl.Utf8).alias('split'))
-    df = df.join(keys, on='plot_key', how='left')
-    # debut (first real record) per tree: tally (microplot vs subplot) -> the true tally threshold
-    deb = (df.filter(pl.col('obs')).group_by(k).agg(pl.col('tpa').sort_by('measdate').first().alias('tpa0'),
-                                                     pl.col('dia').sort_by('measdate').first().alias('dia0'),
-                                                     pl.len().alias('n_real')))
-    df = df.join(deb, on=k, how='inner').with_columns(
-        pl.when(pl.col('tpa0') > MICRO_TPA).then(1.0).otherwise(5.0).alias('thr_in'))
+    if a.from_seq:
+        df = pl.read_parquet(a.from_seq)
+    else:
+        df = pl.concat([load(d) for d in a.dbs], how='vertical_relaxed')
+        df = df.with_columns(
+            pl.concat_str([pl.col(c).cast(pl.Utf8) for c in k[:4]], separator='_').alias('plot_key'),
+            (pl.col('intro_type') == 'real').alias('obs'),
+            (pl.col('land_use') == 'artificial').alias('planted'))
+        keys = df.select('plot_key').unique()
+        keys = keys.with_columns(pl.col('plot_key').map_elements(split_of, return_dtype=pl.Utf8).alias('split'))
+        df = df.join(keys, on='plot_key', how='left')
+        # debut (first real record) per tree: tally (microplot vs subplot) -> the true tally threshold
+        deb = (df.filter(pl.col('obs')).group_by(k).agg(pl.col('tpa').sort_by('measdate').first().alias('tpa0'),
+                                                         pl.col('dia').sort_by('measdate').first().alias('dia0'),
+                                                         pl.len().alias('n_real')))
+        df = df.join(deb, on=k, how='inner').with_columns(
+            pl.when(pl.col('tpa0') > MICRO_TPA).then(1.0).otherwise(5.0).alias('thr_in'))
+    if a.scheme == 'r2':
+        keys = df.select('plot_key', 'split').unique()
+        keys = keys.with_columns(pl.struct('split', 'plot_key').map_elements(lambda r: resplit_r2(r['split'], r['plot_key']),
+                                                                            return_dtype=pl.Utf8).alias('split2'))
+        df = df.join(keys.select('plot_key', 'split2'), on='plot_key', how='left').drop('split').rename({'split2': 'split'})
     df.write_parquet(f'{a.out}/seq.parquet')
     print(f'seq: {df.height:,} slots, {df.select(k).unique().height:,} trees; by split',
           df.group_by('split').agg(pl.len()).sort('split').rows())

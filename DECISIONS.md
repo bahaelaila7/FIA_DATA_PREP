@@ -741,3 +741,13 @@ Validation-only development gave:
 3. **Interval width factors per imputed size class** (imputed DIA < 2 in vs ≥ 2 in), each fitted on VAL to cover 0.80 there. A2 is per class, and the class is known at prediction time from the imputed DIA.
 
 **Unchanged:** the bars A1–A3 and P1–P3; TEST scored once; outcome recorded whatever it is.
+
+**D50 outcome (fresh TEST scored once, 2026-10-30; /workspace/FIA/nimiwae_r8/d50/bench_report_test.json).** NOT ACCEPTED.
+- **A1 FAIL.** Overall log AGB +0.025 and log DIA +0.028 pass, and so does 1–2 in (log AGB −0.06). But softwoods (major group 1) are **+0.24** and major group 2 **+0.11**.
+- **A2 FAIL.** Overall coverage is 0.80, but 1–2 in is **0.69** and 2–3 in **0.853**.
+- **A3 PASS** (1.06). **P1 PASS** (0 violations).
+- **Accuracy:** MAE log AGB **1.37**, worse than the rule (1.03, context only). The validation MAE rose over training (0.63 → 1.38) while the bias converged near 0, and the interval width factors needed ≈ 4×.
+
+**Reading.** The NIMIWAE objective, the likelihood of the observed visits under not-missing-at-random missingness, does not identify the pre-debut path: more training fits the observed period better while the extrapolation gets noisier. The fixes for the D49 failure (allometry, schedule) moved the bias but not this.
+
+**Status.** Two test sets are now used. Any further candidate needs a clean held-out set: a whole held-out state is cleanest. Options (user): see the session report. The rule stays in production, with its measured bias (+0.47 log AGB, totals 1.51) on record.

@@ -16,13 +16,14 @@ Semantics (D49 + amendments; review fixes 1–7):
     given z, so each importance sample is a monotone path.
   * Outputs (fix 4/5): posterior-mean log DIA / log HT / log AGB; linear-scale posterior mean AGB (for totals); predictive samples of
     log AGB (mixture over the weighted paths + allometry noise) for interval coverage. Capped at the first observed value.
-  * Epoch selection on the VAL benchmark: minimise |median bias log AGB|; then one interval width factor w fitted on VAL so the 80 %
-    interval covers 0.80 there, frozen into the checkpoint (D49 amendment 3). TEST scored once by nimiwae_bench.py.
+  * D50: AdamW + cosine learning-rate decay over all epochs; the FINAL epoch is the model (no epoch picking). Then one interval width
+    factor per imputed size class (DIA < 2 in, >= 2 in), fitted on VAL to cover 0.80 there, frozen into the checkpoint. TEST scored once.
 Usage: python -I nimiwae_train.py --data DIR [--epochs N] [--k K]"""
 import argparse, json, math, time
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 
 T_MAX, DZ, YRS_S = 13, 4, 20.0
+KNOTS = torch.log(torch.tensor([0.5, 1.0, 2.0, 3.0, 5.0]))     # allometry hinge knots (log in)
 KAPPA = 20.0                                    # steepness of the tally step per log unit of DIA (FIA records DIA to 0.1 in)
 A_BH = {'S': 2.0, 'H': 5.0}                     # years from establishment to breast height (softwood / hardwood; curation I6 rule)
 LOG_BH_HT, LOG_BH_DIA = math.log(4.5), math.log(0.1)
@@ -98,6 +99,7 @@ class NIMIWAE(nn.Module):
         nn.init.constant_(s.dc.weight, -2.1); nn.init.constant_(s.db.weight, 0.55); s.zeta = nn.Linear(DZ, 1)
         s.a, s.b, s.c, s.ls = (nn.Embedding(nsp + 1, 1) for _ in range(4))
         nn.init.constant_(s.a.weight, 3.0); nn.init.constant_(s.b.weight, 1.8); nn.init.constant_(s.c.weight, 0.3); nn.init.constant_(s.ls.weight, -1.5)
+        s.hw = nn.Embedding(nmaj + 1, 2 * len(KNOTS)); nn.init.constant_(s.hw.weight, -4.0)          # hinge weights (softplus >= 0)
         s.lsD, s.lsH = nn.Parameter(torch.tensor(-2.3)), nn.Parameter(torch.tensor(-2.0))
         s.leps = nn.Parameter(torch.tensor(-4.0))                                              # logit of the field-miss rate ε
         s.lsP = nn.Parameter(torch.tensor(math.log(0.3)))                                       # log sd of the growth process noise
@@ -129,8 +131,14 @@ class NIMIWAE(nn.Module):
         sD = torch.log(torch.exp(c) * exc ** F.softplus(s.db(B['sp'])[:, 0])[None, :, None] + 0.01)
         return sD, sH
     def allom(s, sD, sH, B):
+        """log AGB = a_sp + b_sp s + c_sp h + Σ_j w_{g,j} φ_j(s): φ = relu(s − t_j) and −relu(t_j − s), both increasing in s, w >= 0, so the
+        allometry is monotone in DIA and HT but can bend at small sizes (D50)."""
         a, b, c = s.a(B['sp'])[:, 0], F.softplus(s.b(B['sp'])[:, 0]), F.softplus(s.c(B['sp'])[:, 0])
-        return a[None, :, None] + b[None, :, None] * sD + c[None, :, None] * sH, s.ls(B['sp'])[:, 0][None, :, None].expand_as(sD)
+        w = F.softplus(s.hw(B['maj']))[None, :, None, :]                                       # [1, n, 1, 2J]
+        t = KNOTS[None, None, None, :]
+        phi = torch.cat([F.relu(sD[..., None] - t), -F.relu(t - sD[..., None])], -1)           # [K, n, T, 2J]
+        return (a[None, :, None] + b[None, :, None] * sD + c[None, :, None] * sH + (w * phi).sum(-1),
+                s.ls(B['sp'])[:, 0][None, :, None].expand_as(sD))
     def logw(s, B, K):
         st = s.static(B); mu, lsd = s.q(B, st)
         z = mu + torch.exp(lsd) * torch.randn(K, *mu.shape)
@@ -170,7 +178,9 @@ def impute(model, B, K=100, bs=2048, nsamp=200, w_int=1.0):
         n_ = ks.shape[0]; ar = torch.arange(n_)[:, None]
         smu = muA.permute(1, 0, 2)[ar, ks]; ssd = torch.exp(lsA.permute(1, 0, 2)[ar, ks])        # [n, nsamp, T]
         draw = smu + ssd * torch.randn_like(smu)
-        draw = eA[:, None] + w_int * (draw - eA[:, None])                                       # interval width factor (fitted on VAL, D49 am. 3)
+        ws, wl = (w_int, w_int) if np.isscalar(w_int) else w_int
+        wt = torch.where(eD < math.log(2.0), torch.tensor(float(ws)), torch.tensor(float(wl)))   # per imputed size class (D50)
+        draw = eA[:, None] + wt[:, None] * (draw - eA[:, None])
         q = torch.quantile(draw, torch.tensor([0.1, 0.9]), dim=1)                              # [2, n, T]
         res['lD'].append(cap(eD, b['lD'])); res['lH'].append(cap(eH, b['lH'])); res['lA'].append(cap(eA, b['lA']))
         res['A'].append(torch.minimum(A, torch.exp(b['lA'].gather(1, f[:, None])))); res['q10'].append(q[0]); res['q90'].append(q[1])
@@ -199,16 +209,28 @@ def bench_eval(model, data, split, atab, K=100, w_int=1.0):
                 bias_allom_true_size=float(np.median(eAl)), cov80=float(cov.mean()),
                 viol=(monotone_violations(R['lD'], B), monotone_violations(R['lH'], B), monotone_violations(R['lA'], B))), B, R, seq
 
-def fit_width(model, data, atab, grid=np.arange(1.0, 12.01, 0.05)):
-    """Smallest interval width factor whose VAL 80 % coverage reaches 0.80 (split-conformal style, D49 amendment 3)."""
-    torch.manual_seed(7)
-    for w in grid:
-        r, *_ = bench_eval(model, data, 'val', atab, w_int=float(w))
-        if r['cov80'] >= 0.80: return float(w)
-    return float(grid[-1])
+def fit_width(model, data, atab, lo=1.0, hi=12.0, iters=12):
+    """Per imputed size class (DIA < 2 in, >= 2 in), the width factor whose VAL 80 % coverage in that class is 0.80, by bisection
+    (coverage is monotone in the width; D50)."""
+    def cov(cls, w):
+        torch.manual_seed(7)
+        r, B, R, _ = bench_eval(model, data, 'val', atab, w_int=(w, 1.0) if cls == 0 else (1.0, w))
+        hid = B['hid'].bool(); small = (R['lD'] < math.log(2.0)) & hid; sel = small if cls == 0 else (hid & ~small)
+        inside = ((B['lA'] >= R['q10']) & (B['lA'] <= R['q90']))[sel].float()
+        return 1.0 if inside.numel() == 0 else float(inside.mean())
+    out = []
+    for cls in (0, 1):
+        a_, b_ = lo, hi
+        if cov(cls, a_) >= 0.80: out.append(a_); continue
+        for _ in range(iters):
+            mid = 0.5 * (a_ + b_)
+            if cov(cls, mid) >= 0.80: b_ = mid
+            else: a_ = mid
+        out.append(round(b_, 3))
+    return tuple(out)
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); ap.add_argument('--epochs', type=int, default=6)
+    ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); ap.add_argument('--epochs', type=int, default=10)
     ap.add_argument('--k', type=int, default=8); ap.add_argument('--bs', type=int, default=1024); ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--threads', type=int, default=6); a = ap.parse_args()
     torch.manual_seed(a.seed); torch.set_num_threads(a.threads); rng = np.random.default_rng(a.seed)
@@ -216,7 +238,9 @@ def main():
     atab = age_table(tr); atab.to_parquet(f'{a.data}/age_proxy_table.parquet')
     B, vocab, _ = build(tr, None, atab); n = B['m'].shape[0]
     model = NIMIWAE(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd'])); model.vocab = vocab
-    opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-5)
+    nsteps = a.epochs * ((n + a.bs - 1) // a.bs)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=nsteps, eta_min=1e-5)          # D50: decays to a converged final epoch
     print(f'train trees {n:,}; slots {int(B["v"].sum()):,}, observed {int(B["m"].sum()):,}, height obs {int(B["mH"].sum()):,}', flush=True)
     best, hist = (1e9, None), []
     for ep in range(a.epochs):
@@ -224,20 +248,20 @@ def main():
         for ix in batches(n, a.bs, rng):
             b = sub(B, ix); lw, *_ = model.logw(b, a.k)
             loss = -(torch.logsumexp(lw, 0) - math.log(a.k)).mean()
-            opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step()
+            opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step(); sched.step()
             tot += loss.item(); nb += 1
         r, *_ = bench_eval(model, a.data, 'val', atab)
-        score = abs(r['bias_lA'])                                                             # (D49 am. 3: coverage is set by the VAL width factor)
-        hist.append(dict(epoch=ep, loss=tot / nb, **{f'val_{k}': v for k, v in r.items()}, select=score, field_miss=float(torch.sigmoid(model.leps)), proc_sd=float(torch.exp(model.lsP))))
+        hist.append(dict(epoch=ep, loss=tot / nb, lr=sched.get_last_lr()[0], **{f'val_{k}': v for k, v in r.items()},
+                         field_miss=float(torch.sigmoid(model.leps)), proc_sd=float(torch.exp(model.lsP))))
         print(json.dumps(hist[-1]), f'{time.time() - t0:.0f}s', flush=True)
-        if score < best[0]:
-            best = (score, ep); torch.save({'state': model.state_dict(), 'vocab': vocab, 'epoch': ep}, f'{a.data}/nimiwae.pt')
-    json.dump(dict(hist=hist, best_epoch=best[1], best_select=best[0], args=vars(a)), open(f'{a.data}/train_log.json', 'w'), indent=1)
-    print(f'best epoch {best[1]} (|median bias log AGB| = {best[0]:.4f}) -> {a.data}/nimiwae.pt')
+    torch.save({'state': model.state_dict(), 'vocab': vocab, 'epoch': a.epochs - 1}, f'{a.data}/nimiwae.pt')   # D50: the FINAL epoch
+    best = (abs(hist[-1]['val_bias_lA']), a.epochs - 1)
+    json.dump(dict(hist=hist, final_epoch=best[1], args=vars(a)), open(f'{a.data}/train_log.json', 'w'), indent=1)
+    print(f'final epoch {best[1]} (VAL |median bias log AGB| = {best[0]:.4f}) -> {a.data}/nimiwae.pt')
     ck = torch.load(f'{a.data}/nimiwae.pt', weights_only=False); model.load_state_dict(ck['state'])
     w = fit_width(model, a.data, atab); ck['w_int'] = w; torch.save(ck, f'{a.data}/nimiwae.pt')
     r, *_ = bench_eval(model, a.data, 'val', atab, w_int=w)
-    print(f'VAL width factor w = {w:.2f} -> VAL 80 % coverage {r["cov80"]:.3f}; frozen into {a.data}/nimiwae.pt')
+    print(f'VAL width factors (imputed < 2 in, >= 2 in) = {w} -> VAL 80 % coverage {r["cov80"]:.3f}; frozen into {a.data}/nimiwae.pt')
 
 if __name__ == '__main__':
     main()
