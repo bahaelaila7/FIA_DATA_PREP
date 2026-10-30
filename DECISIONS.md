@@ -1001,3 +1001,30 @@ The learned AR(1) persistence ρ ≈ 0.01–0.03, so the persistence prior was i
   - 400k sampled training trees per fold, 4 epochs, K = 16, batch 512, one-cycle cosine schedule;
   - the final epoch is the model;
   - widths are fitted on the inner validation (decisive config).
+
+**D53 outcome (nested CV scored once, 2026-10-30; /workspace/FIA/nimiwae_r8/d53_ncv/ncv_report.json).** NOT ACCEPTED: A1 / A2 fail only in their small TRUE-size classes.
+
+Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 1.5–2.0.
+
+| criterion | result | verdict |
+|---|---|---|
+| A1 (bias, log AGB) | overall +0.04; species groups +0.02 / +0.09 / +0.07 / +0.03 (softwood now passes); true 1–2 in **+1.01**, 2–3 in **+0.31**, 3–4 in +0.08, 4–5 in −0.04 | fail |
+| A2 (80 % coverage) | overall 0.81; 1–2 in **0.61**, 2–3 in **0.73**, 3–4 in 0.79, 4–5 in **0.88** | fail |
+| A3 (totals ratio) | **1.079** | pass |
+| P1 (monotone) | 0 violations | pass |
+| accuracy (MAE) | log AGB **0.468** (folds 0.46–0.48; the best so far: D52 0.507), log DIA 0.171 | |
+
+- **Diagnostic, by prediction:** −0.42 / −0.07 / +0.02 / +0.05 for predicted 1–2 / 2–3 / 3–4 / 4–5 in.
+- **Existence diagnostic** ("< limit only", truth E = 1): mean P(E) 0.953 (5 in), 0.941 (3 in).
+- **Alongside:**
+  - 5 in / lt: MAE 0.785, A3 1.025;
+  - 3 in / interval: MAE 0.498, A3 1.152;
+  - 3 in / lt: MAE 0.929, A3 1.033.
+
+**Next (user, 2026-10-30): D54 existence semantics.**
+- Existence means "qualifies, should have a record" (≥ 1 in), with one flip.
+- TRUE (posited) from the debut through the last record, gaps included (measurements missing, imputed, no cutoff penalty).
+- **Observed FALSE** before the debut for microplot trees with a clean history (RECONCILECD 1, sampled visits); gated, not set to 0.
+- Unknown otherwise: subplot trees, RECONCILECD 8 / blank, unsampled visits.
+- RECONCILECD 3: TRUE at the previous visit.
+- The cutoff is one likelihood term, not the heuristic. Existence becomes scoreable on hidden clean microplot lineages.
