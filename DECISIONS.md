@@ -751,3 +751,37 @@ Validation-only development gave:
 **Reading.** The NIMIWAE objective, the likelihood of the observed visits under not-missing-at-random missingness, does not identify the pre-debut path: more training fits the observed period better while the extrapolation gets noisier. The fixes for the D49 failure (allometry, schedule) moved the bias but not this.
 
 **Status.** Two test sets are now used. Any further candidate needs a clean held-out set: a whole held-out state is cleanest. Options (user): see the session report. The rule stays in production, with its measured bias (+0.47 log AGB, totals 1.51) on record.
+
+## D51 — NIMIWAE redesign: causal forward growth with growth drivers (user, 2026-10-30; recorded before any code or training)
+**User.** "You are mis-modeling with nimiwae… the observed data encoder is doing the heavy lifting… be clever about growth curves and what might affect them… bundle in enough information to guide that, also the causal dependency."
+
+**What was wrong.**
+- **Anti-causal generation.** D49/D50 integrated sizes BACKWARDS from the last visit, so the unobserved early states inherited every accumulated error.
+- **No drivers.** The growth rate had almost no information about WHY a tree grows fast or slow, so the encoder had nothing to work with.
+
+**Generative model (forward in time, causal).**
+- **Per-tree latents:**
+  - z (vigour / microsite);
+  - the age at the first observed record, A_f. Its prior is log-normal around the leak-free age proxy (from the first observed record only), with sd 0.4 in log space.
+- Establishment is at t_f − A_f.
+- **Effective age** accumulates forward: a_eff(t) = Σ over the intervals since establishment of Δyears · m_t · ε_t.
+  - m_t = exp(f(z, competition_t, release_t, climate anomaly_t)) is the growth modifier of the interval.
+  - ε_t is log-normal process noise.
+  - So a_eff is non-decreasing, and each interval depends only on its own covariates.
+- **Height** is a Chapman–Richards curve, H(t) = Hmax (1 − e^{−k a_eff})^p, with Hmax, k and p depending on z, species and site (site index SICOND with a missing flag, SITECLCD, PHYSCLCD, slope / aspect) and on the L4 climate normals. Height is monotone in time by construction.
+- **DIA and AGB.** DIA = c (H − 4.5 ft)_+^b + 0.01 in (the breast-height anchor). AGB comes from the monotone hinge allometry.
+- **Missingness** is the near-step tally limit with a learned field-miss rate (as D49).
+
+**Per-interval drivers (causal: the interval ending at each slot).**
+- **Competition:** BA of the OTHER trees on the subplot at the slot (the subplot BA minus the tree's own BA, so there is no leak from a hidden tree), and stems per acre.
+- **Release:** a cut (TRTCD 10) or disturbance (DSTRBCD other than 0 / 60) recorded on the tree's condition at the slot.
+- **Climate:** the mean yearly tmean, ppt and vpdmax of the L4 over the interval, as anomalies against its 1991–2020 normal. Calendar years are used only for this join.
+- Crown ratio and crown class are OBSERVATIONS seen by the encoder, masked at hidden or missing visits.
+
+**Encoder.** Observed sizes, crown measures and all per-slot drivers → q(z) and q(log A_f).
+
+**Splits.** VAL is unchanged. The new TEST is plots never scored before: d50-train plots that were in neither earlier test, with crc32(key + "|r3") % 100 < 18. Both earlier tests move to train.
+
+**Training.** Cosine decay; the final epoch is the model; width factors per imputed size class are fitted on VAL.
+
+**Bars unchanged:** A1–A3 and P1–P3. TEST is scored once.
