@@ -1028,3 +1028,66 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
 - Unknown otherwise: subplot trees, RECONCILECD 8 / blank, unsampled visits.
 - RECONCILECD 3: TRUE at the previous visit.
 - The cutoff is one likelihood term, not the heuristic. Existence becomes scoreable on hidden clean microplot lineages.
+
+## D54 — NIMIWAE lineage completion: existence start AND end, tree fate, future records (user, 2026-10-30; recorded before any D54 code or training)
+**User decisions.**
+- Complete every tree's lineage over all plot visits that measured something: establishment, size while alive, fate. This is **completion within measured visits, not prediction**; projection is left to process models (Biomass Succession, PnET, HBAD ≥ 3).
+- Existence = "qualifies, should have a record" (≥ 1 in), one contiguous interval.
+- RECONCILECD 3 / 6 / 7 → missed (TRUE at the previous visit).
+- AGENTCD 80 → cut.
+- Soft existence evidence, but it must not override existence.
+- Per-tree first.
+- Sapling totals use the exact split below, not raw expansion.
+- Use DReG gradients (Tucker et al. 2018, arXiv 1810.04152).
+
+**Frame.**
+- **Counted plot visits:** at least one subplot sampled (forest subplot condition). Plot visits with none are dropped.
+- **Subplot span:** its first to last sampled visit. Unsampled visits inside the span are slots (completed); visits outside it are not in the frame.
+- **Tree lineage:** every counted visit in its subplot's span, before the debut, during the record and after it.
+- **Tree's spot sampled at a visit:** the condition of the nearest real record (CONDID) is forest at that visit; a microplot tree's FALSE evidence needs a fully forested microplot.
+
+**Existence evidence** (soft where marked, with error rate ρ ≤ 0.05 learned and capped):
+
+| slot | evidence |
+|---|---|
+| debut → last record (gaps included) | TRUE, hard |
+| before the debut, microplot tree (code 1 / 2), fully forested microplot | FALSE, soft |
+| previous visit of codes 3 / 6 / 7 | TRUE, soft; earlier visits inferred |
+| other pre-debut slots | inferred |
+| recorded death / cut / move-out (terminal_fate harvest_explicit (incl. AGENTCD 80), harvest_inferred, disappeared_inferred_removal → cut; dead_natural, dead_disturbance → death; censored_moved → end, no cause) | FALSE from that visit on, hard; cause observed |
+| censored_shrank | TRUE afterwards, sizes missing (absence uninformative) |
+| censored_procedural(_unrecorded) | inferred afterwards, absence uninformative |
+| diverted_landuse, censored_nonsampled | the tree's spot is unsampled afterwards (completed only if sandwiched) |
+| alive_censored with later sampled visits | inferred; a missing record at a sampled visit is informative (below limit, missed, or gone) |
+
+**Model** (the nimiwae53 structure, extended):
+- **Latents:** z (conditional prior on statics: species (curated resolved), ecoregion, site, normals, forest type, planted; no age) and discrete (start s, end e, cause f ∈ {death, cut}), all summed out exactly. E_t = 1[s ≤ t < e].
+- **Decoder:** a bidirectional transformer on (z, always-known context) with these heads:
+  - an establishment hazard;
+  - competing per-interval end hazards (survive / die / cut);
+  - softplus DIA / HT increments (DIA = 1 in + cumulative from s; nothing outside [s, e));
+  - crown ratio and crown class.
+- **Context inputs:** dropped are BALIVE, ALSTK and STDSZCD (they include the tree itself, a benchmark-only existence cue). Competition is leave-one-out from the records. All TRTCD (10 / 20 / 30 / 40 / 50) and DSTRBCD (10–90) groups are multi-hot drivers.
+- **Likelihood:** as D53 (fixed FIA DIA error + monitored discrepancy; tally-limit / crew-miss missingness), plus the existence and cause evidence above.
+- **Training:** IWAE with **DReG** encoder gradients (decoder / prior: standard), K = 32; pure objective (no supervised term).
+
+**Outputs.**
+- Sampled lineages (the cohort product).
+- Per slot: P(exists), P(gone by death), P(gone by cut), and size given existence.
+- **Sapling totals per visit:** saplings that reach ≥ 5 in later in the lineage are enumerated over the whole subplot (each at the subplot expansion); all other saplings come from the microplot sample only (microplot expansion). No double count.
+
+**Evaluation (nested CV: D52 folds and inner validation; dev-VAL plots never scored).**
+- **(i) Sizes, decisive:** clean microplot lineages pseudo-censored at 5 in, interval protocol; A1–A3 + P1 unchanged (1-in true classes; prediction-binned diagnostic).
+- **(ii) Establishment:** the same lineages under the "< limit only" protocol, with the pre-debut FALSE labels hidden. Score P(exists) at the hidden slots (truth TRUE at hidden real visits, FALSE before the debut).
+  - Bar E1: reliability within ±0.05 in every probability decile with n ≥ 200.
+  - Brier reported.
+- **(iii) Fate:** recorded ends turned into unknown stops (the death / cut record and its codes hidden).
+  - Bar E2: P(exists) reliability within ±0.05 per decile at the hidden end visit and after.
+  - Bar E3: P(cut | gone) reliability within ±0.05 per decile.
+- **(iv) Future records:** the final live record of continuing trees with ≥ 3 real records hidden.
+  - Bar E4: P(exists) reliability within ±0.05 per decile.
+  - Sizes: A1 (overall + major group) and A2 overall within the bars, A3 totals 0.9–1.1.
+- **Benchmark-leak guards:**
+  - converted lineages get the codes a subplot tree would show;
+  - hidden ends drop their RECONCILECD / fate fields;
+  - stand fields exclude the tree itself.
