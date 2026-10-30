@@ -1108,3 +1108,23 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
 - **The flaw.** Amendment 1 took one interval per tree: the death interval for gone trees, the last for survivors. That over-represents deaths relative to the per-interval rate (43 % gone on VAL), so a calibrated model would fail E2 by construction.
 - **The fix.** Every at-risk interval (j − 1, j] with a known outcome is a separate instance: a real record at j, or a definitive death / cut at j, with ≥ 2 visible real records before j. Each instance is the lineage truncated after j and censored procedural-style at j. The benchmark's gone share then equals the population's per-interval rate. E2 / E3 / E4 are unchanged.
 - **Also fixed before any run (a model bug found in smoke testing).** The end hazards now count every interval the tree was at risk, from its start s, during its record too. Before, they applied only after the last record, which conditioned survival away and trained the hazard almost only on trees that ended (smoke VAL: P(exists) 0.20 for both alive and gone).
+
+**D54 amendment 3 (user, 2026-10-30; after the VAL dev check, before any nested-CV scoring): no biomass; implementation bug fixes.**
+- **User.** "You can forgo biomass as a tree input and output. I am not interested in having the model be strained by fitted allometry."
+  - The learned allometry and every AGB input, output and loss are removed.
+  - **Bars re-expressed without biomass:**
+    - A1: |median error of log DIA| ≤ 0.10, overall, per true 1-in class and per major group (n ≥ 200);
+    - A2: 80 % predictive intervals of log DIA (including the FIA measurement error) cover 0.75–0.85, overall and per class;
+    - A3: median ratio of predicted to true **basal area** (0.005454 · DIA², exact) per subplot-visit in 0.9–1.1;
+    - P1 unchanged;
+    - E4: the same A1 (overall + major group) / A2 overall / A3 on the censored-end benchmark's alive instances.
+  - E1–E3 are unchanged.
+- **Bug (confirmed on VAL).** The tally step was centred exactly on the limit, giving a tree measured at the limit a 50 % tally probability; the posterior DIA at 1.0–1.1 in microplot debuts was +7.8 % above the measurement. Fixed: P(tallied | DIA) = (1 − ε) σ(κ (log DIA − log(limit − 0.05 in))), κ = 40; the benchmark's 1-in lower bound likewise.
+- **Design flaw.** Interval widths were fitted on pre-debut sizes and reused for future records (E4 coverage 0.94). Fixed: width factors per slot type (before the debut / after the last record), each fitted on the inner validation's matching benchmark.
+- **Minor.** Moved-out trees (an end without a cause) are excluded from the cause hazards' likelihood (their end is marginalised over survive-to-move); previously either cause was allowed.
+- **Consistency checks passed on the dev model:**
+  - P(E) = 1 at real records;
+  - after the last record, P(E) + P(died) + P(cut) = 1;
+  - P(E) = 0 at recorded ends, with the cause respected;
+  - clean FALSE slots have mean P(E) 0.012;
+  - P(E) is monotone up to the debut.

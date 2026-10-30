@@ -13,8 +13,9 @@ import math, time, json
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 
 T_MAX, DZ, D_MODEL = 8, 16, 64
-KAPPA, NEG, RHO_MAX = 20.0, -1e4, 0.05
-KNOTS = torch.log(torch.tensor([0.5, 1.0, 2.0, 3.0, 5.0]))
+KAPPA, NEG, RHO_MAX = 40.0, -1e4, 0.05
+HALF_UNIT = 0.05            # DIA is recorded to 0.1 in: the tally step sits half a unit below the limit (amendment 3)
+BA_K = 0.005454             # ft² per in² (basal area = BA_K · DIA²)
 K_ = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']
 NORM_COLS = ('sicond', 'slope', 'tm_n', 'pp_n', 'vp_n')
 TRT = [10, 20, 30, 40, 50]; DST = [10, 20, 30, 40, 50, 60, 70, 80, 90]
@@ -113,10 +114,10 @@ def build(seq: pd.DataFrame, vocab=None):
                **{f'trt{c}': ((tr_ >= c) & (tr_ < c + 10)).any(1).astype(float) for c in TRT},
                **{f'dst{c}': ((ds_ >= c) & (ds_ < c + 10)).any(1).astype(float) for c in DST})
     lgD = np.log(np.clip(np.nan_to_num(dia, nan=1.0), 0.05, None)); lgH = np.log(np.clip(np.nan_to_num(ht, nan=4.5), 1.0, None))
-    X = dict(lD=mat(lgD), lH=mat(lgH), lA=mat(np.log(np.clip(seq.drybio_g.fillna(1.0).to_numpy(float), 0.1, None))),
+    X = dict(lD=mat(lgD), lH=mat(lgH),
              mD=mat(mD), mH=mat(mH), cr=mat(np.where(mcr, seq.cr.to_numpy(float) / 100, 0)), mcr=mat(mcr),
              cc=mat(np.where(mcc, seq.cclcd.to_numpy(float), 0)), mcc=mat(mcc), v=mat(np.ones(N)), hid=mat(hid), real=mat(real),
-             sampled=mat(sampled), llim=mat(np.log(limit)), llo=mat(np.log(lo), -20.0), fmp=mat(fmp),
+             sampled=mat(sampled), llim=mat(np.log(limit - HALF_UNIT)), llo=mat(np.log(lo - HALF_UNIT), -20.0), fmp=mat(fmp),
              ev=mat(ev), mode=mat(mode), cov=np.stack([mat(cov[c]) for c in COV], -1))
     st = g.head(1)
     def ids(c): return st[c].map(vocab[c]).fillna(0).astype(int).to_numpy()
@@ -166,10 +167,6 @@ class NIMIWAE54(nn.Module):
         s.dout = nn.Linear(d, 2 + 1 + 3 + 1 + 5)                                  # dD, dH | establishment | (survive, die, cut) | cr | cclcd
         with torch.no_grad():
             s.dout.bias.zero_(); s.dout.bias[0] = -0.5; s.dout.bias[1] = 1.5; s.dout.bias[3] = 3.0
-        s.a, s.b, s.c, s.ls = (nn.Embedding(nsp + 1, 1) for _ in range(4))
-        nn.init.constant_(s.a.weight, 4.4); nn.init.constant_(s.b.weight, math.log(math.expm1(2.0))); nn.init.constant_(s.c.weight, math.log(math.expm1(0.8)))
-        nn.init.constant_(s.ls.weight, -1.5)
-        s.hw = nn.Embedding(nmaj + 1, 2 * len(KNOTS)); nn.init.constant_(s.hw.weight, -4.0)
         s.lsdisc, s.lsH, s.lscr = nn.Parameter(torch.tensor(-4.0)), nn.Parameter(torch.tensor(-2.0)), nn.Parameter(torch.tensor(-2.0))
         s.leps, s.lrho = nn.Parameter(torch.tensor(-4.0)), nn.Parameter(torch.tensor(-2.0))
     def enc_params(s):
@@ -196,15 +193,8 @@ class NIMIWAE54(nn.Module):
         o = s.dout(s.dtr(h.reshape(K * n, T_MAX, D_MODEL), src_key_padding_mask=pad)).reshape(K, n, T_MAX, -1)
         return (F.softplus(o[..., 0]) * B['v'], F.softplus(o[..., 1]) * B['v'], o[..., 2], torch.log_softmax(o[..., 3:6], -1),
                 torch.sigmoid(o[..., 6]), o[..., 7:])
-    def allom(s, lD, lH, B, shape):
-        a, b, c = s.a(B['sp'])[:, 0], F.softplus(s.b(B['sp'])[:, 0]), F.softplus(s.c(B['sp'])[:, 0])
-        w = F.softplus(s.hw(B['maj'])); t = KNOTS
-        ph = torch.cat([F.relu(lD[..., None] - t), -F.relu(t - lD[..., None])], -1)
-        bc = lambda x: x.reshape((1,) * (lD.dim() - 2) + (-1, 1))
-        wv = w.reshape((1,) * (lD.dim() - 2) + (w.shape[0], 1, w.shape[1]))
-        return bc(a) + bc(b) * lD + bc(c) * lH + (wv * ph).sum(-1), bc(s.ls(B['sp'])[:, 0]).expand(shape)
     def joint(s, B, K, dreg=False):
-        """-> log weights lw [K, n] (and lw with q detached for DReG), log posterior over (s, e, f) [K, n, S, E, 2], sizes, allometry NLL."""
+        """-> log weights lw [K, n] (and lw with q detached for DReG), log posterior over (s, e, f) [K, n, S, E, 2], sizes."""
         mq, lq = s.q(B); mp, lp = s.p_z(B)
         z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape)
         dD, dH, hz, lend, crm, ccl = s.decode(z, B)
@@ -253,8 +243,9 @@ class NIMIWAE54(nn.Module):
         sI, uI = ar[:, None], ar[None, :]
         valid = (uI > sI)[None, None] & (uI[None, None] > l[..., None]) & (uI[None, None] < nv[..., None])   # [1, n, S, U]
         surv_su = cprev[..., None, :] - csum[..., :, None]                                               # [K, n, S, U]: Σ_{s<v<u}
-        lpe_die = torch.where(valid, surv_su + ldie[..., None, :], torch.full_like(surv_su, NEG))
-        lpe_cut = torch.where(valid, surv_su + lcut[..., None, :], torch.full_like(surv_su, NEG))
+        mv = (B['moved'] == 1)[None, :, None, None]                                                     # a move is not a death / cut
+        lpe_die = torch.where(valid, surv_su + torch.where(mv, torch.zeros_like(ldie[..., None, :]), ldie[..., None, :]), torch.full_like(surv_su, NEG))
+        lpe_cut = torch.where(valid & ~mv, surv_su + lcut[..., None, :], torch.full_like(surv_su, NEG))
         alive = csum.gather(-1, (nv - 1).clamp(min=0).expand(K, -1, 1)) - csum                           # [K, n, S]: Σ_{s<v<nv}
         e_idx = torch.arange(T_MAX + 1)[None, None, None]
         lpe = torch.stack([torch.cat([lpe_die, alive[..., None]], -1), torch.cat([lpe_cut, torch.full_like(alive[..., None], NEG)], -1)], -1)
@@ -271,27 +262,14 @@ class NIMIWAE54(nn.Module):
         lpz = (-0.5 * (z - mp) ** 2 / torch.exp(lp) - 0.5 * lp - c2).sum(-1)
         lqz = (-0.5 * (z - mq) ** 2 / torch.exp(lq) - 0.5 * lq - c2).sum(-1)
         lw = lpx + lcr + lcc + lpz - lqz
-        out = dict(lw=lw, lpost=lj - lpx[..., None, None, None], D=D, H=H)
+        out = dict(lw=lw, lpost=lj - lpx[..., None, None, None], D=D, H=H, sdD=sdD, lsdisc=s.lsdisc)
         if dreg:
             mqd, lqd = mq.detach(), lq.detach()
             out['lw_dreg'] = lpx + lcr + lcc + lpz - (-0.5 * (z - mqd) ** 2 / torch.exp(lqd) - 0.5 * lqd - c2).sum(-1)
-        mA = B['mD'] * B['mH']; muA, lsA = s.allom(B['lD'], B['lH'], B, B['lD'].shape)
-        out['nll_allom'] = -(nl(B['lA'], muA, lsA) * mA).sum() / mA.sum().clamp(min=1)
         return out
 
 def make_model(vocab):
     m = NIMIWAE54(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1); m.vocab = vocab; return m
-
-def init_allometry(model, tr):
-    t = tr[(tr.slot_kind == 'real') & tr.ht.notna() & tr.drybio_g.notna() & tr.dia.notna()]
-    X = np.c_[np.ones(len(t)), np.log(t.dia), np.log(t.ht)]; y = np.log(t.drybio_g.clip(lower=0.1)).to_numpy()
-    coef = np.linalg.lstsq(X, y, rcond=None)[0]; r = pd.Series(y - X @ coef, index=t.index)
-    inv = lambda x: math.log(math.expm1(max(x, 1e-3)))
-    with torch.no_grad():
-        model.a.weight.fill_(coef[0]); model.b.weight.fill_(inv(coef[1])); model.c.weight.fill_(inv(coef[2]))
-        for sp, med in r.groupby(t.spgrpcd).median().items():
-            if sp in model.vocab['spgrpcd']: model.a.weight[model.vocab['spgrpcd'][sp], 0] = coef[0] + med
-    return coef
 
 # --------------------------------------------------------------------------------------------------------------------------- inference
 def wmedian(X, w):
@@ -299,10 +277,12 @@ def wmedian(X, w):
     return Xs.gather(0, (cw < 0.5).sum(0, keepdim=True).clamp(max=X.shape[0] - 1))[0]
 
 @torch.no_grad()
-def impute(model, B, K=100, bs=512, nsamp=200, w_int=(1.0, 1.0)):
-    """Per slot: P(exists), P(gone by death / cut by t); unconditional posterior median DIA (0 when not existing); size given existence
-    (median); AGB median / mean / 80 % interval given existence."""
-    keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD', 'lH', 'lA', 'A', 'q10', 'q90')
+def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
+    """Per slot: P(exists), P(gone by death / cut by t); unconditional posterior median log DIA (0 when not existing; P1); size given
+    existence (median log DIA / HT); 10 / 90 % predictive quantiles of the MEASURED log DIA (path + FIA measurement error + discrepancy),
+    widths scaled per slot type (pre: before the debut, post: after the last record) and imputed size class; expected basal area."""
+    w_int = w_int or {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}
+    keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD', 'lH', 'q10', 'q90', 'BA')
     out = {k: [] for k in keys}
     ar = torch.arange(T_MAX)
     for i in range(0, B['v'].shape[0], bs):
@@ -311,37 +291,38 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=(1.0, 1.0)):
         Kk, n = W.shape[:2]
         sI = ar[:, None, None]; eI = torch.arange(T_MAX + 1)[None, :, None]; tI = ar[None, None, :]
         nv = b['v'].sum(1).long()
-        Ex = ((tI >= sI) & ((tI < eI) | (eI == T_MAX))).float()                                       # [S, E, T]
+        Ex = ((tI >= sI) & ((tI < eI) | (eI == T_MAX))).float()
         Ex = Ex[None, None].expand(Kk, n, -1, -1, -1) * (tI[None, None] < nv[None, :, None, None, None]).float()
-        Ws = W.sum(-1)                                                                                 # over cause
+        Ws = W.sum(-1)
         pE = (Ws[..., None] * Ex).sum((0, 2, 3))
         gone = ((tI >= eI) & (eI < T_MAX)).float()[None, None]
         pDie = (W[..., 0][..., None] * gone).sum((0, 2, 3)); pCut = (W[..., 1][..., None] * gone).sum((0, 2, 3))
-        # per (k, s) samples: weight summed over (e, f); sizes depend on s only
-        Wks = Ws.sum(-1)                                                                               # [K, n, S]
+        Wks = Ws.sum(-1)
         Df = o['D'].permute(0, 2, 1, 3).reshape(Kk * T_MAX, n, T_MAX); Hf = o['H'].permute(0, 2, 1, 3).reshape(Kk * T_MAX, n, T_MAX)
         Wf = Wks.permute(0, 2, 1).reshape(Kk * T_MAX, n)
         lD_u = torch.log(wmedian(Df, Wf).clamp(min=1e-3))
-        # size given existence at slot t: weights restricted to samples with t >= s (alive at t is implied for t <= l; beyond l
-        # existence also depends on e, ignored for the size summary)
         ex = (Df > 0).float(); Wc = Wf[..., None] * ex; Wc = Wc / Wc.sum(0, keepdim=True).clamp(min=1e-12)
         def cmed(X):
             Xs, ix = torch.sort(X, 0); cw = torch.cumsum(Wc.gather(0, ix), 0)
             return Xs.gather(0, (cw < 0.5).sum(0, keepdim=True).clamp(max=X.shape[0] - 1))[0]
         lDf, lHf = torch.log(Df.clamp(min=1e-3)), torch.log(Hf.clamp(min=1.0))
-        muA, lsA = model.allom(lDf, lHf, b, lDf.shape)
-        lD, lH, lA = cmed(torch.where(ex > 0, lDf, torch.full_like(lDf, -9.0))), cmed(lHf), cmed(muA)
-        A = (Wc * torch.exp(muA + 0.5 * torch.exp(lsA) ** 2)).sum(0)
+        lD, lH = cmed(torch.where(ex > 0, lDf, torch.full_like(lDf, -9.0))), cmed(lHf)
+        BA = (Wc * BA_K * Df ** 2).sum(0)
+        sdm = torch.sqrt(torch.exp(2 * ls_dia(lDf)) + torch.exp(2 * o['lsdisc']))                    # measurement + discrepancy
         q10, q90 = [], []
+        typ_pre = (ar[None] < b['f'][:, None]); typ_post = (ar[None] > b['l'][:, None])
         for tt in range(T_MAX):
             ks = torch.multinomial(Wc[:, :, tt].T + 1e-12, nsamp, replacement=True); arn = torch.arange(n)[:, None]
-            draw = muA[:, :, tt].T[arn, ks] + torch.exp(lsA[:, :, tt].T[arn, ks]) * torch.randn(n, nsamp)
-            wt = torch.where(lD[:, tt] < math.log(2.0), torch.tensor(float(w_int[0])), torch.tensor(float(w_int[1])))
-            draw = lA[:, tt, None] + wt[:, None] * (draw - lA[:, tt, None])
+            draw = lDf[:, :, tt].T[arn, ks] + sdm[:, :, tt].T[arn, ks] * torch.randn(n, nsamp)
+            small = lD[:, tt] < math.log(2.0)
+            wpre = torch.where(small, torch.tensor(float(w_int['pre'][0])), torch.tensor(float(w_int['pre'][1])))
+            wpost = torch.where(small, torch.tensor(float(w_int['post'][0])), torch.tensor(float(w_int['post'][1])))
+            wt = torch.where(typ_pre[:, tt], wpre, torch.where(typ_post[:, tt], wpost, torch.ones_like(wpre)))
+            draw = lD[:, tt, None] + wt[:, None] * (draw - lD[:, tt, None])
             q = torch.quantile(draw, torch.tensor([0.1, 0.9]), dim=1); q10.append(q[0]); q90.append(q[1])
         fI = b['f'][:, None]
         for k_, v_ in (('pE', pE), ('pDie', pDie), ('pCut', pCut), ('lD_u', torch.minimum(lD_u, b['lD'].gather(1, fI))),
-                       ('lD', lD), ('lH', lH), ('lA', lA), ('A', A), ('q10', torch.stack(q10, 1)), ('q90', torch.stack(q90, 1))):
+                       ('lD', lD), ('lH', lH), ('q10', torch.stack(q10, 1)), ('q90', torch.stack(q90, 1)), ('BA', BA)):
             out[k_].append(v_)
     return {k: torch.cat(v) for k, v in out.items()}
 
@@ -405,37 +386,51 @@ def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
         out.append(b.drop(columns=['_rk', '_nr', '_truth', '_i']))
     return pd.concat(out, ignore_index=True)
 
-def predictions(model, bb, K=100, w_int=(1.0, 1.0)):
+def predictions(model, bb, K=100, w_int=None):
     B, _, sq = build(bb, model.vocab)
     R = impute(model, B, K, w_int=w_int)
     ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
-    for k in ('pE', 'pDie', 'pCut', 'lD', 'lA', 'A', 'q10', 'q90', 'lD_u'): sq[f'nim_{k}'] = R[k][ti, po].numpy()
-    viol = (monotone_violations(R['lD_u'], B), monotone_violations(R['lD_u'], B), monotone_violations(R['lD_u'], B))
+    for k in ('pE', 'pDie', 'pCut', 'lD', 'lH', 'q10', 'q90', 'BA', 'lD_u'): sq[f'nim_{k}'] = R[k][ti, po].numpy()
+    viol = (monotone_violations(R['lD_u'], B),)
     return sq, viol
 
-def fit_width(model, bbv, lo=1.0, hi=12.0, iters=10):
-    def cov(cls, w):
-        torch.manual_seed(7); sq, _ = predictions(model, bbv, w_int=(w, 1.0) if cls == 0 else (1.0, w)); h = sq[sq.hidden]
+def fit_width(model, b_pre, b_post, lo=0.5, hi=8.0, iters=10):
+    """Width factors per slot type and imputed size class (< 2 in, >= 2 in): 80 % coverage of the measured log DIA on the validation
+    benchmarks (pre: hidden visits of the 5-in interval benchmark; post: alive instances of the censored-end benchmark), by bisection."""
+    def cov(typ, cls, w):
+        torch.manual_seed(7)
+        wi = {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}; wi[typ] = (w, 1.0) if cls == 0 else (1.0, w)
+        sq, _ = predictions(model, b_pre if typ == 'pre' else b_post, w_int=wi)
+        h = sq[sq.hidden] if typ == 'pre' else sq[sq.truth_E == 1]
+        h = h[h.dia.notna()]
         sel = (np.exp(h.nim_lD) < 2) if cls == 0 else (np.exp(h.nim_lD) >= 2)
-        la = np.log(h.drybio_g); inside = ((la >= h.nim_q10) & (la <= h.nim_q90))[sel]
-        return 1.0 if len(inside) == 0 else float(inside.mean())
-    out = []
-    for cls in (0, 1):
-        a_, b_ = lo, hi
-        if cov(cls, a_) >= 0.80: out.append(a_); continue
-        for _ in range(iters):
-            mid = 0.5 * (a_ + b_)
-            if cov(cls, mid) >= 0.80: b_ = mid
-            else: a_ = mid
-        out.append(round(b_, 3))
-    return tuple(out)
+        ld = np.log(h.dia); inside = ((ld >= h.nim_q10) & (ld <= h.nim_q90))[sel]
+        return None if inside.sum() + (~inside).sum() < 50 else float(inside.mean())
+    tk = b_post[b_post.truth_E == 1][K_].drop_duplicates()                                          # alive instances only (sizes)
+    if len(tk) > 8000: tk = tk.sample(8000, random_state=0)
+    b_post = b_post.merge(tk, on=K_)
+    out = {}
+    for typ in ('pre', 'post'):
+        ws = []
+        for cls in (0, 1):
+            c_lo = cov(typ, cls, lo)
+            if c_lo is None: ws.append(1.0); continue
+            if c_lo >= 0.80: ws.append(lo); continue
+            a_, b_ = lo, hi
+            for _ in range(iters):
+                mid = 0.5 * (a_ + b_)
+                if cov(typ, cls, mid) >= 0.80: b_ = mid
+                else: a_ = mid
+            ws.append(round(b_, 3))
+        out[typ] = tuple(ws)
+    return out
 
 # ---------------------------------------------------------------------------------------------------------------------------- training
 def train(tr, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print):
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     B, vocab, _ = build(tr); n = B['v'].shape[0]
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
-    model = make_model(vocab); log(f'allometry OLS start {init_allometry(model, tr).round(3)}')
+    model = make_model(vocab)
     phi = model.enc_params(); phi_ids = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in phi_ids]
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     nb_ep = (n + bs - 1) // bs
@@ -446,7 +441,7 @@ def train(tr, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, l
         t0, tot, nb = time.time(), 0.0, 0
         for ix in torch.split(torch.tensor(rng.permutation(n)), bs):
             b = sub(B, ix); o = model.joint(b, k, dreg=True)
-            loss_t = -(torch.logsumexp(o['lw'], 0) - math.log(k)).mean() + o['nll_allom']
+            loss_t = -(torch.logsumexp(o['lw'], 0) - math.log(k)).mean()
             wt = torch.softmax(o['lw'], 0).detach()
             loss_p = -(wt ** 2 * o['lw_dreg']).sum(0).mean()                                          # DReG surrogate (encoder)
             gt = torch.autograd.grad(loss_t, theta, retain_graph=True, allow_unused=True)
