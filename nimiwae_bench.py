@@ -16,7 +16,7 @@ def main():
     ap.add_argument('--k', type=int, default=100); a = ap.parse_args()
     torch.manual_seed(11)
     ck = torch.load(f'{a.data}/nimiwae.pt', weights_only=False); v = ck['vocab']; w = ck.get('w_int', 1.0)
-    model = N.NIMIWAE(len(v['spgrpcd']), len(v['epa_l3']), len(v['major_spgrpcd'])); model.load_state_dict(ck['state']); model.vocab = v; model.epoch = ck['epoch']; model.eval()
+    model = N.make_model(v); model.load_state_dict(ck['state']); model.epoch = ck['epoch']; model.eval()
     atab = pd.read_parquet(f'{a.data}/age_proxy_table.parquet')
     rep = score(model, a, atab, w, lower=True); torch.manual_seed(11)
     rep['original_protocol_lt3_only'] = {k: v for k, v in score(model, a, atab, w, lower=False).items() if k not in ('split', 'model_epoch', 'width_factor')}
@@ -24,32 +24,46 @@ def main():
     print(json.dumps(rep, indent=1))
 
 def score(model, a, atab, w, lower):
-    ck_epoch = getattr(model, 'epoch', None)
     r, B, R, seq = N.bench_eval(model, a.data, a.split, atab, K=a.k, w_int=w, lower=lower)
+    rep = criteria(hidden_predictions(B, R, seq), r['viol'])
+    return dict(split=a.split, protocol='interval [1, 3) in' if lower else '< 3 in only', model_epoch=getattr(model, 'epoch', None),
+                width_factor=w, **rep)
+
+def hidden_predictions(B, R, seq):
+    """Per hidden visit: truth + the model's posterior summaries."""
     keep = seq['_pos'].to_numpy() < N.T_MAX; seq = seq[keep].copy()
     ti, po = seq['_tid'].to_numpy(), seq['_pos'].to_numpy()
     for kk in ('lA', 'lD', 'A', 'q10', 'q90'): seq[f'nim_{kk}'] = R[kk][ti, po].numpy()
-    h = seq[seq.hidden.fillna(False).astype(bool)].copy()
+    return seq[seq.hidden.fillna(False).astype(bool)].copy()
+
+def criteria(h, viol):
+    """The pre-registered bars A1-A3 + P1 (benchmark part) on hidden visits `h`; rule context if `rule_agb` is present. A1 cells are binned
+    by the TRUE class as pre-registered; the prediction-binned version is a diagnostic only (regression dilution, D52)."""
+    h = h.copy()
     h['eA'] = h.nim_lA - np.log(h.drybio_g); h['eD'] = h.nim_lD - np.log(h.dia)
     h['inside'] = (np.log(h.drybio_g) >= h.nim_q10) & (np.log(h.drybio_g) <= h.nim_q90)
-    h['dcls'] = np.where(h.dia < 2, '1-2 in', '2-3 in'); h['e_rule'] = np.log(h.rule_agb) - np.log(h.drybio_g)
+    h['dcls'] = np.where(h.dia < 2, '1-2 in', '2-3 in'); h['pcls'] = np.where(np.exp(h.nim_lD) < 2, '1-2 in', '2-3 in')
     a1 = [dict(cell='overall', n=len(h), bias_lA=float(h.eA.median()), bias_lD=float(h.eD.median()))]
     for col in ('dcls', 'major_spgrpcd'):
         for val, d in h.groupby(col):
             if len(d) >= 200: a1.append(dict(cell=f'{col}={val}', n=len(d), bias_lA=float(d.eA.median()), bias_lD=float(d.eD.median())))
     ok1 = all(abs(c['bias_lA']) <= 0.10 and abs(c['bias_lD']) <= 0.10 for c in a1)
+    a1p = [dict(cell=f'predicted {val}', n=len(d), bias_lA=float(d.eA.median()), bias_lD=float(d.eD.median())) for val, d in h.groupby('pcls')]
     a2 = [dict(cell='overall', n=len(h), cov80=float(h.inside.mean()))] + \
          [dict(cell=f'dcls={val}', n=len(d), cov80=float(d.inside.mean())) for val, d in h.groupby('dcls')]
     ok2 = all(0.75 <= c['cov80'] <= 0.85 for c in a2)
     s = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'measdate']
-    tot = h.groupby(s).agg(t=('drybio_g', 'sum'), n=('nim_A', 'sum'), r=('rule_agb', 'sum'))
+    tot = h.groupby(s).agg(t=('drybio_g', 'sum'), n=('nim_A', 'sum'))
     ratio = float((tot.n / tot.t).median()); ok3 = 0.9 <= ratio <= 1.1
-    ok4 = tuple(r['viol']) == (0, 0, 0)
-    return dict(split=a.split, protocol='interval [1, 3) in' if lower else '< 3 in only', model_epoch=ck_epoch, width_factor=w, n_hidden=len(h), A1=a1, A1_pass=ok1, A2=a2, A2_pass=ok2,
-               A3_median_total_ratio=ratio, n_subplot_visits=len(tot), A3_pass=ok3, P1_benchmark_violations=list(r['viol']), P1_pass=ok4,
+    ok4 = tuple(viol) == (0, 0, 0)
+    out = dict(n_hidden=len(h), A1=a1, A1_pass=ok1, A1_by_prediction_diagnostic=a1p, A2=a2, A2_pass=ok2,
+               A3_median_total_ratio=ratio, n_subplot_visits=len(tot), A3_pass=ok3, P1_benchmark_violations=list(viol), P1_pass=ok4,
                accuracy=dict(mae_lA=float(h.eA.abs().mean()), mae_lD=float(h.eD.abs().mean())),
-               context_rule=dict(mae_lA=float(h.e_rule.abs().mean()), bias_lA=float(h.e_rule.median()), median_total_ratio=float((tot.r / tot.t).median())),
                benchmark_pass=bool(ok1 and ok2 and ok3 and ok4))
+    if 'rule_agb' in h and h.rule_agb.notna().all():
+        e = np.log(h.rule_agb) - np.log(h.drybio_g); rt = h.groupby(s).rule_agb.sum() / tot.t
+        out['context_rule'] = dict(mae_lA=float(e.abs().mean()), bias_lA=float(e.median()), median_total_ratio=float(rt.median()))
+    return out
 
 if __name__ == '__main__':
     main()

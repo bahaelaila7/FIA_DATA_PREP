@@ -863,3 +863,40 @@ Model: final epoch 5 of 6 on the full train split (1.28M trees); VAL width facto
 - Whether a truth-binned bias bar is the right acceptance test for an imputer (versus calibration binned by the PREDICTION, plus totals) is a question for the user. It must not be changed after this result.
 
 **Status.** Three test sets are now used (D49, D50, r3). By the pre-registered rule the production backfill is unchanged (the rule, bias +0.42 and totals 1.44 on record). The adoption decision is the user's: D51 is better than the rule on every measured criterion but does not pass the absolute bars. Any further candidate needs a clean held-out set, preferably a whole held-out state.
+
+## D52 — NIMIWAE: information, model fixes and NESTED CV instead of a holdout (user, 2026-10-30; recorded before any nested-CV scoring)
+**User.** "Either you are not pulling enough information for a tree from the plot information which makes you regress to a mean, or the model is not complex enough, or there are bugs. Also you can do nested cross val instead of on holdout."
+
+**Diagnosis (VAL only).**
+1. **Information ceiling.** A supervised gradient-boosting model (median loss) predicts log(DIA_hidden / DIA_debut) for the benchmark's hidden visits. It is trained on the TRAIN plots' pseudo-censored trees and scored on VAL by TRUE class:
+   - tree-only features: MAE log DIA 0.157; true 1–2 in +0.216, 2–3 in −0.048;
+   - + plot / stand / neighbour features: MAE 0.138; +0.158 / −0.038;
+   - the same predictions binned by PREDICTION: −0.010 / +0.002 and +0.002 / −0.010;
+   - the true log DIA sd within the true 1–2 in class is 0.198.
+   - So **the truth-binned A1 cells measure regression dilution**. Even a supervised model with every feature cannot meet them (+0.16 log DIA ≈ +0.38 log AGB vs the ±0.10 bar).
+   - Plot information is real signal: −12 % MAE.
+2. **Bugs / design errors found and fixed:**
+   - **(a) Information only the encoder saw could not move the posterior.** In an IWAE the encoder only proposes, and the weights return the posterior of the generative model. The first record's crown ratio / class and stand context are now conditioning covariates of the generative model (growth curve, modifier, age prior). The per-interval stand state is a modifier driver.
+   - **(b) The encoder was blind to each slot's censoring bounds.** The tally limit had been removed from all covariates in D51. The encoder (inference) now sees each missing slot's upper bound and the interval-censoring flag / lower bound; the growth model still does not.
+   - **(c) The learned DIA measurement sd (0.11 log) had absorbed curve misfit.** That made a tree's observed growth rate indistinguishable from noise: the error trended +0.21 across post-debut growth quintiles. It is now **FIXED at FIA precision**, sqrt(0.02² + (0.06 in / DIA)²). This removed the depth-dependent bias (3 visits back: −0.15 → −0.05).
+3. **Model additions:**
+   - prep: per visit, COND stand context (STDAGE, FLDAGE, BALIVE, FORTYPCD, STDSZCD, ALSTK, LIVE_CANOPY_CVR_PCT, STDORGCD) and leave-one-out neighbour log-DIA increments over the interval ending at the visit (subplot and plot; trees ≥ 3 in at both ends, so they are visible both in production and in the 3-in benchmark);
+   - a bidirectional-GRU encoder;
+   - an amortised per-interval growth-noise proposal q(log ε_t);
+   - an AR(1) prior on log ε_t (growth persistence, ρ learned).
+   - ε_t > 0, so the paths stay monotone by construction.
+4. **Dev result on VAL** (200k trees × 4 epochs):
+   - MAE log AGB 0.529 (D51 dev 0.57) and log DIA 0.183;
+   - the supervised ceiling is 0.138 log DIA, so a gap remains (evaluation K = 100 / 400 / 1000 gives the same result: the gap is the model, not sampling).
+
+**Nested-CV protocol (fixed now, scored once).**
+- **Benchmark trees:** every plot's trees under the D49 benchmark rules (`nimiwae_train.pseudo_bench`; it reproduces the prep benchmark exactly on VAL: 4,334 trees, 6,746 hidden visits).
+- **Outer folds:** crc32(plot_key | "ncv") % 5.
+- **For each outer fold f:**
+  - inner validation = the other folds' plots with crc32(plot_key | "ncv-in") % 10 == 0; width factors are fitted on their benchmark trees, and these plots are not trained on;
+  - training = all remaining plots (slots + pseudo-censored trees), 400k sampled trees + all their pseudo-censored trees, 4 epochs, cosine schedule, final epoch, K = 16, batch 1024, pseudo batch 128, λ = 2;
+  - scored = fold f's benchmark trees EXCEPT the dev-VAL plots, which shaped the design (38,168 hidden visits pooled vs 4,369 in the last holdout).
+- The earlier test plots (D49 / D50 / r3) are included in the outer folds. Their results were seen, but no design choice was tuned on them.
+- **Bars unchanged:** A1–A3 + P1 on the POOLED out-of-fold predictions; the per-fold spread is reported.
+  - Decisive protocol: interval [1, 3) in (D51 amendment 7); the "< 3 in only" protocol is reported alongside.
+  - A1 is truth-binned as pre-registered. The prediction-binned A1 is reported as a DIAGNOSTIC only and is not a pass criterion.
