@@ -926,3 +926,78 @@ The learned AR(1) persistence ρ ≈ 0.01–0.03, so the persistence prior was i
 - User decisions:
   1. the A1 bar definition (truth-binned vs prediction-binned calibration + totals);
   2. NIMIWAE vs a supervised (monotone-constrained) imputer vs the rule.
+
+## D53 — NIMIWAE with an explicit existence state, no age, bidirectional transformers, pure (unsupervised) objective (user, 2026-10-30; recorded before any D53 code or training)
+**User decisions.**
+- "Don't depend on age at all… it's an estimated age."
+- A Boolean **established / exists** flag per tree per visit. It flips once (0 up to some visit, 1 afterwards). Every tree that ever exists on the subplot gets it at **every** subplot visit, and the flag gates whether a non-zero reading is possible.
+- A **bidirectional** transformer ("not a simulation, data completion").
+- **No Chapman–Richards constraint for now**: a CR distillation can come later for robustness.
+- **No supervised imputation term**: pure NIMIWAE.
+- Validation on microplot lineages is legitimate, because "the dynamics are separate from the plot design".
+
+**Slot frame (prep).**
+- Every clean visit of a tree's subplot (curation `clean_subplot_years`) up to the tree's last real record.
+- The rule's phantom rows are dropped, so which visits are missing no longer depends on the rule.
+- slot_kind:
+  - `real` (tallied);
+  - `pre` (before the first real record: existence unknown);
+  - `gap` (inside the record without a row: exists, size missing).
+- AL: 919,239 slots = 576,536 real + 342,637 pre + 66 gap. The rule had 212,936 phantoms.
+- Per slot:
+  - a **sampled** flag (forested subplot / microplot condition at the visit; 4.4 % of pre slots are unsampled and carry no censoring information);
+  - competition, the condition, neighbours (trees ≥ 5 in at both ends, visible under either benchmark limit), climate.
+- Per tree: the first record's RECONCILECD (1 ingrowth: below the limit at the previous visit; 3 **missed live**: existed and was at or above the limit, i.e. a crew miss, not censoring).
+- No age fields and no STDAGE / FLDAGE (estimated stand ages) are used.
+
+**Model.**
+- **Latents:** per-tree z with a prior conditioned on static covariates (species, ecoregion, site, climate normals, forest type, planted), plus an existence **flip index τ** (the first slot at which the tree exists; τ = 0: before the first visit).
+  - E_t = 1[t ≥ τ], so exactly one flip.
+  - τ is summed out **exactly** over its ≤ 14 positions.
+  - τ is constrained to be ≤ the first real slot (one slot earlier for a missed-live tree).
+- **Decoder:** a transformer over the slots on (z, always-known covariates, elapsed-time encoding) only. It never sees the tree's own measurements (no identity leak). It outputs:
+  - a discrete-time hazard for τ;
+  - **non-negative (softplus) increments** of DIA and HT, cumulated from τ, with size 0 before it, so the paths are monotone by construction;
+  - crown ratio and crown class, reconstructed, so they constrain z.
+  - AGB follows from the allometry on the measured sizes (D51 amendment 5).
+- **Encoder:** a bidirectional transformer over all slots. Inputs: the masked measurements, the masks, slot kind, the sampled flag, the tally limit, the lower bound where known, the known existence, RECONCILECD, the covariates and the time encoding. Output: q(z).
+- **Observation model:**
+  - DIA: fixed FIA measurement sd (D52) + a learned discrepancy sd, which is monitored, as it must not absorb growth signal;
+  - HT: learned sd;
+  - crown: Gaussian (CR) and categorical (CCLCD).
+- **Missingness (MNAR), per slot:**
+  - real: E = 1 and P(tallied | D) = (1 − ε) σ(κ(log D − log limit));
+  - unrecorded and sampled: E = 0 (no reading), or E = 1 and below the limit or missed;
+  - missed-live previous slot: E = 1 and D ≥ limit, missed;
+  - unsampled: no missingness information.
+- **Objective:** the IWAE bound only (no supervised term).
+
+**Outputs.**
+- Per slot: P(E_t); the posterior median of the unconditional DIA / HT / AGB, which is 0 when the tree does not exist (pointwise quantiles of 0-then-increasing paths are monotone); the linear-scale mean AGB (the expected value for totals); an 80 % interval.
+- Sampled realisations are available for cohort records.
+
+**Benchmark and validation (nested CV, the D52 folds and rules; dev-VAL plots never scored).**
+- Microplot lineages, pseudo-censored.
+- **Decisive: pseudo-limit 5 in.** This is the production case: a tree outside the microplot is unseen below 5 in.
+  - Benchmark trees: microplot debut < 5 in, ≥ 3 real visits, a visit < 5 in and a later one ≥ 5 in.
+  - Hidden: real visits before the first ≥ 5 in, interval [1, 5) in, E = 1 known.
+  - The tree's pre slots are treated as unrecorded under the 5-in limit with existence unknown.
+- **Alongside:** the 3-in benchmark (continuity with D49–D52) and the "< limit only" protocol (E unknown at hidden visits).
+- **Existence diagnostic (not a bar):** P(E) at hidden visits under the "< limit only" protocol, where the truth is E = 1. FIA records no absences, so existence can only be checked one-sidedly.
+- **Bars unchanged:** A1–A3 + P1 on sizes. A1 is truth-binned; the prediction-binned version is a diagnostic only.
+
+**D53 dev (VAL only, 200k train trees × 4 epochs, pure IWAE).**
+- **3 in / interval:** MAE log AGB 0.547, log DIA 0.196. This matches the semi-supervised D52 (0.529 / 0.183) without any supervised term.
+- **5 in / interval (decisive):**
+  - MAE 0.529 / 0.184;
+  - A1: overall +0.12; true 1–2 in +1.27, 2–3 in +0.54, 3–4 in +0.19, 4–5 in 0.00; softwood +0.21;
+  - A2 per class 0.60 / 0.67 / 0.76 / 0.90;
+  - A3 1.156; P1 pass.
+- **Existence diagnostic** ("< limit only", where the truth is E = 1): mean P(E) at hidden visits 0.93 (5 in) and 0.92 (3 in).
+- Learned DIA discrepancy sd 0.027, far below D52's absorbed 0.11; the field-miss rate is 0.009.
+- For the 5-in benchmark, A1 / A2 use 1-in true-size classes (1–2 … 4–5 in), as the natural extension of D49's 1-in classes; this is fixed before the nested CV.
+- The design is frozen as-is for the nested CV:
+  - folds and inner validation as in D52;
+  - 400k sampled training trees per fold, 4 epochs, K = 16, batch 512, one-cycle cosine schedule;
+  - the final epoch is the model;
+  - widths are fitted on the inner validation (decisive config).

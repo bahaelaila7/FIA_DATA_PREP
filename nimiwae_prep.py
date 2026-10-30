@@ -21,17 +21,41 @@ def split_of(key: str) -> str:
     return 'train' if h < 70 else 'val' if h < 85 else 'test'
 
 def load(db: str) -> pl.DataFrame:
-    """Slots (real + phantom) with the D51 growth drivers: subplot competition, crown observations, the condition's site / treatment."""
+    """D53 slot frame: EVERY clean visit of a tree's subplot (curation's clean_subplot_years) up to the tree's last real record, so which
+    visits are missing no longer depends on the rule's phantom rows (dropped). slot_kind: 'real' (tallied), 'pre' (before the first real
+    record: existence unknown), 'gap' (a visit inside the tree's record without a real row: exists, size missing). Per slot: whether the
+    tree's plot type was sampled at the visit (forested subplot / microplot condition), the subplot competition from the real rows, the
+    condition (COND via the PLOT CN at that date; the tree's condid where it has a row, else its first condid, else 1); per tree: the first
+    record's RECONCILECD (1 ingrowth, 3 missed live, ...) and statics from the first real record."""
     c = duckdb.connect(db, read_only=True)
     q = """
-    WITH sub AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, sum(ba) sub_ba, sum(tpa) sub_tpa FROM tree_trajectories
-                 WHERE intro_type = 'real' GROUP BY ALL),
-    ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, CCLCD cclcd
+    WITH real AS (SELECT * FROM tree_trajectories WHERE intro_type = 'real'),
+    sub AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, sum(ba) sub_ba, sum(tpa) sub_tpa FROM real GROUP BY ALL),
+    ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, CCLCD cclcd, RECONCILECD rcd
            FROM curated_trees WHERE STATUSCD = 1),
+    tr AS (SELECT r.statecd, r.unitcd, r.countycd, r.plot, r.subp, r.tree, min(r.measdate) d0, max(r.measdate) d1,
+                  arg_min(r.condid, r.measdate) condid0, arg_min(r.species_symbol, r.measdate) species_symbol, arg_min(r.spgrpcd, r.measdate) spgrpcd,
+                  arg_min(r.major_spgrpcd, r.measdate) major_spgrpcd, arg_min(r.sftwd_hrdwd, r.measdate) sftwd_hrdwd,
+                  arg_min(r.epa_l3, r.measdate) epa_l3, arg_min(r.epa_l4, r.measdate) epa_l4, arg_min(r.land_use, r.measdate) land_use
+           FROM real r GROUP BY ALL),
+    rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING (statecd, unitcd, countycd, plot, subp, tree)
+           WHERE ct.measdate = tr.d0),
+    vis AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, MEASDATE measdate,
+                   forest_subpcond_prop, forest_micrcond_prop FROM clean_subplot_years),
+    fr AS (SELECT tr.*, vis.measdate, vis.forest_subpcond_prop, vis.forest_micrcond_prop FROM tr
+           JOIN vis USING (statecd, unitcd, countycd, plot, subp) WHERE vis.measdate <= tr.d1
+           UNION ALL                                              -- real rows on visits missing from the clean list (kept)
+           SELECT tr.*, r.measdate, NULL, NULL FROM tr JOIN real r USING (statecd, unitcd, countycd, plot, subp, tree)
+           WHERE NOT EXISTS (SELECT 1 FROM vis v WHERE v.statecd = r.statecd AND v.unitcd = r.unitcd AND v.countycd = r.countycd
+                             AND v.plot = r.plot AND v.subp = r.subp AND v.measdate = r.measdate)),
     pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, make_date(MEASYEAR::INT, MEASMON::INT, MEASDAY::INT) md,
                   max(CN) cn FROM PLOT GROUP BY ALL)   -- tree_trajectories.plt_cn is the plot key, not the FIA CN
-    SELECT t.statecd, t.unitcd, t.countycd, t.plot, t.subp, t.tree, t.measdate, t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa,
-           coalesce(t.ba, 0) own_ba, t.intro_type, t.species_symbol, t.spgrpcd, t.major_spgrpcd, t.sftwd_hrdwd, t.epa_l3, t.epa_l4, t.land_use,
+    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate,
+           CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' ELSE 'gap' END slot_kind,
+           CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
+           t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
+           f.species_symbol, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use, rc.rcd0,
+           f.forest_subpcond_prop, f.forest_micrcond_prop,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
            coalesce(c1.SICOND, c0.SICOND) sicond, coalesce(c1.SITECLCD, c0.SITECLCD) siteclcd, coalesce(c1.PHYSCLCD, c0.PHYSCLCD) physclcd,
            coalesce(c1.SLOPE, c0.SLOPE) slope, coalesce(c1.ASPECT, c0.ASPECT) aspect,
@@ -39,18 +63,19 @@ def load(db: str) -> pl.DataFrame:
            coalesce(c1.STDAGE, c0.STDAGE) stdage, coalesce(c1.FLDAGE, c0.FLDAGE) fldage, coalesce(c1.BALIVE, c0.BALIVE) balive,
            coalesce(c1.FORTYPCD, c0.FORTYPCD) fortypcd, coalesce(c1.STDSZCD, c0.STDSZCD) stdszcd, coalesce(c1.ALSTK, c0.ALSTK) alstk,
            coalesce(c1.LIVE_CANOPY_CVR_PCT, c0.LIVE_CANOPY_CVR_PCT) canopy_pct, coalesce(c1.STDORGCD, c0.STDORGCD) stdorgcd
-    FROM tree_trajectories t
-    LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
+    FROM fr f
+    LEFT JOIN real t USING (statecd, unitcd, countycd, plot, subp, tree, measdate)
     LEFT JOIN ct USING (statecd, unitcd, countycd, plot, subp, tree, measdate)
-    LEFT JOIN pc ON pc.statecd = t.statecd AND pc.unitcd = t.unitcd AND pc.countycd = t.countycd AND pc.plot = t.plot AND pc.md = t.measdate
-    LEFT JOIN COND c1 ON c1.PLT_CN = pc.cn AND c1.CONDID = t.condid
+    LEFT JOIN rc USING (statecd, unitcd, countycd, plot, subp, tree)
+    LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
+    LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.md = f.measdate
+    LEFT JOIN COND c1 ON c1.PLT_CN = pc.cn AND c1.CONDID = coalesce(t.condid, f.condid0)
     LEFT JOIN COND c0 ON c0.PLT_CN = pc.cn AND c0.CONDID = 1
-    WHERE t.intro_type IN ('real', 'phantom_backfill')
-    ORDER BY t.statecd, t.unitcd, t.countycd, t.plot, t.subp, t.tree, t.measdate"""
+    ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate"""
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
 
-NB_MIN_IN = 3.0          # neighbours = trees >= 3 in at both ends of the interval: visible in production AND in the 3-in benchmark
+NB_MIN_IN = 5.0          # neighbours = trees >= 5 in at both ends of the interval: visible in production AND in the 3- / 5-in benchmarks
 
 def add_neighbours(df: pl.DataFrame) -> pl.DataFrame:
     """Per slot: leave-one-out mean annual log-DIA increment of the OTHER trees on the same subplot / plot over the interval ending at the
