@@ -835,3 +835,31 @@ Known caveat (not changed): at benchmark slots, the subplot competition sums sti
 - K = 16, batch 1024.
 - Pseudo batch 64 with λ = 4, which keeps the dev weight 0.25 and limits re-cycling of the 21.5k pseudo trees.
 - Widths fitted on VAL (decisive protocol), then TEST scored once.
+
+**D51 outcome (fresh r3 TEST scored once, 2026-10-30; /workspace/FIA/nimiwae_r8/d51/bench_report_test.json).** NOT ACCEPTED under the pre-registered bars, in either protocol.
+
+Model: final epoch 5 of 6 on the full train split (1.28M trees); VAL width factors (1.666, 1.62). The TEST has 4,369 hidden visits on 3,272 subplot-visits.
+
+**Decisive protocol (interval [1, 3) in):**
+
+| criterion | result | verdict |
+|---|---|---|
+| A1 (bias, log AGB / log DIA) | overall −0.03 / −0.01; 1–2 in **+0.43 / +0.18**; 2–3 in **−0.13** / −0.04; softwood **+0.18**; hardwood groups −0.03 and −0.08 | fail |
+| A2 (80 % coverage) | overall 0.80; 1–2 in **0.739**; 2–3 in 0.83 | fail |
+| A3 (totals ratio) | 0.996 | pass |
+| P1 (monotone) | 0 / 0 / 0 violations | pass |
+| accuracy (MAE) | log AGB 0.51, log DIA 0.19 | |
+
+**Original protocol ("< 3 in only"):**
+- A1 fails: 1–2 in +0.23; 2–3 in −0.19; hardwoods −0.14 and −0.17; overall −0.13.
+- A2 fails: 1–2 in 0.747.
+- A3 0.90 passes (on the edge); P1 passes; MAE 0.75.
+
+**Context only (not a yardstick):** the rule has MAE 1.04, bias +0.42 and totals 1.44 on the same TEST, so it fails A1 and A3 by wide margins.
+
+**Reading the result.**
+- Every remaining failure is in TRUE-size-class or group cells: small trees are over-predicted and large ones under-predicted. This is the regression-dilution signature of binning by the true value with a predictor that is unbiased overall but imprecise (log-DIA MAE 0.19 over back-casts of 5–20 yr).
+- The bars stand as pre-registered.
+- Whether a truth-binned bias bar is the right acceptance test for an imputer (versus calibration binned by the PREDICTION, plus totals) is a question for the user. It must not be changed after this result.
+
+**Status.** Three test sets are now used (D49, D50, r3). By the pre-registered rule the production backfill is unchanged (the rule, bias +0.42 and totals 1.44 on record). The adoption decision is the user's: D51 is better than the rule on every measured criterion but does not pass the absolute bars. Any further candidate needs a clean held-out set, preferably a whole held-out state.
