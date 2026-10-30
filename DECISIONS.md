@@ -727,3 +727,17 @@ Validation-only development gave:
 **Status.** TEST has now been used. Any revised model needs a FRESH held-out set. Options:
 - a new plot split, with this test set retired;
 - a different state held out.
+
+## D50 — NIMIWAE revision and fresh held-out test (2026-10-30, user: option 1; recorded before any training)
+**Fresh split.**
+- The old TEST plots are retired as a test set and move to train.
+- VAL is unchanged and used for model choices.
+- The new TEST is the old-train plots with crc32(plot key + "|r2") % 100 < 22, about 15 % of all plots. The previous model never evaluated these plots; they were only training data for a model that is now discarded.
+- The benchmark definition is unchanged (pseudo-censoring at 3 in).
+
+**Model changes (aimed at the D49 failure, not at the bars):**
+1. **Flexible monotone allometry.** log AGB = a_sp + b_sp·s + c·h + Σ_j w_{g,j}·φ_j(s), with s = log DIA and h = log HT. The φ_j are increasing hinge functions, relu(s − t_j) and −relu(t_j − s), at knots of 0.5, 1, 2, 3 and 5 in, with weights w ≥ 0 per major species group. It stays monotone in DIA and HT and can bend at small sizes.
+2. **A training schedule that converges.** Cosine learning-rate decay from 2e-3 to 1e-5 over 10 epochs, with weight decay 1e-5. The model is the FINAL epoch; there is no epoch picking, so a bias zero-crossing can no longer be selected. Validation bias per epoch is reported as a convergence diagnostic.
+3. **Interval width factors per imputed size class** (imputed DIA < 2 in vs ≥ 2 in), each fitted on VAL to cover 0.80 there. A2 is per class, and the class is known at prediction time from the imputed DIA.
+
+**Unchanged:** the bars A1–A3 and P1–P3; TEST scored once; outcome recorded whatever it is.
