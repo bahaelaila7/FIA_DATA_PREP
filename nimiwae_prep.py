@@ -75,6 +75,77 @@ def load(db: str) -> pl.DataFrame:
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
 
+def load54(db: str) -> pl.DataFrame:
+    """D54 lineage frame. Counted plot visits = at least one subplot with a forested condition; a subplot's span = its first to last
+    such visit; a tree's lineage = every counted visit in its subplot's span (before its debut, during and after its record).
+    slot_kind real / pre / gap / post. Per slot: the tree's spot condition = the CONDID of its nearest real record, with that
+    condition's COND_STATUS_CD at the visit (1 = forest = sampled for trees) and its site / treatment / disturbance fields; microplot
+    forested share. Per tree: first-record RECONCILECD, curated terminal_fate, first dead record (date, AGENTCD), first status-0 event
+    (date, RC). Stand fields that include the tree itself (BALIVE, ALSTK, STDSZCD) are not loaded."""
+    c = duckdb.connect(db, read_only=True)
+    K = "statecd, unitcd, countycd, plot, subp, tree"
+    q = f"""
+    WITH real AS (SELECT * FROM tree_trajectories WHERE intro_type = 'real'),
+    csy AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, MEASDATE measdate,
+                   forest_subpcond_prop fsp, forest_micrcond_prop fmp FROM clean_subplot_years),
+    pv AS (SELECT statecd, unitcd, countycd, plot, measdate FROM csy GROUP BY ALL HAVING max(fsp) > 0),
+    span AS (SELECT statecd, unitcd, countycd, plot, subp, min(measdate) s0, max(measdate) s1 FROM csy WHERE fsp > 0 GROUP BY ALL),
+    sv AS (SELECT sp.statecd, sp.unitcd, sp.countycd, sp.plot, sp.subp, pv.measdate, csy.fsp, csy.fmp FROM span sp
+           JOIN pv USING (statecd, unitcd, countycd, plot)
+           LEFT JOIN csy USING (statecd, unitcd, countycd, plot, subp, measdate) WHERE pv.measdate BETWEEN sp.s0 AND sp.s1),
+    ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, STATUSCD statuscd,
+                  CCLCD cclcd, RECONCILECD rcd, AGENTCD agentcd FROM curated_trees),
+    tr AS (SELECT {K}, min(measdate) d0, max(measdate) d1, arg_min(condid, measdate) condid0,
+                  arg_min(species_symbol, measdate) species_symbol, arg_min(spgrpcd, measdate) spgrpcd, arg_min(major_spgrpcd, measdate) major_spgrpcd,
+                  arg_min(sftwd_hrdwd, measdate) sftwd_hrdwd, arg_min(epa_l3, measdate) epa_l3, arg_min(epa_l4, measdate) epa_l4,
+                  arg_min(land_use, measdate) land_use, arg_max(terminal_fate, measdate) terminal_fate
+           FROM real GROUP BY ALL),
+    rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING ({K})
+           WHERE ct.measdate = tr.d0 AND ct.statuscd = 1),
+    dr AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
+           FROM ct JOIN tr USING ({K}) WHERE ct.statuscd = 2 AND ct.measdate > tr.d1 GROUP BY ALL),
+    s0 AS (SELECT e.STATECD statecd, e.UNITCD unitcd, e.COUNTYCD countycd, e.PLOT plot, e.SUBP subp, e.TREE tree,
+                  min(e.MEASDATE) s0_md, arg_min(e.RC, e.MEASDATE) s0_rc
+           FROM tree_status0_events e JOIN tr ON tr.statecd = e.STATECD AND tr.unitcd = e.UNITCD AND tr.countycd = e.COUNTYCD
+                AND tr.plot = e.PLOT AND tr.subp = e.SUBP AND tr.tree = e.TREE AND e.MEASDATE > tr.d1 GROUP BY ALL),
+    fr AS (SELECT tr.*, sv.measdate, sv.fsp, sv.fmp FROM tr JOIN sv USING (statecd, unitcd, countycd, plot, subp)
+           UNION ALL
+           SELECT tr.*, r.measdate, NULL, NULL FROM tr JOIN real r USING ({K})
+           WHERE NOT EXISTS (SELECT 1 FROM sv WHERE sv.statecd = r.statecd AND sv.unitcd = r.unitcd AND sv.countycd = r.countycd
+                             AND sv.plot = r.plot AND sv.subp = r.subp AND sv.measdate = r.measdate)),
+    nr AS (SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate,
+                  arg_min(r.condid, abs(date_diff('day', r.measdate, f.measdate))) condid_nr
+           FROM fr f JOIN real r USING ({K}) GROUP BY ALL),
+    sub AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, sum(ba) sub_ba, sum(tpa) sub_tpa FROM real GROUP BY ALL),
+    pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, make_date(MEASYEAR::INT, MEASMON::INT, MEASDAY::INT) md,
+                  max(CN) cn FROM PLOT GROUP BY ALL)
+    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate,
+           CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' WHEN f.measdate <= f.d1 THEN 'gap' ELSE 'post' END slot_kind,
+           CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
+           t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
+           f.species_symbol, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use,
+           rc.rcd0, f.terminal_fate, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc,
+           f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, c1.COND_STATUS_CD cond_status,
+           coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
+           coalesce(c1.SICOND, c0.SICOND) sicond, coalesce(c1.SITECLCD, c0.SITECLCD) siteclcd, coalesce(c1.PHYSCLCD, c0.PHYSCLCD) physclcd,
+           coalesce(c1.SLOPE, c0.SLOPE) slope, coalesce(c1.ASPECT, c0.ASPECT) aspect,
+           coalesce(c1.TRTCD1, c0.TRTCD1) trtcd1, coalesce(c1.TRTCD2, c0.TRTCD2) trtcd2, coalesce(c1.TRTCD3, c0.TRTCD3) trtcd3,
+           coalesce(c1.DSTRBCD1, c0.DSTRBCD1) dstrbcd1, coalesce(c1.DSTRBCD2, c0.DSTRBCD2) dstrbcd2, coalesce(c1.DSTRBCD3, c0.DSTRBCD3) dstrbcd3,
+           coalesce(c1.FORTYPCD, c0.FORTYPCD) fortypcd, coalesce(c1.LIVE_CANOPY_CVR_PCT, c0.LIVE_CANOPY_CVR_PCT) canopy_pct,
+           coalesce(c1.STDORGCD, c0.STDORGCD) stdorgcd
+    FROM fr f
+    LEFT JOIN real t USING ({K}, measdate)
+    LEFT JOIN ct USING ({K}, measdate)
+    LEFT JOIN rc USING ({K}) LEFT JOIN dr USING ({K}) LEFT JOIN s0 USING ({K})
+    LEFT JOIN nr USING ({K}, measdate)
+    LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
+    LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.md = f.measdate
+    LEFT JOIN COND c1 ON c1.PLT_CN = pc.cn AND c1.CONDID = coalesce(t.condid, nr.condid_nr, f.condid0)
+    LEFT JOIN COND c0 ON c0.PLT_CN = pc.cn AND c0.CONDID = 1
+    ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate"""
+    df = pl.from_arrow(c.execute(q).arrow()); c.close()
+    return df
+
 NB_MIN_IN = 5.0          # neighbours = trees >= 5 in at both ends of the interval: visible in production AND in the 3- / 5-in benchmarks
 
 def add_neighbours(df: pl.DataFrame) -> pl.DataFrame:
@@ -138,13 +209,14 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--out', required=True); ap.add_argument('dbs', nargs='*')
     ap.add_argument('--from-seq', help='re-split an existing seq.parquet instead of reading the DBs')
     ap.add_argument('--scheme', default='d49', choices=['d49', 'r2', 'r3'])
-    ap.add_argument('--prism', help='PRISM L4 yearly DB: add the D51 climate drivers'); a = ap.parse_args()
+    ap.add_argument('--prism', help='PRISM L4 yearly DB: add the D51 climate drivers')
+    ap.add_argument('--frame', default='d53', choices=['d53', 'd54']); a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']
     if a.from_seq:
         df = pl.read_parquet(a.from_seq)
     else:
-        df = pl.concat([load(d) for d in a.dbs], how='vertical_relaxed')
+        df = pl.concat([(load54 if a.frame == 'd54' else load)(d) for d in a.dbs], how='vertical_relaxed')
         df = df.with_columns(
             pl.concat_str([pl.col(c).cast(pl.Utf8) for c in k[:4]], separator='_').alias('plot_key'),
             (pl.col('intro_type') == 'real').alias('obs'),

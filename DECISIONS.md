@@ -1103,3 +1103,8 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
   - **E3:** P(cut | gone) reliability among truly gone;
   - **E4 (sizes):** A1 overall + major group, A2 overall, A3 among truly alive.
 - (ii) establishment is already mixed (hidden real visits TRUE, clean pre-debut FALSE) and keeps bar E1.
+
+**D54 amendment 2 (2026-10-30; VAL smoke tests only, before any D54 dev or nested-CV run): every at-risk interval is an instance.**
+- **The flaw.** Amendment 1 took one interval per tree: the death interval for gone trees, the last for survivors. That over-represents deaths relative to the per-interval rate (43 % gone on VAL), so a calibrated model would fail E2 by construction.
+- **The fix.** Every at-risk interval (j − 1, j] with a known outcome is a separate instance: a real record at j, or a definitive death / cut at j, with ≥ 2 visible real records before j. Each instance is the lineage truncated after j and censored procedural-style at j. The benchmark's gone share then equals the population's per-interval rate. E2 / E3 / E4 are unchanged.
+- **Also fixed before any run (a model bug found in smoke testing).** The end hazards now count every interval the tree was at risk, from its start s, during its record too. Before, they applied only after the last record, which conditioned survival away and trained the hazard almost only on trees that ended (smoke VAL: P(exists) 0.20 for both alive and gone).
