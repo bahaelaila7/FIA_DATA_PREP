@@ -35,7 +35,10 @@ def load(db: str) -> pl.DataFrame:
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
            coalesce(c1.SICOND, c0.SICOND) sicond, coalesce(c1.SITECLCD, c0.SITECLCD) siteclcd, coalesce(c1.PHYSCLCD, c0.PHYSCLCD) physclcd,
            coalesce(c1.SLOPE, c0.SLOPE) slope, coalesce(c1.ASPECT, c0.ASPECT) aspect,
-           coalesce(c1.TRTCD1, c0.TRTCD1) trtcd1, coalesce(c1.DSTRBCD1, c0.DSTRBCD1) dstrbcd1
+           coalesce(c1.TRTCD1, c0.TRTCD1) trtcd1, coalesce(c1.DSTRBCD1, c0.DSTRBCD1) dstrbcd1,
+           coalesce(c1.STDAGE, c0.STDAGE) stdage, coalesce(c1.FLDAGE, c0.FLDAGE) fldage, coalesce(c1.BALIVE, c0.BALIVE) balive,
+           coalesce(c1.FORTYPCD, c0.FORTYPCD) fortypcd, coalesce(c1.STDSZCD, c0.STDSZCD) stdszcd, coalesce(c1.ALSTK, c0.ALSTK) alstk,
+           coalesce(c1.LIVE_CANOPY_CVR_PCT, c0.LIVE_CANOPY_CVR_PCT) canopy_pct, coalesce(c1.STDORGCD, c0.STDORGCD) stdorgcd
     FROM tree_trajectories t
     LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
     LEFT JOIN ct USING (statecd, unitcd, countycd, plot, subp, tree, measdate)
@@ -46,6 +49,28 @@ def load(db: str) -> pl.DataFrame:
     ORDER BY t.statecd, t.unitcd, t.countycd, t.plot, t.subp, t.tree, t.measdate"""
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
+
+NB_MIN_IN = 3.0          # neighbours = trees >= 3 in at both ends of the interval: visible in production AND in the 3-in benchmark
+
+def add_neighbours(df: pl.DataFrame) -> pl.DataFrame:
+    """Per slot: leave-one-out mean annual log-DIA increment of the OTHER trees on the same subplot / plot over the interval ending at the
+    visit (both records >= NB_MIN_IN, real), and their counts. The local growth environment, observable whenever the visit happened."""
+    k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']; sk, pk = k[:5], k[:4]
+    r = (df.filter(pl.col('obs')).sort(k + ['measdate'])
+           .with_columns(pl.col('dia').shift(1).over(k).alias('_d0'), pl.col('measdate').shift(1).over(k).alias('_t0'))
+           .with_columns(((pl.col('measdate') - pl.col('_t0')).dt.total_days() / 365.25).alias('_dt'))
+           .filter((pl.col('dia') >= NB_MIN_IN) & (pl.col('_d0') >= NB_MIN_IN) & (pl.col('_dt') > 0.5))
+           .with_columns(((pl.col('dia').log() - pl.col('_d0').log()) / pl.col('_dt')).clip(-0.05, 0.5).alias('_inc'))
+           .select(k + ['measdate', '_inc']))
+    out = df.join(r, on=k + ['measdate'], how='left')
+    for g, nm in ((sk, 'sub'), (pk, 'plt')):
+        a = r.group_by(g + ['measdate']).agg(pl.col('_inc').sum().alias('_s'), pl.len().alias('_n'))
+        out = out.join(a, on=g + ['measdate'], how='left').with_columns(
+            pl.col('_s').fill_null(0.0), pl.col('_n').fill_null(0)).with_columns(
+            (pl.col('_n') - pl.col('_inc').is_not_null().cast(pl.Int64)).alias(f'nb_n_{nm}'),
+            (pl.col('_s') - pl.col('_inc').fill_null(0.0)).alias('_s2')).with_columns(
+            pl.when(pl.col(f'nb_n_{nm}') > 0).then(pl.col('_s2') / pl.col(f'nb_n_{nm}')).otherwise(None).alias(f'nb_inc_{nm}')).drop('_s', '_n', '_s2')
+    return out.drop('_inc')
 
 def add_climate(df: pl.DataFrame, prism: str) -> pl.DataFrame:
     """Per slot: mean yearly tmean / ppt / vpdmax of its L4 over the interval ending at the slot (calendar years (prev slot, slot], first slot:
@@ -108,6 +133,7 @@ def main():
                                                          pl.len().alias('n_real')))
         df = df.join(deb, on=k, how='inner').with_columns(
             pl.when(pl.col('tpa0') > MICRO_TPA).then(1.0).otherwise(5.0).alias('thr_in'))
+        df = add_neighbours(df)
     if a.prism: df = add_climate(df, a.prism)
     if a.scheme in ('r2', 'r3'):
         fn = resplit_r2 if a.scheme == 'r2' else resplit_r3
