@@ -900,3 +900,29 @@ Model: final epoch 5 of 6 on the full train split (1.28M trees); VAL width facto
 - **Bars unchanged:** A1–A3 + P1 on the POOLED out-of-fold predictions; the per-fold spread is reported.
   - Decisive protocol: interval [1, 3) in (D51 amendment 7); the "< 3 in only" protocol is reported alongside.
   - A1 is truth-binned as pre-registered. The prediction-binned A1 is reported as a DIAGNOSTIC only and is not a pass criterion.
+
+**D52 outcome (nested CV scored once, 2026-10-30; /workspace/FIA/nimiwae_r8/d52_ncv/ncv_report.json).** NOT ACCEPTED under the pre-registered bars.
+
+Pooled out-of-fold, decisive interval protocol: 38,168 hidden visits on 28,388 subplot-visits. Inner-val width factors 1.63–1.76.
+
+| criterion | result | verdict |
+|---|---|---|
+| A1 (bias, log AGB / log DIA) | overall +0.055 / +0.025; true 1–2 in **+0.56 / +0.22**; 2–3 in −0.06 / −0.01; softwood **+0.26**; groups 2 / 3 / 4 +0.09 / +0.03 / −0.01 | fail |
+| A2 (80 % coverage) | overall 0.82; 1–2 in **0.71**; 2–3 in **0.865** | fail |
+| A3 (totals ratio) | 1.072 (folds 1.05–1.09) | pass |
+| P1 (monotone) | 0 / 0 / 0 violations | pass |
+| accuracy (MAE) | log AGB 0.507 (folds 0.50–0.52), log DIA 0.180 | |
+
+**"< 3 in only" protocol:** A1 / A2 fail; A3 0.966; MAE 1.10.
+
+**Diagnostic — A1 binned by PREDICTION:** −0.16 / +0.10 log AGB (predicted 1–2 / 2–3 in). The supervised ceiling model is ~±0.01 on the same split, so NIMIWAE's predictions are noisier than the information justifies. Unlike the truth-binned cells, this part is a model deficit, not regression dilution.
+
+The learned AR(1) persistence ρ ≈ 0.01–0.03, so the persistence prior was inert.
+
+**Status.**
+- The production backfill is unchanged by the pre-registered rule.
+- On the same features, a direct supervised predictor is more accurate than the generative NIMIWAE (VAL: log DIA MAE 0.138 vs 0.18), and it is calibrated by prediction.
+- The truth-binned A1 bar is unattainable for either.
+- User decisions:
+  1. the A1 bar definition (truth-binned vs prediction-binned calibration + totals);
+  2. NIMIWAE vs a supervised (monotone-constrained) imputer vs the rule.
