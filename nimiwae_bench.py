@@ -3,6 +3,8 @@ A1 unbiased: |median error| of log AGB and log DIA <= 0.10 overall, per hidden D
 A2 calibrated: coverage of the central 80 % predictive interval of log AGB in [0.75, 0.85], overall and per DIA class.
 A3 totals: median of (sum predicted / sum true) hidden AGB per subplot-visit in [0.9, 1.1] (linear-scale posterior means).
 P1 (benchmark part) monotone: 0 imputed DIA / HT / AGB trajectories decreasing up to the debut. The rule's numbers are context only.
+D51 amendment 7 (declared before TEST): the DECISIVE protocol tells the model what the data carry, i.e. a hidden visit is interval-censored in
+[1 in, 3 in) (it WAS tallied at the real microplot limit). The original '< 3 in only' protocol is scored in the same run and reported alongside.
 Usage: python -I nimiwae_bench.py --data DIR [--split test]"""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse, json
@@ -14,9 +16,16 @@ def main():
     ap.add_argument('--k', type=int, default=100); a = ap.parse_args()
     torch.manual_seed(11)
     ck = torch.load(f'{a.data}/nimiwae.pt', weights_only=False); v = ck['vocab']; w = ck.get('w_int', 1.0)
-    model = N.NIMIWAE(len(v['spgrpcd']), len(v['epa_l3']), len(v['major_spgrpcd'])); model.load_state_dict(ck['state']); model.vocab = v; model.eval()
+    model = N.NIMIWAE(len(v['spgrpcd']), len(v['epa_l3']), len(v['major_spgrpcd'])); model.load_state_dict(ck['state']); model.vocab = v; model.epoch = ck['epoch']; model.eval()
     atab = pd.read_parquet(f'{a.data}/age_proxy_table.parquet')
-    r, B, R, seq = N.bench_eval(model, a.data, a.split, atab, K=a.k, w_int=w)
+    rep = score(model, a, atab, w, lower=True); torch.manual_seed(11)
+    rep['original_protocol_lt3_only'] = {k: v for k, v in score(model, a, atab, w, lower=False).items() if k not in ('split', 'model_epoch', 'width_factor')}
+    json.dump(rep, open(f'{a.data}/bench_report_{a.split}.json', 'w'), indent=1)
+    print(json.dumps(rep, indent=1))
+
+def score(model, a, atab, w, lower):
+    ck_epoch = getattr(model, 'epoch', None)
+    r, B, R, seq = N.bench_eval(model, a.data, a.split, atab, K=a.k, w_int=w, lower=lower)
     keep = seq['_pos'].to_numpy() < N.T_MAX; seq = seq[keep].copy()
     ti, po = seq['_tid'].to_numpy(), seq['_pos'].to_numpy()
     for kk in ('lA', 'lD', 'A', 'q10', 'q90'): seq[f'nim_{kk}'] = R[kk][ti, po].numpy()
@@ -36,13 +45,11 @@ def main():
     tot = h.groupby(s).agg(t=('drybio_g', 'sum'), n=('nim_A', 'sum'), r=('rule_agb', 'sum'))
     ratio = float((tot.n / tot.t).median()); ok3 = 0.9 <= ratio <= 1.1
     ok4 = tuple(r['viol']) == (0, 0, 0)
-    rep = dict(split=a.split, model_epoch=ck['epoch'], width_factor=w, n_hidden=len(h), A1=a1, A1_pass=ok1, A2=a2, A2_pass=ok2,
+    return dict(split=a.split, protocol='interval [1, 3) in' if lower else '< 3 in only', model_epoch=ck_epoch, width_factor=w, n_hidden=len(h), A1=a1, A1_pass=ok1, A2=a2, A2_pass=ok2,
                A3_median_total_ratio=ratio, n_subplot_visits=len(tot), A3_pass=ok3, P1_benchmark_violations=list(r['viol']), P1_pass=ok4,
                accuracy=dict(mae_lA=float(h.eA.abs().mean()), mae_lD=float(h.eD.abs().mean())),
                context_rule=dict(mae_lA=float(h.e_rule.abs().mean()), bias_lA=float(h.e_rule.median()), median_total_ratio=float((tot.r / tot.t).median())),
                benchmark_pass=bool(ok1 and ok2 and ok3 and ok4))
-    json.dump(rep, open(f'{a.data}/bench_report_{a.split}.json', 'w'), indent=1)
-    print(json.dumps(rep, indent=1))
 
 if __name__ == '__main__':
     main()

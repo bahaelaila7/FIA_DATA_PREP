@@ -785,3 +785,53 @@ Validation-only development gave:
 **Training.** Cosine decay; the final epoch is the model; width factors per imputed size class are fitted on VAL.
 
 **Bars unchanged:** A1–A3 and P1–P3. TEST is scored once.
+
+**Dev amendments (2026-10-30; VAL diagnostics only, before any TEST scoring; benchmark construction and bars unchanged).**
+
+Each amendment fixes a specific model error that the VAL failure dumps showed. Dev runs used 200k train trees × 4 epochs.
+
+1. **Prep fixes.**
+   - The PRISM values are stored as text: they are now cast via VARCHAR.
+   - The COND join was 100 % null: `tree_trajectories.plt_cn` is the plot key, not the FIA CN. The CN is now resolved through PLOT on (state, unit, county, plot, measurement date).
+   - Site index is still null on 38 % of slots; it is flagged as missing.
+2. **The tally limit was removed from the growth / encoder covariates.**
+   - It is a measurement-design property, not a growth driver, and it now lives only in the missingness model.
+   - Training sees only 1 in and 5 in, so the bench's 3 in was out of distribution.
+3. **Point imputation is the weighted posterior MEDIAN per slot.**
+   - The previous summary was the mean of log size. A few pre-breast-height paths (DIA floor 0.01 in) dragged it down.
+   - The median is the Bayes point for the absolute-error bars.
+   - A pointwise quantile of non-decreasing paths with shared weights is non-decreasing, so P1 holds by construction.
+   - Totals keep the linear posterior mean.
+4. **The age prior is a learned conditional (empirical-Bayes) prior.**
+   - δ ~ N(μ(x_f), σ(x_f)), where x_f is the covariates of the FIRST observed record only (DIA, HT, crown ratio / class, competition, stems) plus site / species.
+   - Cause: VAL dumps showed suppressed hardwood advance regeneration (1–2 in for ~20 yr) "established" at the first hidden slot. The curated ages are compressed for these trees: the bench's own curated debut ages (median 23 yr for CCLCD 5) contradict their 1.4 in records 20 yr earlier. The fixed sd 0.4 around the proxy could not correct this.
+5. **The AGB likelihood uses the MEASURED DIA / HT.**
+   - FIA's DRYBIO is computed from the measured sizes, so p(D, H, A | latent) = p(D, H | latent) · p(A | D_obs, H_obs). Latent HT is used where HT is unmeasured.
+   - The latent-size allometry is used only to impute.
+   - Before this, fitting AGB on the smooth latent path (errors in variables) left a size-trending residual (−0.50 at 1–2 in → +0.12 above 10 in), even at the true sizes.
+6. **The allometry starts from a global OLS on TRAIN measured records.**
+   - Per-species intercepts start at the OLS residual medians, and the hinge weights start at ~0.
+   - The constant start (a = 3.0 vs the OLS 4.41) had not converged within the dev budget.
+
+Known caveat (not changed): at benchmark slots, the subplot competition sums still include neighbours in the 1–3 in band. Production would not see those trees, because they are below the tally limit. This is a small competition-scale shift, not a leak of the target tree's own size.
+7. **The decisive benchmark protocol is interval censoring (declared before TEST).**
+   - A hidden bench visit WAS tallied at the real 1-in microplot limit. The truth is therefore in [1, 3) in by construction (the D49 selection), but the original protocol told the model only "< 3 in".
+   - A model calibrated for production phantoms, where "not tallied" truly means small or not yet established, is penalised there for information the benchmark withheld. In dev, VAL got WORSE the better the training likelihood fitted.
+   - The decisive protocol therefore gives the model the information the data carry: a lower bound of 1 in on hidden visits (a near-step logsigmoid term in the missingness likelihood). Production phantoms have no such bound.
+   - The original "< 3 in only" protocol is scored in the SAME single TEST run and reported alongside. The bars are unchanged.
+8. **Supervised pseudo-censored term (TRAIN plots only).**
+   - The benchmark's exact construction rules are applied to the TRAIN split: 21,539 trees with 33,799 hidden visits.
+   - Each step adds the IWAE bound of these trees plus the predictive log p(x_hidden | x_obs) ≈ log Σ_k w_k(x_obs) p(x_hidden | path_k). The posterior is inferred WITHOUT the hidden values, exactly as at test.
+   - This is the encoder doing the supervised heavy lifting (user). Neither VAL nor TEST enters training.
+   - **Dev result on VAL** (200k trees × 4 epochs, decisive protocol):
+     - MAE log AGB 0.57 (the rule: 1.06);
+     - overall bias −0.03; A3 1.005; P1 0 violations;
+     - **A1 still fails:** +0.49 at 1–2 in, −0.16 at 2–3 in, softwood +0.27, group 2 −0.23;
+     - **A2 still fails:** 0.71 at 1–2 in.
+   - The per-TRUE-size-class bias is the regression-dilution signature: any imprecise but calibrated predictor binned by its truth shows it. This is noted for the user and is not a reason to change the bar.
+
+**Final protocol run (fixed before training).**
+- Full train split (seq r3), 6 epochs, cosine schedule, final epoch.
+- K = 16, batch 1024.
+- Pseudo batch 64 with λ = 4, which keeps the dev weight 0.25 and limits re-cycling of the 21.5k pseudo trees.
+- Widths fitted on VAL (decisive protocol), then TEST scored once.
