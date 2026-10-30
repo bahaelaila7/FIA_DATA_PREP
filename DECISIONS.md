@@ -1128,3 +1128,17 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
   - P(E) = 0 at recorded ends, with the cause respected;
   - clean FALSE slots have mean P(E) 0.012;
   - P(E) is monotone up to the debut.
+
+**D54 amendment 4 (2026-10-30; verification before the nested CV).**
+- **The verifier.** `nimiwae54_verify.py` checks the pipeline against independent re-computations:
+  - the frame vs the curated DB;
+  - the tensor rules per row;
+  - the exact (s, e, f) sum and posterior by float64 brute force;
+  - DReG gradient routing;
+  - the benchmark leak tests;
+  - the nested-CV fold logic.
+- **Result:** 22 / 22 pass after three fixes.
+  1. **Log-space likelihood.** The tally / cutoff / interval terms clamped probabilities at 1e-12 before the log. That truncated the penalty for grossly inconsistent paths (−27.6 instead of −36.8 on one tree) and zeroed their gradient. They are now computed with log-sigmoid / log1p (exact, differentiable).
+  2. **End detection.** The end slot is now the first slot ON OR AFTER the dead-record (or move) date. A death recorded at a visit outside the frame (an unsampled subplot visit) previously never ended the lineage: 1 slot in 13,859 in the sample.
+  3. **Sampled flag at hidden records.** Hidden benchmark records took sampled = 1 by construction; they now take it from the condition like any other slot. This removes a structural asymmetry between alive and gone instances in the censored-end benchmark.
+- Dev run 2 started before these fixes, so a dev run 3 follows.

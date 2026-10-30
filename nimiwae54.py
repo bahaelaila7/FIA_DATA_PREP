@@ -62,15 +62,15 @@ def build(seq: pd.DataFrame, vocab=None):
     lo = seq.lo_in.to_numpy(float) if 'lo_in' in seq else np.full(N, np.nan)
     cst = seq.cond_status.to_numpy(float)
     fsp, fmp = seq.forest_subpcond_prop.to_numpy(float), seq.forest_micrcond_prop.to_numpy(float)
-    sampled = rec_any | np.where(np.isnan(cst), np.nan_to_num(fsp, nan=0) > 0, cst == 1)
+    sampled = real | np.where(np.isnan(cst), np.nan_to_num(fsp, nan=0) > 0, cst == 1)              # hidden records: from the condition, like any slot
     fate = seq.terminal_fate.fillna('').to_numpy(str)
     end_hidden = seq.end_hidden.fillna(False).to_numpy(bool) if 'end_hidden' in seq else np.zeros(N, bool)
     dead_md = pd.to_datetime(seq.dead_md); s0_md = pd.to_datetime(seq.s0_md); md = pd.to_datetime(seq.measdate)
     agent = seq.dead_agent.to_numpy(float)
     # definitive end slot (first slot at which the tree is gone) and its cause
-    is_dead_end = (md == dead_md).to_numpy() & ~end_hidden
+    is_dead_end = (md >= dead_md).to_numpy() & ~end_hidden                                       # first slot ON OR AFTER the dead record
     is_inf_cut = np.isin(fate, ['harvest_inferred', 'disappeared_inferred_removal']) & (kind == 'post') & ~end_hidden
-    is_moved = (fate == 'censored_moved') & (md == s0_md).to_numpy() & ~end_hidden
+    is_moved = (fate == 'censored_moved') & (md >= s0_md).to_numpy() & ~end_hidden
     end_here = is_dead_end | is_moved
     first_post = (kind == 'post') & (pos == L_ + 1)
     end_here = end_here | (is_inf_cut & first_post)
@@ -208,14 +208,15 @@ class NIMIWAE54(nn.Module):
         e1 = torch.sigmoid(-s.leps); rho = RHO_MAX * torch.sigmoid(s.lrho)
         bc = lambda x: x[None, :, None]                                                                # [n, T] -> [1, n, 1, T]
         sdD = 0.5 * torch.log(torch.exp(2 * ls_dia(B['lD'])) + torch.exp(2 * s.lsdisc))
-        ptal = torch.sigmoid(KAPPA * (lDp - bc(B['llim'])))
+        xt = KAPPA * (lDp - bc(B['llim'])); ptal = torch.sigmoid(xt)
+        le1 = F.logsigmoid(-s.leps)                                                                    # log(1 - ε); all terms in log space (no clamping)
         real, v, mode, ev = bc(B['real']), bc(B['v']), B['mode'][None, :, None], B['ev'][None, :, None]
         unrec = (1 - real) * v
         meas = nl(bc(B['lD']), lDp, bc(sdD)) * bc(B['mD']) + nl(bc(B['lH']), lHp, s.lsH) * bc(B['mH'])
-        lrec = torch.log((e1 * ptal).clamp(min=1e-12))
-        lmiss = torch.where(mode == MODE['cutoff'], torch.log((1 - e1 * ptal).clamp(min=1e-12)),
-                torch.where(mode == MODE['missed'], torch.log(ptal.clamp(min=1e-12)),
-                torch.where(mode == MODE['interval'], torch.log((torch.sigmoid(KAPPA * (lDp - bc(B['llo']))) * (1 - ptal)).clamp(min=1e-12)),
+        lrec = le1 + F.logsigmoid(xt)                                                                   # tallied
+        lmiss = torch.where(mode == MODE['cutoff'], torch.log1p(-(e1 * ptal).clamp(max=1 - 1e-7)),       # below the limit or missed
+                torch.where(mode == MODE['missed'], F.logsigmoid(xt),
+                torch.where(mode == MODE['interval'], F.logsigmoid(KAPPA * (lDp - bc(B['llo']))) + F.logsigmoid(-xt),
                             torch.zeros_like(ptal))))
         lr, l1r = torch.log(rho), torch.log(1 - rho)
         ev1 = torch.where(ev == EV['false_hard'], torch.tensor(NEG),
