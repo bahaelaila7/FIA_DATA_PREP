@@ -1372,3 +1372,15 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - (a) 150k trees × 24 epochs (more epochs);
   - (b) 400k trees × 12 epochs (more data).
   - Same rule against the 12-epoch run; the winning budget goes to the nested CV.
+
+**D56-base nested CV (5 folds, 400k trees, 4 epochs; outer folds pooled; dev-VAL plots never scored).**
+- **Bars:**
+  - A1 ✗ (overall +0.013; truth-binned 1–2 in +0.49, 2–3 in +0.16);
+  - A2 ✗ (overall 0.81; 1–2 in 0.52, 2–3 in 0.72, 4–5 in 0.91);
+  - A3 ✓ (BA ratio 1.023); P1 ✓ (0 violations);
+  - E1 ✗ (Brier 0.082); E2 ✗ (Brier 0.100); E3 ✗ (Brier 0.056); E4 ✓ (MAE lD 0.051, coverage 0.80, BA 1.002).
+- **Size MAE** lD 0.172 (n 33,160 hidden).
+- **E1 deciles (pred / obs):** 0.15 / 0.07, 0.25 / 0.10, 0.35 / 0.19, 0.45 / 0.25, 0.55 / 0.31, 0.65 / 0.38, 0.75 / 0.49, 0.85 / 0.61, 0.99 / 0.95. Existence is over-predicted by ≈ 0.2 across the range, though the ranking is right.
+- **E2 deciles:** within 0.05 except 0.65 / 0.60 and 0.76 / 0.70.
+- **E3 deciles:** within 0.05 except 0.55 / 0.60, 0.65 / 0.71, 0.75 / 0.80.
+- **Superseded by D58:** a 12-epoch budget is better on every tie-break metric. The budget runs (D58b) choose the configuration for the next nested CV; this report is the 4-epoch reference.
