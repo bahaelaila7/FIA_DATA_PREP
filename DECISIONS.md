@@ -1227,3 +1227,26 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
 - **Decoder kept flexible** (per-slot increments from z + context). A structural growth constraint (per-tree vigour + shared responses) is added only if the dev check still shows bursts in unobserved intervals.
 - **Unchanged:** species, damage, crown reconstruction; the fixed DIA measurement error; DReG; the outputs (bounds, monotone, undefined where no sample exists, completion span, sampled lineages, stand totals); the benchmarks and bars of D54 with amendments 1–3, 9.
 - **Name.** MIWAE on measurements (NIMIWAE with the missingness model removed).
+
+**D55 amendment 1 (user, 2026-10-31; before any D55 training): compare censoring and growth structure, 2 × 2.**
+- **Review of the MAR argument.**
+  - For NIMIWAE with a LEARNED mask network, MAR restrains the freedom to explain the mask by distorting missing values.
+  - Ours is FIA's deterministic design rule (only the crew-miss rate ε is learned), and it carries true information: a subplot tree first seen at 5.3 in was under 5 in at the previous visit. Pure MAR would only know "≤ 5.3".
+  - The burst came from the separate start hazard (now removed), not from the mask.
+  - The user asked to build both and compare.
+- **Factor A, censoring:**
+  - **known**: the design rule as an observed inequality on the same path, with no learned missingness parameter (ε removed; missed tallies are already flagged by RECONCILECD 3 / 6 / 7). It applies only where it adds information beyond the existence labels:
+    - slots whose tally limit is above the existence threshold (subplot-level trees before the debut: D < limit if the tree exists);
+    - missed slots (D ≥ limit);
+    - the benchmark interval.
+    - Microplot-level slots keep their SOFT FALSE label (not a hard inequality), as the user required.
+  - **mar**: existence labels only.
+- **Factor B, growth:**
+  - **flex**: per-slot increments from the decoder on (z, context);
+  - **struct**: δ_t = Δt · exp(v_tree(z) + g(size_{t−1}, species) + c(context_t)). Per-tree vigour plus SHARED size and context responses, so no tree-specific per-interval freedom; the initial size comes from (z, statics).
+- **Variants:** V1 known + flex, V2 mar + flex, V3 known + struct, V4 mar + struct. All use size-defined existence and everything else of D54 (amendments 1–9).
+- **Dev comparison (VAL only).** Each variant: 150k TRAIN trees, 4 epochs, K = 32, DReG; widths fitted on VAL; scored on the D54 VAL benchmarks.
+- **Selection rule (fixed now):**
+  1. the most bars passed among A1, A2, A3, P1, E1, E2, E3, E4;
+  2. ties → the lowest sum of ratios to the best variant for E1 Brier, E2 Brier, E3 Brier, size MAE (log DIA) and E4 MAE (log DIA).
+- The selected variant goes to the nested CV; the comparison table is recorded here first.
