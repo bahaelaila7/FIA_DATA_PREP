@@ -1318,3 +1318,16 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Options:** (a) drop the summaries everywhere; (b) keep them in the encoder only (a proposal may use any information) and remove them from the prior and decoder; (c) make them causal per-slot covariates ("recorded so far"), but those still depend on the tree's own observation pattern. **Chosen (b).**
 - **Check B10** (both verifiers): the prior / decoder inputs (statics token, context, padding) are identical for a censored-end instance and its original lineage (Δ = 0 over 11,567 instances; the encoder token differs, up to 0.47, as allowed). D55 46 / 46, D56 54 / 54.
 - **Consequence:** the trained D55 models are invalid (leaky); the D56 comparison retrains both arms under am. 4: base = V1 (known + flex, selected in both D55 scorings; the leak is common to all four variants, so the D55 2 × 2 is not rerun) vs V1 + noise.
+
+**D56 dev comparison (VAL; am. 3 + am. 4 code; both arms retrained; 150k TRAIN trees, 4 epochs, K = 32).**
+
+| Arm | A1 | A2 | A3 | P1 | E1 | E2 | E3 | E4 | bars | E1 Brier | E2 Brier | E3 Brier | size MAE lD | E4 MAE lD | Σ ratio | ESS |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base (V1, no noise) | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | 3 | 0.1130 | 0.1136 | 0.0764 | 0.1911 | 0.0582 | 5.144 | 2.3 |
+| + noise | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | 3 | 0.1308 | 0.1097 | 0.0689 | 0.2031 | 0.0617 | 5.280 | 2.7 |
+
+- **Selected: base** (tie at 3 bars; lower Σ ratio).
+- **Am. 4 effect:** E2 Brier 0.151 → 0.114. Deciles are now mildly under-predicting ends (0.15 / 0.04 … 0.65 / 0.54), still outside ±0.05.
+- **Noise diagnostics:** σ_D 0.32, σ_H 0.25. Posterior E[u²] on bracketed training intervals is ≈ 1 in every size class (1.19 under 2 in, 0.90–0.94 over 5 in), so the noise is calibrated and size-dependent noise would not help. Pre-debut width factors 2.18 / 2.31 (base) vs 2.24 / 2.11 (noise): the noise did not fix the early-size spread.
+- **E1 stays open.** P(exists) is still ≥ 0.9 at almost every establishment slot; noise did not change it. It is not the proposal (am. 3 diagnosis) and not the per-interval noise level. Remaining hypotheses: (i) the timing of reaching 1 in is set by unobserved growth below 1 in, which no measurement constrains, while FALSE labels only bound it; (ii) lognormal increments cannot represent the bimodal sapling histories (suppressed for decades vs released). Not pursued autonomously; for the user.
+- **Next (per the D55 am. 1 plan):** 5-fold nested CV of the selected model (`--impl nimiwae56 --noise 0 --censor known --growth flex`), 400k trees, 4 epochs, K = 32 training / 100 evaluation, full benchmarks. Folds, inner validation and dev-VAL exclusion as in D52–D54.
