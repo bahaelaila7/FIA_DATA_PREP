@@ -1384,3 +1384,27 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **E2 deciles:** within 0.05 except 0.65 / 0.60 and 0.76 / 0.70.
 - **E3 deciles:** within 0.05 except 0.55 / 0.60, 0.65 / 0.71, 0.75 / 0.80.
 - **Superseded by D58:** a 12-epoch budget is better on every tie-break metric. The budget runs (D58b) choose the configuration for the next nested CV; this report is the 4-epoch reference.
+
+**Finding (2026-10-31): the E1 truth labels are least reliable exactly where E1 fails. Open; for the user.**
+- **The labels.** E1's truth FALSE is the clean microplot slot before a sapling's debut (RECONCILECD 1 / 2). The label implies the tree grew from < 0.95 in to its debut DIA within one interval.
+- **The data** (6,000 plots; clean FALSE slot just before the debut; the tree's own rate over its next interval):
+
+  | Debut DIA | Min. rate implied before (in/yr) | Own rate after | Share needing > 2× faster growth before |
+  |---|---|---|---|
+  | ≤ 1.2 in | 0.025 | 0.047 | 0.05 |
+  | 1.2–1.5 | 0.074 | 0.078 | 0.26 |
+  | 1.5–2 | 0.137 | 0.120 | 0.32 |
+  | 2–3 | 0.252 | 0.188 | 0.35 |
+  | 3–5 | 0.457 | 0.309 | 0.36 |
+
+  About a third of the FALSE labels before debuts ≥ 1.5 in imply implausibly fast pre-debut growth: likely saplings that existed but were coded as new ingrowth, or debuts measured late.
+- **The model.** On TRAINING trees with the labels visible, the posterior P(exists) at the FALSE slot just before the debut (D58 12-epoch model; learned ρ = 0.02) rises with debut DIA: 0.105, 0.18, 0.27, 0.37, 0.41. It tracks the implausible share. So the model overrides these labels at about the rate the data say they are suspect, far above its own ρ. The label-noise model is mis-specified: one global ρ cannot express size-dependent reliability.
+- **E1 by debut size** (D56-base NCV pooled; worst |pred − obs| over deciles with n ≥ 200):
+  - ≤ 1.2 in: 0.045, only the top decile populated;
+  - 1.2–1.5: 0.058; 1.5–2: 0.137; 2–5 in (78 % of E1): 0.386.
+  - The miscalibration concentrates where the truth is least reliable. A cleaner separation was tried and dropped: a growth-consistency subset keeps only 12 % of instances, almost all in the top decile, so it would pass vacuously.
+- **Options (not applied):**
+  - (a) keep E1 as pre-registered, accepting that part of its failure is truth noise;
+  - (b) redefine E1's truth set before the next nested CV with a pre-specified reliability rule (e.g. debut ≤ 1.5 in), applied to every model;
+  - (c) model side, independent of (a) / (b): a label-reliability ρ that depends on the implied debut growth (debut DIA, interval length; learned), extending the user's D54 remark that ρ might "depend on the gap (learned)". Against the current E1 truth it would look worse, because it trusts the suspect labels less. Evaluate it only once (a) / (b) is settled.
+- **Recommendation:** (b) + (c). Because (b) changes a bar's truth set after seeing results, it is the user's decision.
