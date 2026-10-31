@@ -99,6 +99,11 @@ def build(seq: pd.DataFrame, vocab=None):
     ign_after = np.isin(fate, ['censored_procedural', 'censored_procedural_unrecorded', 'censored_shrank']) | end_hidden
     mode[post & ign_after] = MODE['ignore']
     mode[missed_prev] = MODE['missed']
+    # pre-debut visits that carry NO information (user): procedural change (8) / previously non-sampled area (9): all earlier visits;
+    # missed tallies (3 / 6 / 7): every visit BEFORE the missed one (the tree may have been missed earlier too; inferred back)
+    pre_ = pos < F_
+    mode[pre_ & np.isin(rcd, [8, 9])] = MODE['ignore']
+    mode[pre_ & np.isin(rcd, [3, 6, 7]) & (pos < F_ - 1)] = MODE['ignore']
     mode[~np.isnan(lo)] = MODE['interval']
     own_ba = np.where(rec_any, seq.own_ba.fillna(0).to_numpy(), 0.0); own_tpa = np.where(rec_any, seq.tpa.fillna(0).to_numpy(), 0.0)
     dt = t.groupby([seq[c] for c in K_], sort=False).diff().fillna(5.0).to_numpy()
@@ -273,7 +278,8 @@ class NIMIWAE55(nn.Module):
         cens = torch.zeros_like(lp1)
         if s.censor == 'known':                                                                         # FIA design rule, no learned parameter
             xt = KAPPA * (lDp - B['llim'][None])                                                        # at / above the tally limit
-            above_ex = (B['llim'] > B['lex'] + 1e-6)[None]                                              # limit above the existence threshold
+            post_ = (ar[None] > B['l'][:, None])                                                        # after the last visible record
+            above_ex = ((B['llim'] > B['lex'] + 1e-6) | post_)[None]   # pre-debut microplot level: the soft FALSE label carries it
             unrec = (1 - real) * B['sampled'][None]
             cens = (real * F.logsigmoid(xt)                                                             # tallied: at or above the limit
                     + unrec * torch.where((mode == MODE['cutoff']) & above_ex, F.logsigmoid(-xt), torch.zeros_like(xt))   # not tallied: below

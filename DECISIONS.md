@@ -1250,3 +1250,12 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
   1. the most bars passed among A1, A2, A3, P1, E1, E2, E3, E4;
   2. ties → the lowest sum of ratios to the best variant for E1 Brier, E2 Brier, E3 Brier, size MAE (log DIA) and E4 MAE (log DIA).
 - The selected variant goes to the nested CV; the comparison table is recorded here first.
+
+**D55 amendment 2 (2026-10-31; semantic audit before any D55 result was read; the first 2 × 2 launch was stopped at ~30 min and discarded).**
+- **The audit.** The verifier checked the likelihood against a brute force, but the brute force took the missingness modes from the same `build`, so a wrong mode could not show. Three mode rules did not match the D54 case table (user):
+  1. RECONCILECD 8 / 9 entries: the pre-debut visits carry no information, but they were 'cutoff' (an informative "below the limit"). Now 'ignore'.
+  2. RECONCILECD 3 / 6 / 7 entries: only the visit before the debut is 'missed' (D ≥ limit); the earlier visits were 'cutoff', but the tree may have been missed there too (inferred back to the first visit). Now 'ignore'.
+  3. Known censoring: a sampled, unrecorded visit AFTER the last record is an informative absence at every tally level. The `above_ex` restriction (inequality only where the limit is above the existence threshold) had removed it at microplot-level slots. It now applies only to pre-debut slots; post-record slots always get the cutoff term.
+- **Options:** (a) fix the three rules and restart the comparison; (b) let the run finish and fix later. Chosen (a): rules 1–3 change only the known arm, so finishing would compare against a mis-specified arm.
+- **New check B7** (`nimiwae55_verify.py`): the mode of every unrecorded slot is recomputed from the written rules, independently of `build` (300 random plots: 0 mismatches). The brute force applies rule 3 itself. 43 / 43 checks pass on d54c, all four variants.
+- The comparison design, bars and selection rule (amendment 1) are unchanged.

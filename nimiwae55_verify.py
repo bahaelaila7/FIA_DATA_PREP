@@ -48,7 +48,7 @@ def brute(model, b, D, H, lend):
                             if real[t]: ll += lsg(xt)
                             elif smp[t]:
                                 mo = int(mode[t])
-                                if mo == M.MODE['cutoff'] and llim[t] > lex + 1e-6: ll += lsg(-xt)
+                                if mo == M.MODE['cutoff'] and (llim[t] > lex + 1e-6 or t > l): ll += lsg(-xt)
                                 elif mo == M.MODE['missed']: ll += lsg(xt)
                                 elif mo == M.MODE['interval']: ll += lsg(-xt)
                     else:
@@ -142,11 +142,33 @@ def run(seq, censor, growth):
           all(g is None or torch.isfinite(g).all() for g in list(gt) + list(gp)) and sum(g is not None and g.abs().sum() > 0 for g in gt) > len(theta) // 2
           and sum(g is not None and g.abs().sum() > 0 for g in gp) > len(phi) // 2, '')
 
+def mode_rules(seq):
+    """B7: the missingness mode of every unrecorded slot recomputed from the written rules (independent of build)."""
+    x = seq[seq.plot_key.isin(seq.plot_key.drop_duplicates().sample(300, random_state=4))]
+    B, _, sq = M.build(x)
+    ti, po = sq._tid.to_numpy(), sq._pos.to_numpy(); mode = B['mode'][ti, po].numpy(); f = B['f'].numpy()[ti]; l = B['l'].numpy()[ti]
+    real = B['real'][ti, po].numpy() > 0; smp = B['sampled'][ti, po].numpy() > 0; bad = 0; ex_ = []
+    for i, r in enumerate(sq.itertuples()):
+        if real[i]: continue
+        p = po[i]; rcd = r.rcd0
+        if not smp[i]: want = 'ignore'
+        elif f[i] < p < l[i]: want = 'ignore'
+        elif p > l[i]: want = 'ignore' if r.terminal_fate in ('censored_procedural', 'censored_procedural_unrecorded', 'censored_shrank') else 'cutoff'
+        elif rcd in (8, 9): want = 'ignore'
+        elif rcd in (3, 6, 7): want = 'missed' if p == f[i] - 1 else 'ignore'
+        else: want = 'cutoff'
+        if M.MODE[want] != mode[i]:
+            bad += 1
+            if len(ex_) < 3: ex_.append(dict(pos=p, f=f[i], l=l[i], rcd=rcd, fate=r.terminal_fate, want=want, got=int(mode[i])))
+    check('B7 missingness mode of every unrecorded slot follows the written rules (8/9: none; before a missed visit: none; after the record: informative unless procedural / shrank)',
+          bad == 0, f'{bad} mismatches {ex_}')
+
 def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); a = ap.parse_args()
     torch.set_num_threads(4); seq = pd.read_parquet(f'{a.data}/seq.parquet')
+    mode_rules(seq)
     for censor in ('known', 'mar'):
         for growth in ('flex', 'struct'): run(seq, censor, growth); outputs(seq, censor, growth)
     print(f"\n{sum(o for _, o in RES)}/{len(RES)} checks passed")
