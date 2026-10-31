@@ -249,7 +249,14 @@ def part_g(seq):
     check('G2 every non-dev plot scored exactly once; dev-VAL never', allout == scored, f'{len(allout)} plots')
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); ap.add_argument('--db', required=True); ap.add_argument('--model'); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); ap.add_argument('--db', required=True); ap.add_argument('--model')
+    ap.add_argument('--fiadb'); ap.add_argument('--prism'); ap.add_argument('--gaps-only', action='store_true'); a = ap.parse_args()
+    if a.gaps_only:
+        torch.set_num_threads(4); seq = pd.read_parquet(f'{a.data}/seq.parquet')
+        if a.fiadb: part_a2(seq, a.db, a.fiadb, a.prism)
+        part_h()
+        model = M.make_model(M.build(seq[seq.split == 'train'].head(200000))[1]); model.eval(); part_i(model, seq)
+        print(f"\n{sum(o for _, o in RES)}/{len(RES)} checks passed"); return
     torch.set_num_threads(4); rng = np.random.default_rng(0)
     seq = pd.read_parquet(f'{a.data}/seq.parquet')
     part_a(seq, a.db, rng)
@@ -261,6 +268,73 @@ def main():
     b = part_cd(model, seq); model.train(); part_e(model, b); model.eval()
     part_f(seq, model); part_g(seq)
     print(f"\n{sum(o for _, o in RES)}/{len(RES)} checks passed")
+
+
+# ------------------------------------------------------------------------------------------------ additional checks (gaps 1-4)
+def part_a2(seq, db, fiadb, prism):
+    c = duckdb.connect(db, read_only=True); state = c.execute('select any_value(STATECD) from clean_subplot_years').fetchone()[0]
+    s = seq[(seq.statecd == state) & (seq.slot_kind == 'real')]
+    # A5 damage join: compare with FIADB TREE by the record's CN
+    smp = s[s.dmg1.notna()].sample(300, random_state=7)[M.K_ + ['measdate', 'dmg1', 'dmg2', 'dmg3']]
+    c.register('smp', smp)
+    cn = c.execute('''select smp.*, ct.CN from smp join curated_trees ct on ct.STATECD = smp.statecd and ct.UNITCD = smp.unitcd and ct.COUNTYCD = smp.countycd
+                      and ct.PLOT = smp.plot and ct.SUBP = smp.subp and ct.TREE = smp.tree and ct.MEASDATE = smp.measdate and ct.STATUSCD = 1''').df()
+    f = duckdb.connect(fiadb, read_only=True); f.register('cn', cn[['CN']])
+    ft = f.execute('select t.CN, t.DAMAGE_AGENT_CD1 a, t.DAMAGE_AGENT_CD2 b, t.DAMAGE_AGENT_CD3 c from TREE t join cn using (CN)').df()
+    x = cn.merge(ft, on='CN', how='left')
+    eq = lambda p, q: (pd.isna(p) & pd.isna(q)) | (p == q)
+    bad = int((~(eq(x.dmg1, x.a) & eq(x.dmg2, x.b) & eq(x.dmg3, x.c))).sum())
+    check('A5 damage codes = FIADB TREE.DAMAGE_AGENT_CD1-3 of the record CN', bad == 0 and len(x) == 300, f'{bad}/{len(x)} mismatches')
+    # A6 species = latest resolved identification; revised = any spcd_changed
+    tt = c.execute("select statecd, unitcd, countycd, plot, subp, tree, arg_max(spcd, measdate) sp, bool_or(coalesce(spcd_changed, false)) rv from tree_trajectories where intro_type = 'real' group by all").df()
+    y = seq[seq.statecd == state].groupby(M.K_).agg(spcd=('spcd', 'first'), rev=('sp_revised', 'first')).reset_index().merge(tt, on=M.K_)
+    check('A6 species = latest resolved SPCD; revised flag = any curated spcd_changed', bool((y.spcd == y.sp).all() and (y.rev.astype(bool) == y.rv.astype(bool)).all()),
+          f'{len(y)} trees; revised share {y.rev.astype(float).mean():.3f}')
+    # A7 climate windows: tm_anom = mean L4 tmean over years (prev slot, slot] (first slot: 5 years before) − 1991-2020 normal
+    p = duckdb.connect(prism, read_only=True)
+    yr = p.execute('select EPA_L4_ID l4, YEAR yr, CAST(CAST(tmean_mean AS VARCHAR) AS DOUBLE) tm from EPA_L4_yearly').df()
+    nrm = yr[(yr.yr >= 1991) & (yr.yr <= 2020)].groupby('l4').tm.mean(); ymax = yr.yr.max(); yr = yr.set_index(['l4', 'yr']).tm
+    ss = seq[seq.statecd == state].sort_values(M.K_ + ['measdate']).copy()
+    ss['yprev'] = ss.groupby(M.K_).measdate.shift(1); ss = ss.sample(300, random_state=8)
+    bad = 0
+    for r in ss.itertuples():
+        ye = min(pd.Timestamp(r.measdate).year, ymax); ys = (pd.Timestamp(r.yprev).year + 1) if not pd.isna(r.yprev) else ye - 4
+        ys = min(ys, ye)
+        vals = [yr.get((r.epa_l4, y_)) for y_ in range(ys, ye + 1)]; vals = [v for v in vals if v is not None]
+        want = np.mean(vals) - nrm.get(r.epa_l4, np.nan) if vals else np.nan
+        bad += not ((np.isnan(want) and pd.isna(r.tm_anom)) or (not pd.isna(r.tm_anom) and abs(want - r.tm_anom) < 1e-6))
+    check('A7 climate anomaly = L4 mean tmean over the interval years − 1991-2020 normal', bad == 0, f'{bad}/300 slots')
+
+def part_h():
+    import nimiwae54_ncv as NC
+    rng = np.random.default_rng(0)
+    p = rng.uniform(0, 1, 50000); y = (rng.uniform(0, 1, 50000) < p).astype(float)
+    r1 = NC.reliability(p, y); r2 = NC.reliability(np.clip(p + 0.15, 0, 1), y)
+    check('H1 reliability bar: calibrated probabilities pass, shifted (+0.15) fail', r1['pass_'] and not r2['pass_'], f"brier {r1['brier']:.3f} vs {r2['brier']:.3f}")
+    # size criteria on a synthetic perfect predictor with a correct 80 % interval
+    n = 4000; d = rng.uniform(1.0, 5.0, n); ld = np.log(d); sd = 0.1
+    h = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': rng.integers(0, 400, n), 'subp': 1, 'measdate': pd.Timestamp('2010-01-01'),
+                      'major_spgrpcd': rng.integers(1, 3, n), 'dia': d, 'nim_lD': ld + rng.normal(0, sd, n)})
+    h['nim_q10'] = h.nim_lD - 1.2816 * sd; h['nim_q90'] = h.nim_lD + 1.2816 * sd; h['nim_BA'] = M.BA_K * np.exp(h.nim_lD) ** 2 * np.exp(-2 * sd ** 2)
+    c = NC.size_criteria(h, (0,), 5.0)
+    check('H2 size criteria: unbiased, calibrated synthetic predictor passes A1 / A2 / A3', c['A1_pass'] and c['A2_pass'] and c['A3_pass'],
+          f"A2 {c['A2'][0]['cov80']:.3f} A3 {c['A3_median_BA_ratio']:.3f}")
+    h2 = h.copy(); h2['nim_lD'] = h2.nim_lD + 0.2; c2 = NC.size_criteria(h2, (0,), 5.0)
+    check('H3 size criteria: a +0.2 log-DIA bias fails A1', not c2['A1_pass'], '')
+
+def part_i(model, seq):
+    va = seq[seq.split == 'val']; x = va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(25, random_state=9))]
+    B, _, sq = M.build(x, model.vocab)
+    torch.manual_seed(0); R = M.impute(model, B, K=1, bs=10 ** 7)                                   # one batch: same z as the joint below
+    torch.manual_seed(0)
+    with torch.no_grad(): o = model.joint(B, 1)
+    W = torch.exp(o['lpost'])[0].sum((-1, -2)).double()                                              # p(s | z) [n, S]
+    D = o['D'][0].double(); BA = (W[..., None] * (D > 0) * M.BA_K * D ** 2).sum(1) / (W[..., None] * (D > 0)).sum(1).clamp(min=1e-12)
+    err = float((BA - R['BA'].double()).abs().max())
+    check('I1 expected basal area given existence = Σ p(s) · 0.005454 · D[s]² (K = 1)', err < 1e-3, f'max |Δ| {err:.2e} ft²')
+    v = B['v'] > 0; inside = ((R['q10'] <= R['lD'] + 1e-6) & (R['lD'] <= R['q90'] + 1e-6))[v]
+    check('I2 predictive interval brackets the point estimate', float(inside.float().mean()) > 0.99, f'{float(inside.float().mean()):.4f}')
+
 
 if __name__ == '__main__':
     main()
