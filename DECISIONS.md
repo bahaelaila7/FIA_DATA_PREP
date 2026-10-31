@@ -1353,3 +1353,22 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Evidence:** in every NCV fold the training loss still falls steeply over the 4 epochs (fold 0: 122.6 → 2.83 → 1.56 → 1.14; ESS 1.7 → 5.3). Dev (150k trees) vs NCV (400k) differ strongly on E1 (Brier 0.113 vs 0.075–0.098), E2 (0.114 vs 0.098–0.100) and widths (2.2 vs 1.3–1.6). The model is under-trained, and capacity / data may dominate the remaining failures.
 - **Comparison (pre-registered):** base (D56, noise off, static prior) at 12 epochs vs the existing 4-epoch dev run; 150k TRAIN trees; VAL; the D55 am. 1 rule. If 12 epochs is selected, the next nested CV uses the larger budget (epochs, and trees as compute allows).
 - Also: the NCV driver now stores the model config in the fold checkpoints.
+- **D58 result (VAL dev, 150k trees): 12 epochs selected.**
+
+  | Budget | bars | E1 Brier | E2 Brier | E3 Brier | size MAE lD | E4 MAE lD | Σ ratio | ESS |
+  |---|---|---|---|---|---|---|---|---|
+  | 12 epochs | 3 | 0.0765 | 0.1004 | 0.0610 | 0.1786 | 0.0514 | 5.000 | 5.0 |
+  | 4 epochs | 3 | 0.1130 | 0.1136 | 0.0764 | 0.1911 | 0.0582 | 6.063 | 2.3 |
+
+  - The same bars pass (A3, P1, E4). Every tie-break metric improves; pre-debut width factors 2.18 / 2.31 → 1.75 / 1.61.
+  - The remaining gaps are near the bars:
+    - E2 deciles 1–3 and 6–7 are off by 0.04–0.06;
+    - E3 deciles 5–7 under-predict cut by 0.05–0.06;
+    - E1 decile 8 is still 0.85 vs 0.65 observed.
+  - A1 / A2 fail only in the truth-binned 1–2 in cell (+0.48; coverage 0.54). By prediction the 1–2 in bias is −0.18. Conditioning on the truth class makes the extreme classes look biased even for a calibrated posterior, so this cell may not be passable as pre-registered; flagged for the user, not changed.
+  - **Monitor:** σ_disc rises over training (0.020 → 0.038 at epoch 11; FIA measurement sd ≈ 0.02–0.03). Watch it in the next runs: a growing discrepancy can absorb growth signal.
+  - Loss 1.11 → 1.04 → 1.00 over the last epochs, under the annealing LR, so saturation is not established.
+- **Next (decided):** once the running D56-base NCV finishes, two dev runs on VAL, 4 threads each:
+  - (a) 150k trees × 24 epochs (more epochs);
+  - (b) 400k trees × 12 epochs (more data).
+  - Same rule against the 12-epoch run; the winning budget goes to the nested CV.
