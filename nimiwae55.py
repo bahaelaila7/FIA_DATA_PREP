@@ -2,7 +2,9 @@
 Latents   z ~ p(z | statics); end e (first slot at which the tree is gone; T = alive through the span) and cause f ∈ {death, cut}, summed out.
 Size      latent DIA path D_t = Σ_{u<=t} δD_u (δ >= 0; may stay below 1 in, unobservable), HT likewise: monotone.
 Existence E_t = 1[D_t >= 1 in] · 1[t < e]  (soft step σ(κ (log D_t − log 0.95 in)), κ = 40): exactly one appearance, at most one end.
-MAR       no missingness-mask likelihood; the design information enters as the OBSERVED existence variable (TRUE / FALSE, hard / soft).
+Censoring 'known': FIA's design rule as a fixed mask model on the latent size (no learned parameter; D55 am. 1-2);
+          'mar': no mask likelihood, only the OBSERVED existence variable (TRUE / FALSE, hard / soft).
+Structure missing sizes = the decoder's latent path D(z) (no second encoder, as in not-MIWAE); q(z | x_obs, r, c) sees the mask.
 At risk   from the first slot at which the tree exists; competing per-interval (survive, die, cut).
 Bound     IWAE; encoder gradients DReG."""
 import math, time, json
