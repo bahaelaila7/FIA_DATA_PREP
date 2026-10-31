@@ -22,6 +22,9 @@ TRT = [10, 20, 30, 40, 50]; DST = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 COV = ['comp', 'stems', 'tma', 'ppa', 'vpa', 'nbs', 'mnbs', 'nbp', 'mnbp', 'nbn', 'can', 'mcan', 'tyr', 'dt'] + \
       [f'trt{c}' for c in TRT] + [f'dst{c}' for c in DST]
 NCOV = len(COV)
+DMG_GROUPS = [1, 2, 3, 4, 5, 6, 7, 8, 9]       # DAMAGE_AGENT_CD // 10000: insect, disease, fire, animal, abiotic, competition, human, multi, other
+NDQ = len(DMG_GROUPS) + 1 + 2 + 3 + 1          # encoder damage channels: groups, recorded mask, broken (+mask), cull class one-hot, mask
+NSUMM = 8
 EV = {'none': 0, 'true_hard': 1, 'false_hard': 2, 'true_soft': 3, 'false_soft': 4}
 MODE = {'cutoff': 0, 'ignore': 1, 'missed': 2, 'interval': 3}
 CUT_FATES = ('harvest_explicit', 'harvest_inferred', 'disappeared_inferred_removal')
@@ -35,7 +38,7 @@ def build(seq: pd.DataFrame, vocab=None):
     rcd_override (tree), end_hidden (tree: hide the end evidence; absence uninformative from j on), cut_at (slot measdate: truncate)."""
     seq = seq.sort_values(K_ + ['measdate']).copy()
     if vocab is None:
-        vocab = {c: {v: i + 1 for i, v in enumerate(sorted(seq[c].dropna().unique()))} for c in ('spgrpcd', 'epa_l3', 'major_spgrpcd', 'fortypcd')}
+        vocab = {c: {v: i + 1 for i, v in enumerate(sorted(seq[c].dropna().unique()))} for c in ('spcd', 'spgrpcd', 'epa_l3', 'major_spgrpcd', 'fortypcd')}
         vocab['_norm'] = {c: (float(seq[c].mean()), float(seq[c].std()) or 1.0) for c in NORM_COLS}
     t = (pd.to_datetime(seq.measdate) - pd.Timestamp('2000-01-01')) / pd.Timedelta(days=1) / 365.25
     g = seq.groupby(K_, sort=False); tid = g.ngroup().to_numpy(); pos = g.cumcount().to_numpy()
@@ -113,39 +116,56 @@ def build(seq: pd.DataFrame, vocab=None):
                can=seq.canopy_pct.to_numpy(float) / 100, mcan=seq.canopy_pct.notna().to_numpy(float), tyr=t.to_numpy() / 20, dt=dt / 10,
                **{f'trt{c}': ((tr_ >= c) & (tr_ < c + 10)).any(1).astype(float) for c in TRT},
                **{f'dst{c}': ((ds_ >= c) & (ds_ < c + 10)).any(1).astype(float) for c in DST})
+    # D54 am. 5: damage observations at VISIBLE real records only (masked like any measurement); DAMAGE_AGENT_CD recorded 2013+
+    dcodes = np.stack([seq[c].to_numpy(float) if c in seq else np.full(N, np.nan) for c in ('dmg1', 'dmg2', 'dmg3')], 1)
+    m_dmg = real & ~np.isnan(dcodes[:, 0])
+    dgrp = np.floor(np.nan_to_num(dcodes, nan=0) / 10000).astype(int)
+    dmg = np.stack([((dgrp == g).any(1) & m_dmg).astype(float) for g in DMG_GROUPS], 1)
+    aht = seq.actualht.to_numpy(float) if 'actualht' in seq else np.full(N, np.nan)
+    m_brk = real & ~np.isnan(aht) & ~np.isnan(ht); brk = (m_brk & (aht < ht)).astype(float)
+    tcl = seq.treeclcd.to_numpy(float) if 'treeclcd' in seq else np.full(N, np.nan)
+    m_cl = real & np.isin(tcl, [2, 3, 4]); cl = np.where(m_cl, np.clip(np.nan_to_num(tcl, nan=2) - 2, 0, 2), 0)
     lgD = np.log(np.clip(np.nan_to_num(dia, nan=1.0), 0.05, None)); lgH = np.log(np.clip(np.nan_to_num(ht, nan=4.5), 1.0, None))
     X = dict(lD=mat(lgD), lH=mat(lgH),
              mD=mat(mD), mH=mat(mH), cr=mat(np.where(mcr, seq.cr.to_numpy(float) / 100, 0)), mcr=mat(mcr),
              cc=mat(np.where(mcc, seq.cclcd.to_numpy(float), 0)), mcc=mat(mcc), v=mat(np.ones(N)), hid=mat(hid), real=mat(real),
              sampled=mat(sampled), llim=mat(np.log(limit - HALF_UNIT)), llo=mat(np.log(lo - HALF_UNIT), -20.0), fmp=mat(fmp),
-             ev=mat(ev), mode=mat(mode), cov=np.stack([mat(cov[c]) for c in COV], -1))
+             ev=mat(ev), mode=mat(mode), cov=np.stack([mat(cov[c]) for c in COV], -1),
+             dmg=np.stack([mat(dmg[:, j]) for j in range(len(DMG_GROUPS))], -1), m_dmg=mat(m_dmg), brk=mat(brk), m_brk=mat(m_brk),
+             cl=mat(cl), m_cl=mat(m_cl))
     st = g.head(1)
     def ids(c): return st[c].map(vocab[c]).fillna(0).astype(int).to_numpy()
     def z_(c): mu, sd = vocab['_norm'][c]; return np.nan_to_num((st[c].to_numpy(dtype=float) - mu) / sd, nan=0.0)
     asp = np.deg2rad(st.aspect.fillna(0).to_numpy(dtype=float)); flat = st.slope.fillna(0).to_numpy(dtype=float) < 5
     rc0 = pd.Series(rcd, index=tid).groupby(level=0).first().reindex(range(n)).to_numpy()
+    tmax = lambda a_: pd.Series(np.asarray(a_, float), index=tid).groupby(level=0).max().reindex(range(n)).fillna(0).to_numpy()
+    revised = st.sp_revised.fillna(False).astype(float).to_numpy() if 'sp_revised' in st else np.zeros(n)
+    summ = np.stack([revised, tmax(dmg.sum(1) > 0), tmax(dmg[:, 0]), tmax(dmg[:, 1]), tmax(dmg[:, 4]), tmax(dmg[:, 8]),
+                     tmax(brk), tmax(m_cl & (cl > 0))], 1)                                           # visible records only
     S = dict(sp=ids('spgrpcd'), l3=ids('epa_l3'), maj=ids('major_spgrpcd'), fty=ids('fortypcd'),
              scl=np.clip(st.siteclcd.fillna(0).to_numpy(dtype=float), 0, 7).astype(int), phy=np.clip(st.physclcd.fillna(0).to_numpy(dtype=float), 0, 49).astype(int),
              snum=np.stack([st.planted.fillna(False).astype(float).to_numpy(), z_('sicond'), st.sicond.isna().to_numpy(float), z_('slope'),
                             np.where(flat, 0, np.sin(asp)), np.where(flat, 0, np.cos(asp)), z_('tm_n'), z_('pp_n'), z_('vp_n')], 1),
+             summ=summ, spc=ids('spcd'),
              rcd=np.nan_to_num(rc0, nan=0).clip(0, 9).astype(int), f=f_idx, l=l_idx, cause=tree_cause, moved=tree_moved.astype(int),
              ndef=(endpos >= 0).astype(int))
-    longs = ('sp', 'l3', 'maj', 'fty', 'scl', 'phy', 'rcd', 'f', 'l', 'cause', 'moved', 'ndef')
+    longs = ('spc', 'sp', 'l3', 'maj', 'fty', 'scl', 'phy', 'rcd', 'f', 'l', 'cause', 'moved', 'ndef')
     T = {k: torch.tensor(np.array(v), dtype=torch.long if k in longs else torch.float32) for k, v in {**X, **S}.items()}
-    T['ev'] = T['ev'].long(); T['mode'] = T['mode'].long()
+    T['ev'] = T['ev'].long(); T['mode'] = T['mode'].long(); T['cl'] = T['cl'].long()
     return T, vocab, seq.assign(_tid=tid, _pos=pos)
 
 def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 
 # ------------------------------------------------------------------------------------------------------------------------------ model
 class Static(nn.Module):
-    def __init__(s, nsp, nl3, nmaj, nfty):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc):
         super().__init__()
         s.e = nn.ModuleList([nn.Embedding(nsp + 1, 8), nn.Embedding(nl3 + 1, 4), nn.Embedding(nmaj + 1, 2), nn.Embedding(nfty + 1, 4),
-                             nn.Embedding(8, 3), nn.Embedding(50, 3)])
-        s.out = nn.Linear(8 + 4 + 2 + 4 + 3 + 3 + 9, D_MODEL)
+                             nn.Embedding(8, 3), nn.Embedding(50, 3), nn.Embedding(nspc + 1, 8)])   # + species (resolved SPCD); unseen -> 0
+        s.out = nn.Linear(8 + 4 + 2 + 4 + 3 + 3 + 8 + 9 + NSUMM, D_MODEL)
     def forward(s, B):
-        return s.out(torch.cat([s.e[0](B['sp']), s.e[1](B['l3']), s.e[2](B['maj']), s.e[3](B['fty']), s.e[4](B['scl']), s.e[5](B['phy']), B['snum']], -1))
+        return s.out(torch.cat([s.e[0](B['sp']), s.e[1](B['l3']), s.e[2](B['maj']), s.e[3](B['fty']), s.e[4](B['scl']), s.e[5](B['phy']),
+                                s.e[6](B['spc']), B['snum'], B['summ']], -1))
 
 def tenc(d, layers=2):
     return nn.TransformerEncoder(nn.TransformerEncoderLayer(d, 4, 2 * d, dropout=0.0, batch_first=True, norm_first=True), layers,
@@ -154,17 +174,17 @@ def tenc(d, layers=2):
 NQ = 15 + len(EV) + len(MODE)
 
 class NIMIWAE54(nn.Module):
-    def __init__(s, nsp, nl3, nmaj, nfty):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc):
         super().__init__()
         d = D_MODEL
         # encoder (phi)
-        s.st_q = Static(nsp, nl3, nmaj, nfty); s.ercd = nn.Embedding(10, 4); s.ecc = nn.Embedding(6, 3)
-        s.qin = nn.Linear(NCOV + NQ + 4 + 3, d); s.qtr = tenc(d); s.qout = nn.Linear(d, 2 * DZ)
+        s.st_q = Static(nsp, nl3, nmaj, nfty, nspc); s.ercd = nn.Embedding(10, 4); s.ecc = nn.Embedding(6, 3)
+        s.qin = nn.Linear(NCOV + NQ + 4 + 3 + NDQ, d); s.qtr = tenc(d); s.qout = nn.Linear(d, 2 * DZ)
         # generative model (theta)
-        s.st_p = Static(nsp, nl3, nmaj, nfty)
+        s.st_p = Static(nsp, nl3, nmaj, nfty, nspc)
         s.prior = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2 * DZ))
         s.din = nn.Linear(NCOV, d); s.dz = nn.Linear(DZ, d); s.dtr = tenc(d)
-        s.dout = nn.Linear(d, 2 + 1 + 3 + 1 + 5)                                  # dD, dH | establishment | (survive, die, cut) | cr | cclcd
+        s.dout = nn.Linear(d, 2 + 1 + 3 + 1 + 5 + len(DMG_GROUPS) + 1 + 3 + 1)    # dD, dH | establishment | (survive, die, cut) | cr | cclcd | damage | broken | cull | φ
         with torch.no_grad():
             s.dout.bias.zero_(); s.dout.bias[0] = -0.5; s.dout.bias[1] = 1.5; s.dout.bias[3] = 3.0
         s.lsdisc, s.lsH, s.lscr = nn.Parameter(torch.tensor(-4.0)), nn.Parameter(torch.tensor(-2.0)), nn.Parameter(torch.tensor(-2.0))
@@ -179,7 +199,9 @@ class NIMIWAE54(nn.Module):
                                               B['llim'], haslo, B['llo'].clamp(min=-1) * haslo, (ar == B['f'][:, None]).float(),
                                               (ar == B['l'][:, None]).float(), B['v']], -1),
                        F.one_hot(B['ev'], len(EV)).float(), F.one_hot(B['mode'], len(MODE)).float(),
-                       s.ercd(B['rcd'])[:, None].expand(-1, T, -1), cc], -1)
+                       s.ercd(B['rcd'])[:, None].expand(-1, T, -1), cc,
+                       B['dmg'], B['m_dmg'][..., None], (B['brk'] * B['m_brk'])[..., None], B['m_brk'][..., None],
+                       F.one_hot(B['cl'], 3).float() * B['m_cl'][..., None], B['m_cl'][..., None]], -1)
         h = s.qin(x); cls = s.st_q(B)[:, None]
         pad = torch.cat([torch.zeros_like(B['v'][:, :1]), 1 - B['v']], 1).bool()
         o = s.qtr(torch.cat([cls, h], 1), src_key_padding_mask=pad)[:, 0]
@@ -191,18 +213,21 @@ class NIMIWAE54(nn.Module):
         h = s.din(B['cov'])[None] + s.dz(z)[:, :, None] + s.st_p(B)[None, :, None]
         pad = (1 - B['v']).bool()[None].expand(K, -1, -1).reshape(K * n, T_MAX)
         o = s.dout(s.dtr(h.reshape(K * n, T_MAX, D_MODEL), src_key_padding_mask=pad)).reshape(K, n, T_MAX, -1)
+        nd = len(DMG_GROUPS)
+        # φ_t: fraction of the interval ending at t that elapsed after the tree crossed 1 in, if it qualifies first in that interval
         return (F.softplus(o[..., 0]) * B['v'], F.softplus(o[..., 1]) * B['v'], o[..., 2], torch.log_softmax(o[..., 3:6], -1),
-                torch.sigmoid(o[..., 6]), o[..., 7:])
+                torch.sigmoid(o[..., 6]), o[..., 7:12], o[..., 12:12 + nd], o[..., 12 + nd], o[..., 13 + nd:16 + nd], torch.sigmoid(o[..., 16 + nd]))
     def joint(s, B, K, dreg=False):
         """-> log weights lw [K, n] (and lw with q detached for DReG), log posterior over (s, e, f) [K, n, S, E, 2], sizes."""
         mq, lq = s.q(B); mp, lp = s.p_z(B)
         z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape)
-        dD, dH, hz, lend, crm, ccl = s.decode(z, B)
+        dD, dH, hz, lend, crm, ccl, dml, brl, cll, phi = s.decode(z, B)
         T = T_MAX; ar = torch.arange(T)
         exs = (ar[None, :] >= ar[:, None]).float()                                                     # [s, t]: t >= s
         CD, CH = torch.cumsum(dD, -1), torch.cumsum(dH, -1)
-        pD = torch.cat([torch.zeros_like(CD[..., :1]), CD[..., :-1]], -1); pH = torch.cat([torch.zeros_like(CH[..., :1]), CH[..., :-1]], -1)
-        D = (1.0 + CD[..., None, :] - pD[..., :, None]) * exs; H = (4.5 + CH[..., None, :] - pH[..., :, None]) * exs   # [K, n, S, T]
+        # D[s, t] = 1 in + φ_s δD_s + Σ_{s<u<=t} δD_u  (only the part of the start interval after crossing 1 in counts; am. 6)
+        D = (1.0 + CD[..., None, :] - CD[..., :, None] + (phi * dD)[..., :, None]) * exs
+        H = (4.5 + CH[..., None, :] - CH[..., :, None] + (phi * dH)[..., :, None]) * exs                    # [K, n, S, T]
         lDp, lHp = torch.log(D.clamp(min=1e-3)), torch.log(H.clamp(min=1.0))
         c2 = 0.5 * math.log(2 * math.pi); nl = lambda x, mu, ls: -0.5 * ((x - mu) / torch.exp(ls)) ** 2 - ls - c2
         e1 = torch.sigmoid(-s.leps); rho = RHO_MAX * torch.sigmoid(s.lrho)
@@ -262,6 +287,11 @@ class NIMIWAE54(nn.Module):
         lcc = (torch.log_softmax(ccl, -1).gather(-1, (B['cc'].long().clamp(1, 5) - 1)[None, ..., None].expand(K, -1, -1, 1))[..., 0] * B['mcc'][None]).sum(-1)
         lpz = (-0.5 * (z - mp) ** 2 / torch.exp(lp) - 0.5 * lp - c2).sum(-1)
         lqz = (-0.5 * (z - mq) ** 2 / torch.exp(lq) - 0.5 * lq - c2).sum(-1)
+        # damage reconstruction at visible records (independent of s, e): informs z like the crown measures
+        ldm = (-F.binary_cross_entropy_with_logits(dml, B['dmg'][None].expand_as(dml), reduction='none').sum(-1) * B['m_dmg'][None]).sum(-1)
+        lbk = (-F.binary_cross_entropy_with_logits(brl, B['brk'][None].expand_as(brl), reduction='none') * B['m_brk'][None]).sum(-1)
+        lcl = (torch.log_softmax(cll, -1).gather(-1, B['cl'][None, ..., None].expand(K, -1, -1, 1))[..., 0] * B['m_cl'][None]).sum(-1)
+        lcr = lcr + ldm + lbk + lcl
         lw = lpx + lcr + lcc + lpz - lqz
         out = dict(lw=lw, lpost=lj - lpx[..., None, None, None], D=D, H=H, sdD=sdD, lsdisc=s.lsdisc)
         if dreg:
@@ -270,7 +300,8 @@ class NIMIWAE54(nn.Module):
         return out
 
 def make_model(vocab):
-    m = NIMIWAE54(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1); m.vocab = vocab; return m
+    m = NIMIWAE54(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']))
+    m.vocab = vocab; return m
 
 # --------------------------------------------------------------------------------------------------------------------------- inference
 def wmedian(X, w):

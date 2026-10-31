@@ -75,14 +75,16 @@ def load(db: str) -> pl.DataFrame:
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
 
-def load54(db: str) -> pl.DataFrame:
+def load54(db: str, fiadb: str = None) -> pl.DataFrame:
     """D54 lineage frame. Counted plot visits = at least one subplot with a forested condition; a subplot's span = its first to last
     such visit; a tree's lineage = every counted visit in its subplot's span (before its debut, during and after its record).
     slot_kind real / pre / gap / post. Per slot: the tree's spot condition = the CONDID of its nearest real record, with that
     condition's COND_STATUS_CD at the visit (1 = forest = sampled for trees) and its site / treatment / disturbance fields; microplot
     forested share. Per tree: first-record RECONCILECD, curated terminal_fate, first dead record (date, AGENTCD), first status-0 event
-    (date, RC). Stand fields that include the tree itself (BALIVE, ALSTK, STDSZCD) are not loaded."""
+    (date, RC). Stand fields that include the tree itself (BALIVE, ALSTK, STDSZCD) are not loaded. D54 am. 5: resolved species code and a
+    "species revised" flag per tree; per real record TREECLCD, ACTUALHT and, from FIADB TREE by CN, DAMAGE_AGENT_CD1-3 (recorded 2013+)."""
     c = duckdb.connect(db, read_only=True)
+    if fiadb: c.execute(f"ATTACH '{fiadb}' AS fdb (READ_ONLY)")
     K = "statecd, unitcd, countycd, plot, subp, tree"
     q = f"""
     WITH real AS (SELECT * FROM tree_trajectories WHERE intro_type = 'real'),
@@ -94,11 +96,15 @@ def load54(db: str) -> pl.DataFrame:
            JOIN pv USING (statecd, unitcd, countycd, plot)
            LEFT JOIN csy USING (statecd, unitcd, countycd, plot, subp, measdate) WHERE pv.measdate BETWEEN sp.s0 AND sp.s1),
     ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, STATUSCD statuscd,
-                  CCLCD cclcd, RECONCILECD rcd, AGENTCD agentcd FROM curated_trees),
+                  CCLCD cclcd, RECONCILECD rcd, AGENTCD agentcd, CN tcn, TREECLCD treeclcd, ACTUALHT actualht FROM curated_trees),
+    dm AS (SELECT ct.tcn, ft.DAMAGE_AGENT_CD1 dmg1, ft.DAMAGE_AGENT_CD2 dmg2, ft.DAMAGE_AGENT_CD3 dmg3 FROM ct
+           JOIN {"fdb.TREE" if fiadb else "(SELECT NULL CN, NULL STATECD, NULL DAMAGE_AGENT_CD1, NULL DAMAGE_AGENT_CD2, NULL DAMAGE_AGENT_CD3 WHERE false)"} ft
+           ON ft.CN = ct.tcn AND ft.STATECD = ct.statecd WHERE ct.statuscd = 1),
     tr AS (SELECT {K}, min(measdate) d0, max(measdate) d1, arg_min(condid, measdate) condid0,
                   arg_min(species_symbol, measdate) species_symbol, arg_min(spgrpcd, measdate) spgrpcd, arg_min(major_spgrpcd, measdate) major_spgrpcd,
                   arg_min(sftwd_hrdwd, measdate) sftwd_hrdwd, arg_min(epa_l3, measdate) epa_l3, arg_min(epa_l4, measdate) epa_l4,
-                  arg_min(land_use, measdate) land_use, arg_max(terminal_fate, measdate) terminal_fate
+                  arg_min(land_use, measdate) land_use, arg_max(terminal_fate, measdate) terminal_fate,
+                  arg_max(spcd, measdate) spcd, bool_or(coalesce(spcd_changed, false)) sp_revised
            FROM real GROUP BY ALL),
     rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING ({K})
            WHERE ct.measdate = tr.d0 AND ct.statuscd = 1),
@@ -123,7 +129,9 @@ def load54(db: str) -> pl.DataFrame:
            CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' WHEN f.measdate <= f.d1 THEN 'gap' ELSE 'post' END slot_kind,
            CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
            t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
-           f.species_symbol, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use,
+           f.species_symbol, f.spcd, f.sp_revised, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use,
+           CASE WHEN t.tree IS NOT NULL THEN ct.treeclcd END treeclcd, CASE WHEN t.tree IS NOT NULL THEN ct.actualht END actualht,
+           dm.dmg1, dm.dmg2, dm.dmg3,
            rc.rcd0, f.terminal_fate, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc,
            f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, c1.COND_STATUS_CD cond_status,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
@@ -136,6 +144,7 @@ def load54(db: str) -> pl.DataFrame:
     FROM fr f
     LEFT JOIN real t USING ({K}, measdate)
     LEFT JOIN ct USING ({K}, measdate)
+    LEFT JOIN dm ON dm.tcn = ct.tcn AND t.tree IS NOT NULL
     LEFT JOIN rc USING ({K}) LEFT JOIN dr USING ({K}) LEFT JOIN s0 USING ({K})
     LEFT JOIN nr USING ({K}, measdate)
     LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
@@ -210,13 +219,14 @@ def main():
     ap.add_argument('--from-seq', help='re-split an existing seq.parquet instead of reading the DBs')
     ap.add_argument('--scheme', default='d49', choices=['d49', 'r2', 'r3'])
     ap.add_argument('--prism', help='PRISM L4 yearly DB: add the D51 climate drivers')
-    ap.add_argument('--frame', default='d53', choices=['d53', 'd54']); a = ap.parse_args()
+    ap.add_argument('--frame', default='d53', choices=['d53', 'd54'])
+    ap.add_argument('--fiadb', help='FIADB (read-only) for DAMAGE_AGENT_CD1-3 by tree CN (D54 amendment 5)'); a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']
     if a.from_seq:
         df = pl.read_parquet(a.from_seq)
     else:
-        df = pl.concat([(load54 if a.frame == 'd54' else load)(d) for d in a.dbs], how='vertical_relaxed')
+        df = pl.concat([(load54(d, a.fiadb) if a.frame == 'd54' else load(d)) for d in a.dbs], how='vertical_relaxed')
         df = df.with_columns(
             pl.concat_str([pl.col(c).cast(pl.Utf8) for c in k[:4]], separator='_').alias('plot_key'),
             (pl.col('intro_type') == 'real').alias('obs'),

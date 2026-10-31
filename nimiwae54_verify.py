@@ -94,13 +94,16 @@ def part_b(seq):
     comp = B['cov'][ti, po, 0].numpy(); own = np.where(sq.slot_kind == 'real', sq.own_ba.fillna(0), 0)
     want = np.log1p(np.clip(sq.sub_ba.fillna(0) - own, 0, None)) / 5
     check('B4 competition excludes the tree itself', np.allclose(comp, want, atol=1e-5), '')
+    md_ = B['m_dmg'][ti, po].numpy(); mb_ = B['m_brk'][ti, po].numpy(); mc_ = B['m_cl'][ti, po].numpy()
+    check('B5 damage / broken top / cull class observed only at visible real records', bool(((md_ + mb_ + mc_ > 0) <= (real > 0)).all()),
+          f'damage recorded on {md_[real > 0].mean():.3f} of real slots')
     return B, sq
 
 def brute(model, b, z):
     """Independent float64 enumeration of log p(x_obs, m | z) and the posterior over (s, e, f), from the written spec."""
     with torch.no_grad():
-        dD, dH, hz, lend, crm, ccl = model.decode(z, b)
-    dD, dH, hz, lend = dD[0].double().numpy(), dH[0].double().numpy(), hz[0].double().numpy(), lend[0].double().numpy()
+        out_ = model.decode(z, b); dD, dH, hz, lend, phi = out_[0], out_[1], out_[2], out_[3], out_[-1]
+    dD, dH, hz, lend, phi = dD[0].double().numpy(), dH[0].double().numpy(), hz[0].double().numpy(), lend[0].double().numpy(), phi[0].double().numpy()
     e1 = float(torch.sigmoid(-model.leps)); rho = float(M.RHO_MAX * torch.sigmoid(model.lrho)); sdisc = float(torch.exp(model.lsdisc)); sH = float(torch.exp(model.lsH))
     sig = lambda x: 1 / (1 + np.exp(-x)); lN = lambda x, mu, sd: -0.5 * ((x - mu) / sd) ** 2 - math.log(sd) - 0.5 * math.log(2 * math.pi)
     n, T = dD.shape; out_lpx = np.zeros(n); out_post = {}
@@ -123,7 +126,8 @@ def brute(model, b, z):
                     for t in range(nv):
                         E = s <= t < (e if e < T else nv)
                         if E:
-                            D = 1.0 + dD[i, s:t + 1].sum(); H = 4.5 + dH[i, s:t + 1].sum(); lDp = math.log(D); lHp = math.log(max(H, 1.0))
+                            D = 1.0 + phi[i, s] * dD[i, s] + dD[i, s + 1:t + 1].sum(); H = 4.5 + phi[i, s] * dH[i, s] + dH[i, s + 1:t + 1].sum()
+                            lDp = math.log(D); lHp = math.log(max(H, 1.0))
                             xt = M.KAPPA * (lDp - llim[t]); pt = sig(xt); lsg = lambda u: -np.logaddexp(0, -u)
                             if real[t]:
                                 sd = math.sqrt(0.02 ** 2 + (0.06 / math.exp(lD[t])) ** 2 + sdisc ** 2)
@@ -156,10 +160,13 @@ def part_cd(model, seq):
     torch.manual_seed(0)
     with torch.no_grad():
         mq, lq = model.q(b); z = mq + torch.exp(0.5 * lq) * torch.randn(1, *mq.shape)
-        dD, dH, hz, lend, crm, ccl = model.decode(z, b)
+        dD, dH, hz, lend, crm, ccl, dml, brl, cll, phi = model.decode(z, b)
         c2 = 0.5 * math.log(2 * math.pi)
         lcr = (-0.5 * ((b['cr'][None] - crm) / torch.exp(model.lscr)) ** 2 - model.lscr - c2) * b['mcr'][None]
         lcc = torch.log_softmax(ccl, -1).gather(-1, (b['cc'].long().clamp(1, 5) - 1)[None, ..., None])[..., 0] * b['mcc'][None]
+        lcc = lcc + (-F.binary_cross_entropy_with_logits(dml, b['dmg'][None].expand_as(dml), reduction='none').sum(-1) * b['m_dmg'][None]) \
+                  + (-F.binary_cross_entropy_with_logits(brl, b['brk'][None].expand_as(brl), reduction='none') * b['m_brk'][None]) \
+                  + torch.log_softmax(cll, -1).gather(-1, b['cl'][None, ..., None])[..., 0] * b['m_cl'][None]
         mp, lp = model.p_z(b)
         lpz = (-0.5 * (z - mp) ** 2 / torch.exp(lp) - 0.5 * lp - c2).sum(-1); lqz = (-0.5 * (z - mq) ** 2 / torch.exp(lq) - 0.5 * lq - c2).sum(-1)
         lpx_code = (o['lw'] - lcr.sum(-1) - lcc.sum(-1) - lpz + lqz)[0].double().numpy()
@@ -225,6 +232,9 @@ def part_f(seq, model):
     check('F4 size benchmark: no FALSE labels or microplot codes survive', bool((B2['ev'][ti2, po2].numpy() != M.EV['false_soft']).all()) and bool((B2['rcd'] == 1).all()), '')
     hid = s2.hidden.to_numpy()
     check('F5 size benchmark: hidden real visits carry no measurement', bool((B2['mD'][ti2, po2].numpy()[hid] == 0).all()) and bool((B2['real'][ti2, po2].numpy()[hid] == 0).all()), '')
+    hz_ = lambda Bx, t_, p_, msk: sum(float(Bx[k][t_, p_].numpy()[msk].sum()) for k in ('m_dmg', 'm_brk', 'm_cl', 'brk')) + float(Bx['dmg'][t_, p_].numpy()[msk].sum())
+    check('F6 damage / broken / cull inputs are absent at every hidden record (both benchmarks)',
+          hz_(B2, ti2, po2, hid) == 0 and hz_(B, ti, po, sq.hidden.to_numpy()) == 0, '')
 
 def part_g(seq):
     keys = seq.plot_key.drop_duplicates()

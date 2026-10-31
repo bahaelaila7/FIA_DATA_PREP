@@ -1142,3 +1142,26 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
   2. **End detection.** The end slot is now the first slot ON OR AFTER the dead-record (or move) date. A death recorded at a visit outside the frame (an unsampled subplot visit) previously never ended the lineage: 1 slot in 13,859 in the sample.
   3. **Sampled flag at hidden records.** Hidden benchmark records took sampled = 1 by construction; they now take it from the condition like any other slot. This removes a structural asymmetry between alive and gone instances in the censored-end benchmark.
 - Dev run 2 started before these fixes, so a dev run 3 follows.
+
+**D54 amendment 5 (user, 2026-10-31; before any nested-CV run): species, species revisions, damage.**
+- **User.**
+  1. "Why not species id too?"
+  2. "A tree species might change from visit to visit (as the crew better differentiate the tree species)."
+  3. "Tree damage might explain why a tree's growth is stunted."
+- **Species.** A species embedding on the curated resolved SPCD (GA: 175 codes vs 28 groups), alongside the group embedding. Unseen species fall back to the group.
+- **Species revisions.** 3.1 % of GA trees change observed species across visits. The curation resolves each tree to its LATEST identification, constant across its records, which is the right identity for completing earlier states. A per-tree "species revised" flag (curated spcd_changed) is added. The per-visit observed species, the label noise the curation resolved, is not used.
+- **Damage.**
+  - **Sources:**
+    - FIADB TREE.DAMAGE_AGENT_CD1–3 by tree CN, recorded from 2013 (≈ 75–80 % of 2013+ records; ≈ 14–16 % damaged). Grouped by first digit: insect, disease, fire, animal, abiotic, competition, human, multiple, other / structural.
+    - Broken top (ACTUALHT < HT, all years, ≈ 2 %).
+    - Cull class (TREECLCD 2 / 3 / 4, all years).
+  - **How they enter the model:**
+    - They exist only where the tree was tallied, so they are **reconstructed observations** at visible real records (masked elsewhere, like DIA), not per-slot decoder inputs. Feeding them to the decoder would make the record pattern a cause of the sizes.
+    - Per-tree summaries computed from visible records only (any damage by group, ever broken, ever cull, species revised) enter the static covariates of the prior and the decoder.
+  - **Masking and verification:** the damage inputs are masked at every hidden benchmark record; verifier checks B5 and F6 added.
+- **Data.** The prep gains `--fiadb`, writing to nimiwae_r8/d54b. Dev run 3 (on d54, without these) is the baseline.
+
+**D54 amendment 6 (2026-10-31; dev, before any nested-CV run): start-interval fraction.**
+- **The bias.** DIA at a tree's first existing visit was 1 in + the FULL interval's increment. The tree crossed 1 in somewhere inside that interval, so this overstated its size there. To match an observed debut size, the posterior then shifted the start later, which is the systematic under-prediction of existence in the 1–2 visits before the debut (E1 failing in dev runs 1–3: predicted 0.02 → observed 0.38–0.40).
+- **The fix.** A decoder head gives φ_t ∈ (0, 1), the fraction of the interval ending at t that elapsed after crossing 1 in: D[s, t] = 1 in + φ_s δD_s + Σ_{s<u≤t} δD_u (and HT likewise). The brute-force verifier is updated to the same formula.
+- **Next.** Dev run 4 (on d54b) combines amendments 5 and 6. Dev run 3 (d54, neither) is the baseline: sizes MAE 0.176, E1 fails, E2 / E3 close, E4 passes.
