@@ -1331,3 +1331,17 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Noise diagnostics:** σ_D 0.32, σ_H 0.25. Posterior E[u²] on bracketed training intervals is ≈ 1 in every size class (1.19 under 2 in, 0.90–0.94 over 5 in), so the noise is calibrated and size-dependent noise would not help. Pre-debut width factors 2.18 / 2.31 (base) vs 2.24 / 2.11 (noise): the noise did not fix the early-size spread.
 - **E1 stays open.** P(exists) is still ≥ 0.9 at almost every establishment slot; noise did not change it. It is not the proposal (am. 3 diagnosis) and not the per-interval noise level. Remaining hypotheses: (i) the timing of reaching 1 in is set by unobserved growth below 1 in, which no measurement constrains, while FALSE labels only bound it; (ii) lognormal increments cannot represent the bimodal sapling histories (suppressed for decades vs released). Not pursued autonomously; for the user.
 - **Next (per the D55 am. 1 plan):** 5-fold nested CV of the selected model (`--impl nimiwae56 --noise 0 --censor known --growth flex`), 400k trees, 4 epochs, K = 32 training / 100 evaluation, full benchmarks. Folds, inner validation and dev-VAL exclusion as in D52–D54.
+
+## D57 — Context-conditional prior p(z | statics, context sequence) (2026-10-31; recorded before any D57 code)
+- **Evidence (nested-CV fold models of D56-base, while folds 3–4 run):**
+  - E1 overconfidence concentrates in planted softwoods (gap pE − truth 0.114 planted vs 0.043 natural; by slots before the first visible record 0.11 / 0.24 / 0.30 at 2 / 3 / 4 back).
+  - At the planted-pine FALSE slots the model calls existing (pE > 0.8), the subplot is essentially empty: other trees' TPA median 6 vs 225 at TRUE slots, BA 0.9 ft²/ac, 55 % cutting treatment. These are post-clearcut, pre-establishment visits, and the context says so.
+  - The same miscalibration on TRAIN plots converted the same way (fold-0 model: Brier 0.084 train vs 0.079 outer; planted pine pE 0.85 vs truth 0.71 in both). The model has not learned the context → establishment-timing mapping; this is not overfitting.
+- **Mechanism (hypothesis):** the prior p(z | statics) sees no per-visit context. In training the encoder (labels, records) always supplies the timing through z, so the decoder need not learn it from context. When the records are hidden, z falls back to a prior blind to the stand history.
+- **Options:**
+  - (a) a context-conditional prior: a transformer over the tree's known per-visit context (cov) plus the statics token. It never sees the tree's own records, so it stays on the generative side; z then carries only tree-specific residuals.
+  - (b) shrink z (a bottleneck forcing the decoder onto context);
+  - (c) supervised timing features; out (no supervised terms).
+  - **Chosen (a).**
+- **Leak guard:** B10 extended: the prior's mean / variance are identical for a censored-end instance and its original lineage.
+- **Dev comparison (pre-registered):** base (D56, noise off) vs base + context prior; 150k TRAIN trees, 4 epochs; VAL; the D55 am. 1 selection rule. Diagnostics: E1 by planted / natural, E3 deciles. The selected model goes to nested CV (the running D56-base NCV is completed and recorded either way).

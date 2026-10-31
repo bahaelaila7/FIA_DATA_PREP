@@ -83,12 +83,12 @@ def main():
     ap.add_argument('--dev', action='store_true'); ap.add_argument('--folds', default='0,1,2,3,4')
     ap.add_argument('--epochs', type=int, default=4); ap.add_argument('--max-trees', type=int, default=400000)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=7)
-    ap.add_argument('--impl', default='nimiwae54'); ap.add_argument('--censor', default='known'); ap.add_argument('--growth', default='flex'); ap.add_argument('--noise', type=int, default=1)
+    ap.add_argument('--impl', default='nimiwae54'); ap.add_argument('--censor', default='known'); ap.add_argument('--growth', default='flex'); ap.add_argument('--noise', type=int, default=1); ap.add_argument('--prior-ctx', type=int, default=0)
     ap.add_argument('--rescore', action='store_true', help='dev only: load OUT/dev_model.pt instead of training; refit widths and rescore (OUT/rescore_*)')
     a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
     global M; M = importlib.import_module(a.impl)
     tkw = dict(censor=a.censor, growth=a.growth) if a.impl in ('nimiwae55', 'nimiwae56') else {}
-    if a.impl == 'nimiwae56': tkw['noise'] = bool(a.noise)
+    if a.impl == 'nimiwae56': tkw['noise'] = bool(a.noise); tkw['prior_ctx'] = bool(a.prior_ctx)
     log = lambda x: (print(x, flush=True), open(f'{a.out}/run.log', 'a').write(x + '\n'))
     seq = pd.read_parquet(f'{a.data}/seq.parquet')
     if a.dev and a.rescore:

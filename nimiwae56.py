@@ -192,15 +192,17 @@ NQ = 15 + len(EV) + len(MODE)
 class NIMIWAE56(nn.Module):
     """censor: 'known' (FIA design rule as an observed inequality, no learned missingness) | 'mar' (existence labels only).
     growth: 'flex' (per-slot increments from the decoder on z + context) | 'struct' (Δt · exp(vigour(z) + g(size, species) + c(context)))."""
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=True):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=True, prior_ctx=False):
         super().__init__()
         assert censor in ('known', 'mar') and growth in ('flex', 'struct')
-        s.censor, s.growth, s.noise = censor, growth, noise
+        s.censor, s.growth, s.noise, s.prior_ctx = censor, growth, noise, prior_ctx
         d = D_MODEL
         s.st_q = Static(nsp, nl3, nmaj, nfty, nspc); s.ercd = nn.Embedding(10, 4); s.ecc = nn.Embedding(6, 3)
         s.qin = nn.Linear(NCOV + NQ + 4 + 3 + NDQ, d); s.qtr = tenc(d); s.qout = nn.Linear(d, 2 * DZ)
         s.st_p = Static(nsp, nl3, nmaj, nfty, nspc, use_summ=False)                             # am. 4: no tree-own summaries
         s.prior = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2 * DZ))
+        if prior_ctx:                                                                                 # D57: prior over the known context sequence
+            s.pin = nn.Linear(NCOV, d); s.ptr = tenc(d)
         s.din = nn.Linear(NCOV, d); s.dz = nn.Linear(DZ, d); s.dtr = tenc(d)
         s.dout = nn.Linear(d, 2 + 3 + 1 + 5 + len(DMG_GROUPS) + 1 + 3)            # dD, dH (flex) | (survive, die, cut) | cr | cclcd | damage | broken | cull
         with torch.no_grad():
@@ -247,7 +249,11 @@ class NIMIWAE56(nn.Module):
         mu, lv = s.qout(oo[:, 0]).chunk(2, -1); s._hs = oo[:, 1:]                                    # per-slot states for encoder 2
         return mu, lv.clamp(-8, 4)
     def p_z(s, B):
-        mu, lv = s.prior(s.st_p(B)).chunk(2, -1); return mu, lv.clamp(-6, 3)
+        tok = s.st_p(B)
+        if s.prior_ctx:                                                                               # context only (B10: invariant to the tree's records)
+            pad = torch.cat([torch.zeros_like(B['v'][:, :1]), 1 - B['v']], 1).bool()
+            tok = s.ptr(torch.cat([tok[:, None], s.pin(B['cov'])], 1), src_key_padding_mask=pad)[:, 0]
+        mu, lv = s.prior(tok).chunk(2, -1); return mu, lv.clamp(-6, 3)
     def mult(s, u, B):
         """Noise multipliers [K, n, T, 2] = exp(σ u − σ²/2) (1 when noise is off or u is None)."""
         if not s.noise or u is None: return None
@@ -364,10 +370,10 @@ class NIMIWAE56(nn.Module):
             out['lw_dreg'] = lpx + lrec + lpz - (-0.5 * (z - mqd) ** 2 / torch.exp(lqd) - 0.5 * lqd - c2).sum(-1) + lpu - lqu_d
         return out
 
-def make_model(vocab, censor='known', growth='flex', noise=True):
+def make_model(vocab, censor='known', growth='flex', noise=True, prior_ctx=False):
     m = NIMIWAE56(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']),
-                  censor=censor, growth=growth, noise=noise)
-    m.vocab = vocab; m.cfg = dict(censor=censor, growth=growth, noise=noise); return m
+                  censor=censor, growth=growth, noise=noise, prior_ctx=prior_ctx)
+    m.vocab = vocab; m.cfg = dict(censor=censor, growth=growth, noise=noise, prior_ctx=prior_ctx); return m
 
 def wmedian(X, w):
     Xs, ix = torch.sort(X, 0); cw = torch.cumsum(w[..., None].expand_as(X).gather(0, ix), 0)
@@ -615,11 +621,11 @@ def fit_width(model, b_pre, b_post, lo=0.5, hi=8.0, iters=10):
     return out
 
 # ---------------------------------------------------------------------------------------------------------------------------- training
-def train(tr, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, censor='known', growth='flex', noise=True):
+def train(tr, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, censor='known', growth='flex', noise=True, prior_ctx=False):
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     B, vocab, _ = build(tr); n = B['v'].shape[0]
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
-    model = make_model(vocab, censor=censor, growth=growth, noise=noise)
+    model = make_model(vocab, censor=censor, growth=growth, noise=noise, prior_ctx=prior_ctx)
     phi = model.enc_params(); phi_ids = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in phi_ids]
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     nb_ep = (n + bs - 1) // bs

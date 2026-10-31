@@ -63,14 +63,14 @@ def brute(model, b, D, H, lend):
         post[i] = {k: math.exp(v_ - lp_) for k, v_ in terms.items() if np.isfinite(v_)}
     return lpx, post
 
-def run(seq, censor, growth):
-    tag = f'{censor}+{growth}+noise'
+def run(seq, censor, growth, prior_ctx=False):
+    tag = f'{censor}+{growth}+noise' + ('+ctxprior' if prior_ctx else '')
     va = seq[seq.split == 'val']; x = va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(50, random_state=5))]
     mix = pd.concat([x, M.bench_sizes(va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(1500, random_state=6))], None, True).pipe(lambda d: d[d[M.K_].apply(tuple, axis=1).isin(set(map(tuple, d[M.K_].drop_duplicates().head(30).values)))]),
                      M.bench_end(va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(400, random_state=7))]).pipe(lambda d: d[d[M.K_].apply(tuple, axis=1).isin(set(map(tuple, d[M.K_].drop_duplicates().head(40).values)))])],
                     ignore_index=True).drop_duplicates(M.K_ + ['measdate'])
     tr = seq[seq.split == 'train']; vocab = M.build(tr[tr.plot_key.isin(tr.plot_key.drop_duplicates().sample(3000, random_state=1))])[1]   # whole plots
-    torch.manual_seed(3); model = M.make_model(vocab, censor=censor, growth=growth, noise=True); model.eval()
+    torch.manual_seed(3); model = M.make_model(vocab, censor=censor, growth=growth, noise=True, prior_ctx=prior_ctx); model.eval()
     with torch.no_grad():                                                     # non-trivial encoder 2 and σ (the init is the prior)
         for p_ in model.u_net[-1].parameters(): p_.normal_(0, 0.05)
         model.lsu.fill_(math.log(0.4))
@@ -212,7 +212,10 @@ def gen_inputs(seq):
     inst = sq.drop_duplicates('_tid')[M.K_ + ['_tid']].copy(); inst['otree'] = inst.tree // 16
     o = sq0.drop_duplicates('_tid')[M.K_ + ['_tid']].rename(columns={'_tid': '_t0', 'tree': 'otree'})
     mm = inst.merge(o, on=[c for c in M.K_ if c != 'tree'] + ['otree']); a_, b_ = torch.tensor(mm._tid.to_numpy()), torch.tensor(mm._t0.to_numpy())
-    torch.manual_seed(3); model = M.make_model(voc); model.eval()
+    torch.manual_seed(3); model = M.make_model(voc, prior_ctx=True); model.eval()
+    with torch.no_grad():
+        pa, pb = model.p_z(B), model.p_z(B0); d_pr = max(float((pa[0][a_] - pb[0][b_]).abs().max()), float((pa[1][a_] - pb[1][b_]).abs().max()))
+    check('B11 context-conditional prior p(z | statics, context) invariant to hiding the tree\'s own records', d_pr < 1e-5, f'max |Δ| {d_pr:.1e}')
     with torch.no_grad(): d_tok = float((model.st_p(B)[a_] - model.st_p(B0)[b_]).abs().max()); d_q = float((model.st_q(B)[a_] - model.st_q(B0)[b_]).abs().max())
     d_cov = float((B['cov'][a_] - B0['cov'][b_]).abs().max()); d_v = float((B['v'][a_] - B0['v'][b_]).abs().max())
     check('B10 prior / decoder inputs invariant to hiding the tree\'s own records (statics token, context, padding)', max(d_tok, d_cov, d_v) < 1e-6,
@@ -239,6 +242,7 @@ def main():
     mode_rules(seq); end_bench(seq); gen_inputs(seq); noise_off(seq)
     for censor in ('known', 'mar'):
         for growth in ('flex', 'struct'): run(seq, censor, growth); outputs(seq, censor, growth)
+    run(seq, 'known', 'flex', prior_ctx=True)
     print(f"\n{sum(o for _, o in RES)}/{len(RES)} checks passed")
 
 
