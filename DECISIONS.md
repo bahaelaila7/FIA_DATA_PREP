@@ -1285,3 +1285,17 @@ The rule selects V1. The known arm beats MAR on sizes in both growth forms (MAE 
 - **Leak checks** (verifier B8 / B9, replacing D54 F2): no tree-own record, evidence or code at or after j; alive vs gone identical in every tree-own input at every slot ≥ j; frames extend equally (0.90 vs 0.90 slots after j). Context of later visits (other trees' BA / TPA, treatments, disturbances) is legitimately known, as in production. 45 / 45 checks pass.
 - **Rescoring:** the four trained dev models are rescored on VAL (widths refitted, since the post-record widths come from this benchmark); the selection rule is re-applied to the rescored reports.
 - **E1 (open, not a benchmark issue):** the latent early-size posterior is overconfident. At 3 / 4 slots before the first visible record, the share truly existing is 0.51 / 0.23 while mean P(exists) is 0.90 / 0.74. Medians are right (latent D 3.16 vs true 3.20 in at 2 slots back). K = 1000 and a 2–3× wider proposal leave it unchanged, so it is the model, not the importance sampling. Given z, the path is deterministic, so all spread in unobserved growth must come from z. Candidate (D56, after the rescore): per-interval process noise on growth with its own encoder (NIMIWAE's encoder 2), identifiable because the measurement error is fixed.
+
+## D56 — Per-interval process noise on growth, with its own proposal (NIMIWAE encoder 2) (2026-10-31; recorded before any D56 code)
+- **Problem (D55 am. 3, E1):** given z the latent size path is deterministic, so the uncertainty of unobserved growth comes only from z; the early-size posterior is overconfident (P(exists) 0.90 vs 0.51 truly existing 3 slots back; pre-debut width factors 2.3–2.6).
+- **Change:** each interval's increment gets its own latent u_t ∈ R² (DIA, HT), prior N(0, I):
+  - flex: δD_t = softplus(dec_t) · exp(σ_D u_t − σ_D² / 2); HT likewise;
+  - struct: rate_t · exp(σ u_t − σ² / 2);
+  - σ_D, σ_H learned scalars (init 0.3); the −σ²/2 keeps the mean multiplier at 1.
+  - Monotonicity is kept (the multiplier is positive).
+- **Proposal:** q(u_t | z, x_obs, r) per slot, from the z encoder's per-slot transformer outputs and z (NIMIWAE's encoder 2). Its parameters are encoder parameters: DReG with both q densities detached.
+- **Identifiability:** the DIA measurement error is fixed at FIA precision, so the spread of consecutive measured increments around the z + context prediction identifies σ_D. The learned discrepancy σ_disc stays monitored.
+- **Weights:** log w gains Σ_t v_t [log N(u_t; 0, I) − log q(u_t | ·)].
+- **Unchanged:** existence from size, (e, f) enumeration, censoring arms, benchmarks (with am. 3), bars, outputs.
+- **Dev comparison (pre-registered):** the D55 variant selected on the rescored reports (base) vs base + noise; 150k TRAIN trees, 4 epochs, K = 32; VAL only; the D55 am. 1 selection rule. Diagnostics reported alongside (not selection criteria): pre-debut width factors (closer to 1 is better calibrated), ESS, σ_D, σ_H, σ_disc. The selected model goes to the nested CV.
+- **Verification before training:** a nimiwae56 verifier extending the D55 one (brute-force (e, f) sum given the sampled (z, u); u log densities; monotone paths; DReG surrogate with both q terms detached; noise-off limit reproduces D55).
