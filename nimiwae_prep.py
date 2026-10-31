@@ -14,7 +14,8 @@ import duckdb, numpy as np, polars as pl
 from cohorts_landis import estimate_sapling_growth_rates, MIN_BACKFILL_DRYBIO_G, TREE_ID
 
 PSEUDO_IN = 3.0          # D49 pseudo tally limit (in)
-MICRO_TPA = 50.0         # debut TPA above this = microplot sapling (74.965), else subplot tree (6.018)
+# Plot-design tally levels are DERIVED FROM THE DATA (D54 am. 9; no hard-coded TPA): per (DESIGNCD, TPA_UNADJ class) the minimum DIA
+# tallied = that level's threshold; levels ordered by TPA (largest TPA = smallest plot: microplot, then subplot, then macroplot).
 
 def split_of(key: str) -> str:
     h = zlib.crc32(key.encode()) % 100
@@ -124,8 +125,8 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
            FROM fr f JOIN real r USING ({K}) GROUP BY ALL),
     sub AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, sum(ba) sub_ba, sum(tpa) sub_tpa FROM real GROUP BY ALL),
     pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, make_date(MEASYEAR::INT, MEASMON::INT, MEASDAY::INT) md,
-                  max(CN) cn FROM PLOT GROUP BY ALL)
-    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate,
+                  max(CN) cn, any_value(DESIGNCD) designcd FROM PLOT GROUP BY ALL)
+    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate, pc.designcd,
            CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' WHEN f.measdate <= f.d1 THEN 'gap' ELSE 'post' END slot_kind,
            CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
            t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
@@ -155,16 +156,37 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
 
-NB_MIN_IN = 5.0          # neighbours = trees >= 5 in at both ends of the interval: visible in production AND in the 3- / 5-in benchmarks
+# neighbours = trees at or above the design's SUBPLOT-level threshold at both ends of the interval (column nb_thr; 5 in for DESIGNCD 1):
+# visible in production AND in the subplot-limit benchmark
+
+def add_design_levels(df: pl.DataFrame, k) -> pl.DataFrame:
+    """Per tree, from the data: thr_in = tally threshold of its debut record's level (min DIA tallied at that DESIGNCD x TPA class),
+    thr_micro / thr_subp = the design's smallest / second level thresholds (thr_subp = thr_micro when the design has one level),
+    nb_thr = thr_subp. No hard-coded TPA or limits."""
+    if 'designcd' not in df.columns: df = df.with_columns(pl.lit(1).alias('designcd'))
+    r = df.filter(pl.col('obs') & pl.col('tpa').is_not_null()).with_columns(pl.col('tpa').round(3).alias('_tp'))
+    lv = (r.group_by('designcd', '_tp').agg(pl.col('dia').min().alias('_thr'), pl.len().alias('_n')).filter(pl.col('_n') >= 100)
+            .with_columns((pl.col('_thr') * 10).floor() / 10).sort(['designcd', '_tp'], descending=[False, True]))
+    lv = lv.with_columns(pl.col('_tp').rank('ordinal', descending=True).over('designcd').alias('_lvl'))
+    print('design tally levels (DESIGNCD, TPA_UNADJ, threshold in, n, level):', lv.select('designcd', '_tp', '_thr', '_n', '_lvl').rows(), flush=True)
+    dz = lv.group_by('designcd').agg(pl.col('_thr').filter(pl.col('_lvl') == 1).first().alias('thr_micro'),
+                                     pl.col('_thr').filter(pl.col('_lvl') == 2).first().alias('_t2'))
+    dz = dz.with_columns(pl.coalesce(['_t2', 'thr_micro']).alias('thr_subp')).drop('_t2')
+    deb = (df.filter(pl.col('obs')).sort(k + ['measdate']).group_by(k).agg(pl.col('designcd').first().alias('_dd'),
+                                                                          pl.col('tpa').first().round(3).alias('_tp')))
+    deb = deb.join(lv.select(pl.col('designcd').alias('_dd'), '_tp', '_thr'), on=['_dd', '_tp'], how='left')
+    deb = deb.join(dz.rename({'designcd': '_dd'}), on='_dd', how='left').with_columns(pl.col('_thr').fill_null(pl.col('thr_subp')).alias('thr_in'))
+    return df.drop([c for c in ('thr_in', 'thr_micro', 'thr_subp', 'nb_thr') if c in df.columns]).join(
+        deb.select(k + ['thr_in', 'thr_micro', 'thr_subp']), on=k, how='left').with_columns(pl.col('thr_subp').alias('nb_thr'))
 
 def add_neighbours(df: pl.DataFrame) -> pl.DataFrame:
     """Per slot: leave-one-out mean annual log-DIA increment of the OTHER trees on the same subplot / plot over the interval ending at the
-    visit (both records >= NB_MIN_IN, real), and their counts. The local growth environment, observable whenever the visit happened."""
+    visit (both records >= the design's subplot threshold nb_thr, real), and their counts. The local growth environment, observable whenever the visit happened."""
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']; sk, pk = k[:5], k[:4]
     r = (df.filter(pl.col('obs')).sort(k + ['measdate'])
            .with_columns(pl.col('dia').shift(1).over(k).alias('_d0'), pl.col('measdate').shift(1).over(k).alias('_t0'))
            .with_columns(((pl.col('measdate') - pl.col('_t0')).dt.total_days() / 365.25).alias('_dt'))
-           .filter((pl.col('dia') >= NB_MIN_IN) & (pl.col('_d0') >= NB_MIN_IN) & (pl.col('_dt') > 0.5))
+           .filter((pl.col('dia') >= pl.col('nb_thr')) & (pl.col('_d0') >= pl.col('nb_thr')) & (pl.col('_dt') > 0.5))
            .with_columns(((pl.col('dia').log() - pl.col('_d0').log()) / pl.col('_dt')).clip(-0.05, 0.5).alias('_inc'))
            .select(k + ['measdate', '_inc']))
     out = df.join(r, on=k + ['measdate'], how='left')
@@ -238,8 +260,8 @@ def main():
         deb = (df.filter(pl.col('obs')).group_by(k).agg(pl.col('tpa').sort_by('measdate').first().alias('tpa0'),
                                                          pl.col('dia').sort_by('measdate').first().alias('dia0'),
                                                          pl.len().alias('n_real')))
-        df = df.join(deb, on=k, how='inner').with_columns(
-            pl.when(pl.col('tpa0') > MICRO_TPA).then(1.0).otherwise(5.0).alias('thr_in'))
+        df = df.join(deb, on=k, how='inner')
+        df = add_design_levels(df, k)
         df = add_neighbours(df)
     if a.prism: df = add_climate(df, a.prism)
     if a.scheme in ('r2', 'r3'):
@@ -262,9 +284,9 @@ def main():
     # benchmark trees (VAL for model choices, TEST once): microplot debut below 3 in, >= 3 real visits, a visit < 3 in and a later one >= 3 in
     r = df.filter(pl.col('obs') & pl.col('split').is_in(['val', 'test'])).sort(k + ['measdate'])
     r = r.with_columns(pl.col('dia').ge(PSEUDO_IN).cum_sum().over(k).alias('_nvis'))
-    elig = (r.group_by(k).agg(pl.col('tpa0').first(), pl.col('dia0').first(), pl.col('n_real').first(),
+    elig = (r.group_by(k).agg(pl.col('tpa0').first(), pl.col('thr_in').first(), pl.col('thr_micro').first(), pl.col('dia0').first(), pl.col('n_real').first(),
                               (pl.col('_nvis') == 0).sum().alias('n_hid'), (pl.col('_nvis') > 0).sum().alias('n_vis'))
-              .filter((pl.col('tpa0') > MICRO_TPA) & (pl.col('dia0') < PSEUDO_IN) & (pl.col('n_real') >= 3)
+              .filter((pl.col('thr_in') == pl.col('thr_micro')) & (pl.col('dia0') < PSEUDO_IN) & (pl.col('n_real') >= 3)
                       & (pl.col('n_hid') >= 1) & (pl.col('n_vis') >= 1)).select(k))
     b = r.join(elig, on=k, how='inner').with_columns((pl.col('_nvis') == 0).alias('hidden'))
     vis0 = (b.filter(~pl.col('hidden')).group_by(k).agg(pl.col('age_calc').sort_by('measdate').first().alias('age_deb'),

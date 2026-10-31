@@ -60,8 +60,9 @@ def build(seq: pd.DataFrame, vocab=None):
     assert (f_idx >= 0).all(), 'every tree needs a visible real record'
     F_, L_ = f_idx[tid], l_idx[tid]
     rcd = seq.rcd_override.to_numpy(float) if 'rcd_override' in seq else seq.rcd0.to_numpy(float)
-    limit = seq.limit_in.to_numpy(float) if 'limit_in' in seq else np.where((seq.thr_in.to_numpy(float) <= 1.0) | (rcd == 2), 1.0, 5.0)
-    micro = limit <= 1.0
+    thr_micro = seq.thr_micro.to_numpy(float)                                                       # design levels from the data (am. 9)
+    limit = seq.limit_in.to_numpy(float) if 'limit_in' in seq else np.where(rcd == 2, thr_micro, seq.thr_in.to_numpy(float))
+    micro = limit <= thr_micro + 1e-9                                                                 # tallied at the design's smallest level
     lo = seq.lo_in.to_numpy(float) if 'lo_in' in seq else np.full(N, np.nan)
     cst = seq.cond_status.to_numpy(float)
     fsp, fmp = seq.forest_subpcond_prop.to_numpy(float), seq.forest_micrcond_prop.to_numpy(float)
@@ -418,6 +419,38 @@ def sample_lineages(model, B, n_draws=10, K=100, bs=512):
         outs['start'].append(s_); outs['end'].append(e_); outs['cause'].append(torch.where(e_ < T_MAX, f_, torch.full_like(f_, -1)))
     return {k: torch.cat(v).numpy() for k, v in outs.items()}
 
+def expansion(exists, tpa_tree):
+    """Per-acre expansion of one tree at one visit (D54 am. 9; nothing hard-coded): the TPA_UNADJ of the tree's record on the LARGEST
+    nested plot it was ever tallied on = its smallest observed TPA_UNADJ, at every visit where it exists, else 0. FIA plots are nested
+    (microplot within subplot within macroplot), so the trees that reach a larger plot's tally level are enumerated over that whole plot
+    (observed or completed), and the rest are represented by the smaller plot they stand on: every tree-visit is counted in exactly one
+    group (no double count), for any design whose TPA_UNADJ encodes the nested plot areas."""
+    return np.where(np.asarray(exists, bool), np.asarray(tpa_tree, float), 0.0)
+
+@torch.no_grad()
+def stand_totals(model, seq, n_draws=50, K=100, by=('statecd', 'unitcd', 'countycd', 'plot', 'subp', 'measdate'), group_cols=()):
+    """Stand totals per visit from completed lineages (export step, not part of the model). For each posterior draw (sample_lineages)
+    every tree-visit gets its expansion (see `expansion`); TPA and basal area (ft2/ac = 0.005454 DIA^2 x expansion) are summed per
+    `by` (+ `group_cols`) and summarised over draws (mean, 10 / 90 %). Saplings (DIA below the design's subplot-level threshold, thr_subp)
+    and larger trees are reported separately. Slots outside a tree's sampled span contribute nothing (not completed)."""
+    B, _, sq = build(seq, model.vocab)
+    L = sample_lineages(model, B, n_draws=n_draws, K=K)
+    ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
+    real = (sq.slot_kind == 'real').to_numpy() & ~(sq.hidden.fillna(False).to_numpy(bool) if 'hidden' in sq else np.zeros(len(sq), bool))
+    tpa_tree = pd.Series(np.where(real, sq.tpa.to_numpy(float), np.nan), index=ti).groupby(level=0).min().reindex(range(B['v'].shape[0])).to_numpy()[ti]
+    ex = np.nan_to_num(L['exists'][ti, :, po], nan=0) > 0; dia = np.nan_to_num(L['dia'][ti, :, po], nan=0)    # [rows, draws]
+    w = expansion(ex, tpa_tree[:, None])
+    ba = BA_K * dia ** 2 * w
+    sap = dia < sq.thr_subp.to_numpy(float)[:, None]
+    keys = sq[list(by) + list(group_cols)].reset_index(drop=True)
+    parts = {'tpa_sapling': w * sap, 'tpa_tree': w * ~sap, 'ba_sapling': ba * sap, 'ba_tree': ba * ~sap}
+    out = keys.drop_duplicates().reset_index(drop=True)
+    gid = keys.merge(out.reset_index(), on=list(keys.columns), how='left')['index'].to_numpy()
+    for name, M_ in parts.items():
+        agg = np.zeros((len(out), M_.shape[1])); np.add.at(agg, gid, M_)
+        out[f'{name}_mean'] = agg.mean(1); out[f'{name}_q10'] = np.quantile(agg, 0.1, 1); out[f'{name}_q90'] = np.quantile(agg, 0.9, 1)
+    return out
+
 def monotone_violations(X, B, tol=1e-6):
     v, f = B['v'], B['f']; t = torch.arange(T_MAX)[None]; pre = (t <= f[:, None]) & (v > 0)
     d = X[:, 1:] - X[:, :-1]; pair = pre[:, 1:] & pre[:, :-1]
@@ -428,25 +461,28 @@ def _real_rank(seq):
     r = seq[seq.slot_kind == 'real'].sort_values(K_ + ['measdate'])
     return r
 
-def bench_sizes(seq: pd.DataFrame, limit: float, interval: bool) -> pd.DataFrame:
+def bench_sizes(seq: pd.DataFrame, limit=None, interval: bool = True) -> pd.DataFrame:
     """(i)/(ii) Clean microplot lineages turned into subplot-like trees (limit `limit`): microplot debut < limit, >= 3 real visits, a real
     visit < limit and a later one >= limit. Hidden = real visits before the first >= limit one. RECONCILECD set to 1 (what a subplot tree
     would show); the pre-debut FALSE labels hidden; truth for establishment: hidden real visits TRUE, originally-clean pre slots FALSE."""
     r = _real_rank(seq)
-    nv = (r.dia >= limit).astype(int).groupby([r[c] for c in K_], sort=False).cumsum()
+    lim_r = r.thr_subp.to_numpy(float) if limit is None else np.full(len(r), float(limit))         # the design's subplot level (am. 9)
+    nv = pd.Series((r.dia.to_numpy() >= lim_r).astype(int), index=r.index).groupby([r[c] for c in K_], sort=False).cumsum()
     r = r.assign(_h=(nv == 0).astype(int).to_numpy())
     g = r.groupby(K_, sort=False)
-    t = pd.DataFrame({'thr': g.thr_in.first(), 'dia0': g.dia.first(), 'n': g.size(), 'nh': g._h.sum()}); t['nvis'] = t.n - t.nh
-    ok = t[(t.thr <= 1.0) & (t.dia0 < limit) & (t.n >= 3) & (t.nh >= 1) & (t.nvis >= 1)].reset_index()[K_]
+    t = pd.DataFrame({'thr': g.thr_in.first(), 'tmi': g.thr_micro.first(), 'tsu': g.thr_subp.first(), 'dia0': g.dia.first(), 'n': g.size(), 'nh': g._h.sum()})
+    t['nvis'] = t.n - t.nh; t['lim'] = t.tsu if limit is None else float(limit)
+    ok = t[(t.thr <= t.tmi + 1e-9) & (t.dia0 < t.lim) & (t.n >= 3) & (t.nh >= 1) & (t.nvis >= 1)].reset_index()[K_]
     b = seq.merge(ok, on=K_, how='inner').merge(r[K_ + ['measdate', '_h']], on=K_ + ['measdate'], how='left')
     b['hidden'] = b._h == 1
     # originally clean FALSE pre slots (truth FALSE for establishment scoring), computed with the ORIGINAL microplot semantics
     first = b[b.slot_kind == 'real'].groupby(K_).measdate.min().rename('_d0')
     b = b.join(first, on=K_)
     b['truth_E'] = np.where(b.hidden, 1.0, np.nan)
-    clean = (b.slot_kind == 'pre') & b.rcd0.isin([1, 2]) & (b.forest_micrcond_prop.fillna(0) >= 1.0) & (b.cond_status == 1)
+    clean = (b.slot_kind == 'pre') & b.rcd0.isin([1, 2]) & (b.forest_micrcond_prop.fillna(0) >= 1.0) & (b.cond_status == 1)   # microplot debut (selected above)
     b.loc[clean, 'truth_E'] = 0.0
-    b['limit_in'] = limit; b['lo_in'] = np.where(b.hidden & interval, 1.0, np.nan); b['e_known'] = b.hidden & interval
+    b['limit_in'] = b.thr_subp if limit is None else float(limit)
+    b['lo_in'] = np.where(b.hidden & interval, b.thr_micro, np.nan); b['e_known'] = b.hidden & interval
     b['drop_false'] = True; b['rcd_override'] = 1.0
     return b.drop(columns=['_h', '_d0'])
 

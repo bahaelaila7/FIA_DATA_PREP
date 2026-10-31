@@ -1188,3 +1188,21 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
 5. **Size given existence is undefined (NaN) where no posterior sample has the tree existing.** Before, a placeholder median and a random interval were reported there. The scoring and width fitting skip undefined slots.
 6. **Not implemented.** The sapling-total split rule for stand totals is a production aggregation step, outside the model; it remains planned.
 - **Verifier:** checks I0 and J1–J3 added; the full verifier passes 24 / 24 core and 13 / 13 gap checks.
+
+**D54 amendment 9 (user, 2026-10-31): plot design from the data, no hard-coded TPA; stand-total split implemented.**
+- **User.** "Don't forget about macroplots and other plot design TPA. Be careful not to rely on hard-coded TPA."
+- **Data (8 states).** DESIGNCD 1 only; two TPA_UNADJ classes, 74.965 (DIA 1.0–4.9) and 6.018 (≥ 5.0); no MACRO_BREAKPOINT_DIA anywhere. The code is nevertheless design-general.
+- **Tally levels from the data.**
+  - Per (DESIGNCD, TPA_UNADJ class), the minimum DIA tallied is that level's threshold. Levels are ordered by TPA: largest TPA = smallest plot (microplot, then subplot, then macroplot).
+  - Per tree: thr_in = its debut record's level threshold; thr_micro / thr_subp = the design's smallest / second level.
+  - Replaced, all derived from these: the prep's "microplot if debut TPA > 50" rule; the model's 1 / 5 in limits (through growth → the smallest level); the neighbour threshold (thr_subp); the size benchmark's pseudo-limit and lower bound (thr_subp / thr_micro per tree); the sapling / tree reporting split (thr_subp).
+  - For DESIGNCD 1 these reproduce exactly 1.0 / 5.0 in, so results are unchanged; the data move to nimiwae_r8/d54c.
+- **Stand-total split (implemented: `expansion`, `stand_totals`).**
+  - A tree's expansion at every visit where it exists = the TPA_UNADJ of its record on the LARGEST nested plot it was ever tallied on, i.e. its smallest observed TPA_UNADJ.
+  - Because FIA plots are nested, trees reaching a larger plot's tally level are enumerated over that whole plot (observed or completed), and the rest are represented by the smaller plot they stand on. For DESIGNCD 1:
+    - microplot saplings that later reach 5 in → 6.018 at every visit;
+    - other microplot saplings → 74.965;
+    - subplot trees → 6.018.
+  - A macroplot design would give its breakpoint trees the macroplot TPA in the same way.
+  - Totals of TPA and basal area per visit are computed over posterior lineage draws (mean, 10 / 90 %), with saplings and trees separate and nothing outside a tree's sampled span.
+- **Verifier.** B2 / B6 (levels from the data, consistent with every record), F3 (benchmark limit = the design's subplot level), K1–K3 (expansion rule; single-level trees keep their own TPA; one expansion per tree; totals).

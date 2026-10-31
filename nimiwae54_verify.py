@@ -69,12 +69,12 @@ def part_b(seq):
     bad = 0
     for i, r in enumerate(sq.itertuples()):
         p = po[i]
-        rcd = r.rcd0; limit = 1.0 if (r.thr_in <= 1 or rcd == 2) else 5.0
+        rcd = r.rcd0; limit = r.thr_micro if rcd == 2 else r.thr_in
         sampled = (r.slot_kind == 'real' and not getattr(r, 'hidden', False)) or (r.cond_status == 1 if not pd.isna(r.cond_status) else (r.forest_subpcond_prop or 0) > 0)
         # expected evidence
         e = M.EV['none']
         if f[i] <= p <= l[i]: e = M.EV['true_hard']
-        if (p < f[i] and limit <= 1 and rcd in (1, 2) and sampled and (r.forest_micrcond_prop or 0) >= 1 and r.slot_kind == 'pre'): e = M.EV['false_soft']
+        if (p < f[i] and limit <= r.thr_micro + 1e-9 and rcd in (1, 2) and sampled and (r.forest_micrcond_prop or 0) >= 1 and r.slot_kind == 'pre'): e = M.EV['false_soft']
         if p == f[i] - 1 and rcd in (3, 6, 7) and sampled: e = M.EV['true_soft']
         md = pd.Timestamp(r.measdate)
         end = (not pd.isna(r.dead_md) and md >= pd.Timestamp(r.dead_md)) or (r.terminal_fate == 'censored_moved' and not pd.isna(r.s0_md) and md >= pd.Timestamp(r.s0_md))
@@ -87,8 +87,12 @@ def part_b(seq):
                                                      md=str(md.date()), dead=str(r.dead_md), s0=str(r.s0_md), cond=r.cond_status, fmp=r.forest_micrcond_prop))
     check('B1 existence evidence codes match the rule table', bad == 0, f'{bad}/{len(sq)} slots')
     v = B['v'][ti, po].numpy(); lim = np.exp(B['llim'][ti, po].numpy()) + M.HALF_UNIT
-    want_lim = np.where((sq.thr_in.to_numpy() <= 1) | (sq.rcd0.to_numpy() == 2), 1.0, 5.0)
-    check('B2 tally limit per slot (1 in microplot / through growth, else 5 in), stored at limit − 0.05', np.allclose(lim, want_lim), '')
+    want_lim = np.where(sq.rcd0.to_numpy() == 2, sq.thr_micro.to_numpy(), sq.thr_in.to_numpy())
+    check('B2 tally limit per slot = debut level threshold from the data (through growth: smallest level), stored at limit − 0.05', np.allclose(lim, want_lim), '')
+    # B6 the design levels are consistent with every real record: DIA >= its own level threshold
+    rr = sq[sq.slot_kind == 'real']
+    check('B6 data-derived tally levels: every real record at or above its tree\'s debut threshold or the smallest level',
+          bool(((rr.dia >= rr.thr_micro - 1e-9)).all()) and bool((sq.groupby(M.K_).thr_in.nunique() == 1).all()), '')
     real = B['real'][ti, po].numpy(); mD = B['mD'][ti, po].numpy()
     check('B3 measurements present only on visible real records', bool(((mD > 0) <= (real > 0)).all()), '')
     comp = B['cov'][ti, po, 0].numpy(); own = np.where(sq.slot_kind == 'real', sq.own_ba.fillna(0), 0)
@@ -150,7 +154,7 @@ def brute(model, b, z):
 def part_cd(model, seq):
     va = seq[seq.split == 'val']
     mix = pd.concat([va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(60, random_state=5))],
-                     M.bench_sizes(va.head(400000), 5.0, True).pipe(lambda d: d[d[M.K_].apply(tuple, axis=1).isin(set(map(tuple, d[M.K_].drop_duplicates().head(40).values)))]),
+                     M.bench_sizes(va.head(400000), None, True).pipe(lambda d: d[d[M.K_].apply(tuple, axis=1).isin(set(map(tuple, d[M.K_].drop_duplicates().head(40).values)))]),
                      M.bench_end(va.head(200000)).pipe(lambda d: d[d[M.K_].apply(tuple, axis=1).isin(set(map(tuple, d[M.K_].drop_duplicates().head(60).values)))])],
                     ignore_index=True)
     mix = mix.drop_duplicates(M.K_ + ['measdate'])
@@ -226,9 +230,9 @@ def part_f(seq, model):
     check('F1 censored-end: identical structural inputs at the scored slot (alive vs gone)', worst < 5e-3, '; '.join(rows)
           + f' | info (condition evidence, legitimate): sampled alive {smp[y == 1].mean():.3f} gone {smp[y == 0].mean():.3f}')
     check('F2 censored-end: lineage truncated at the scored slot (no later slots)', bool((last == jpos).all()), '')
-    bs = M.bench_sizes(va.head(300000), 5.0, False); B2, _, s2 = M.build(bs, model.vocab)
+    bs = M.bench_sizes(va.head(300000), None, False); B2, _, s2 = M.build(bs, model.vocab)
     ti2, po2 = s2._tid.to_numpy(), s2._pos.to_numpy()
-    check('F3 size benchmark: every slot of a converted lineage has the 5-in limit', np.allclose(np.exp(B2['llim'][ti2, po2].numpy()) + M.HALF_UNIT, 5.0), '')
+    check('F3 size benchmark: every slot of a converted lineage has its design\'s subplot-level limit', np.allclose(np.exp(B2['llim'][ti2, po2].numpy()) + M.HALF_UNIT, s2.thr_subp.to_numpy()), '')
     check('F4 size benchmark: no FALSE labels or microplot codes survive', bool((B2['ev'][ti2, po2].numpy() != M.EV['false_soft']).all()) and bool((B2['rcd'] == 1).all()), '')
     hid = s2.hidden.to_numpy()
     check('F5 size benchmark: hidden real visits carry no measurement', bool((B2['mD'][ti2, po2].numpy()[hid] == 0).all()) and bool((B2['real'][ti2, po2].numpy()[hid] == 0).all()), '')
@@ -255,7 +259,7 @@ def main():
         torch.set_num_threads(4); seq = pd.read_parquet(f'{a.data}/seq.parquet')
         if a.fiadb: part_a2(seq, a.db, a.fiadb, a.prism)
         part_h()
-        model = M.make_model(M.build(seq[seq.split == 'train'].head(200000))[1]); model.eval(); part_i(model, seq)
+        model = M.make_model(M.build(seq[seq.split == 'train'].head(200000))[1]); model.eval(); part_i(model, seq); part_k(model, seq)
         print(f"\n{sum(o for _, o in RES)}/{len(RES)} checks passed"); return
     torch.set_num_threads(4); rng = np.random.default_rng(0)
     seq = pd.read_parquet(f'{a.data}/seq.parquet')
@@ -390,6 +394,27 @@ def part_i(model, seq):
           str({k: bad[k] for k in ('monotone', '>=1in', 'bounds', 'observed')}))
     check('J3 slots outside the tree\'s sampled span are not completed (NaN); inside always defined', bad['span'] == 0, f"{int(span[v].mean() * 1000) / 1000} of slots in span")
 
+
+def part_k(model, seq):
+    """Stand totals: expansion = each tree's own smallest observed TPA_UNADJ (data-driven, nested plots)."""
+    E = M.expansion
+    got = [float(E(np.array([e]), np.array([t]))[0]) for e, t in ((True, 74.965), (True, 6.018), (True, 0.999), (False, 6.018))]
+    check('K1 expansion = tree\'s smallest observed TPA_UNADJ while existing, else 0', got == [74.965, 6.018, 0.999, 0.0], str(got))
+    va = seq[seq.split == 'val']; x = va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(40, random_state=11))]
+    B, _, sq = M.build(x, model.vocab); ti = sq._tid.to_numpy(); real = (sq.slot_kind == 'real').to_numpy()
+    tmin = pd.Series(np.where(real, sq.tpa, np.nan), index=ti).groupby(level=0).min()
+    sub = sq[real].assign(tmin=tmin.reindex(ti[real]).to_numpy())
+    # K2: a tree whose records are all at one level keeps FIA's own TPA; microplot saplings that later reach the subplot level take the
+    # subplot TPA at every visit (they are enumerated over the subplot) and so does every other tree reaching that level
+    lv = sub.groupby(M.K_).tpa.nunique(); multi = set(lv[lv > 1].index)
+    one = ~sub.set_index(M.K_).index.isin(multi)
+    check('K2 single-level trees keep their own TPA_UNADJ; multi-level trees take their largest plot\'s TPA at every visit',
+          bool(np.allclose(sub.tmin[one], sub.tpa[one])) and bool((sub.tmin[~one] <= sub.tpa[~one] + 1e-9).all()), f'{len(multi)} multi-level trees')
+    # K3 no double count: each tree has exactly one expansion over its whole lineage
+    torch.manual_seed(2); t = M.stand_totals(model, x, n_draws=6, K=30)
+    check('K3 one expansion per tree; stand_totals reports saplings / trees with mean inside its 10-90 % band',
+          bool((sq.assign(tm=tmin.reindex(ti).to_numpy()).groupby('_tid').tm.nunique() <= 1).all())
+          and bool(((t.tpa_sapling_mean >= t.tpa_sapling_q10 - 1e-9) & (t.tpa_sapling_mean <= t.tpa_sapling_q90 + 1e-9)).all()), f'{len(t)} subplot-visits')
 
 if __name__ == '__main__':
     main()

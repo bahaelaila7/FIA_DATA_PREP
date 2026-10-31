@@ -57,12 +57,12 @@ def future_sizes(x):
 
 def score(model, seq_eval, w, tag, log):
     out = {}; P = []
-    torch.manual_seed(11); bb = M.bench_sizes(seq_eval, 5.0, True); sq, viol = M.predictions(model, bb, K=100, w_int=w)
-    h = sq[sq.hidden].copy(); c = size_criteria(h, viol, 5.0); out['sizes'] = c; P.append(h.assign(bench='sizes'))
+    torch.manual_seed(11); bb = M.bench_sizes(seq_eval, None, True); sq, viol = M.predictions(model, bb, K=100, w_int=w)
+    h = sq[sq.hidden].copy(); c = size_criteria(h, viol, float(h.thr_subp.max())); out['sizes'] = c; P.append(h.assign(bench='sizes'))
     log(f"  [{tag}] sizes 5in/interval: n {c['n_hidden']} MAE lD {c['mae_lD']:.3f} | A1 {c['A1_pass']} "
         + ' '.join(f"{x['cell'].split('=')[-1]}:{x['bias_lD']:+.3f}" for x in c['A1']) + f" | by pred " + ' '.join(f"{x['cell']}:{x['bias_lD']:+.3f}" for x in c['A1_by_prediction_diagnostic'])
         + f" | A2 {c['A2_pass']} " + ' '.join(f"{x['cell'].split('=')[-1]}:{x['cov80']:.2f}" for x in c['A2']) + f" | A3 BA {c['A3_median_BA_ratio']:.3f} P1 {c['P1_pass']}")
-    torch.manual_seed(11); bb = M.bench_sizes(seq_eval, 5.0, False); sq, _ = M.predictions(model, bb, K=100, w_int=w)
+    torch.manual_seed(11); bb = M.bench_sizes(seq_eval, None, False); sq, _ = M.predictions(model, bb, K=100, w_int=w)
     x = sq[sq.truth_E.notna()]; e1 = reliability(x.nim_pE, x.truth_E); out['E1'] = e1; P.append(x.assign(bench='establishment'))
     log(f"  [{tag}] E1 establishment: n {e1['n']} base {e1['base_rate']:.3f} Brier {e1['brier']:.3f} pass {e1['pass_']} | "
         + ' '.join(f"{c_['decile']}:{c_['mean_pred']:.2f}/{c_['observed']:.2f}" for c_ in e1['cells']))
@@ -87,7 +87,7 @@ def main():
     seq = pd.read_parquet(f'{a.data}/seq.parquet')
     if a.dev:
         model, hist = M.train(seq[seq.split == 'train'], a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=log)
-        vv = seq[seq.split == 'val']; w = M.fit_width(model, M.bench_sizes(vv, 5.0, True), M.bench_end(vv)); log(f'VAL width factors {w}')
+        vv = seq[seq.split == 'val']; w = M.fit_width(model, M.bench_sizes(vv, None, True), M.bench_end(vv)); log(f'VAL width factors {w}')
         res, P = score(model, seq[seq.split == 'val'], w, 'dev-VAL', log)
         torch.save({'state': model.state_dict(), 'vocab': model.vocab, 'w_int': w, 'hist': hist}, f'{a.out}/dev_model.pt')
         json.dump(res, open(f'{a.out}/dev_report.json', 'w'), indent=1, default=float); return
@@ -100,7 +100,7 @@ def main():
         tr = seq[(seq._fold != f) & ~seq._inner]; inn = seq[(seq._fold != f) & seq._inner]; outer = seq[(seq._fold == f) & (seq.split != 'val')]
         log(f'fold {f}: train slots {len(tr):,}; inner {len(inn):,}; outer {len(outer):,}')
         model, hist = M.train(tr, a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=lambda x: log(f'  [f{f}] {x}'))
-        w = M.fit_width(model, M.bench_sizes(inn, 5.0, True), M.bench_end(inn)); log(f'  [f{f}] inner-val width factors {w}')
+        w = M.fit_width(model, M.bench_sizes(inn, None, True), M.bench_end(inn)); log(f'  [f{f}] inner-val width factors {w}')
         res, P = score(model, outer, w, f'f{f}', log); P['fold'] = f
         torch.save({'state': model.state_dict(), 'vocab': model.vocab, 'w_int': w, 'hist': hist}, f'{a.out}/fold{f}_model.pt')
         P.to_parquet(f'{a.out}/fold{f}_preds.parquet'); json.dump(dict(res=res, width=w, hist=hist), open(f'{a.out}/fold{f}_meta.json', 'w'), indent=1, default=float)
@@ -110,7 +110,7 @@ def main():
     Mt = [json.load(open(f'{a.out}/fold{f}_meta.json')) for f in range(NF)]
     viol = (int(sum(m['res']['sizes']['P1_violations'][0] for m in Mt)),)
     h = P[P.bench == 'sizes']; x1 = P[P.bench == 'establishment']; x = P[P.bench == 'end']; g = x[x.truth_E == 0]
-    rep = dict(sizes=size_criteria(h, viol, 5.0), E1=reliability(x1.nim_pE, x1.truth_E), E2=reliability(x.nim_pE, x.truth_E),
+    rep = dict(sizes=size_criteria(h, viol, float(h.thr_subp.max())), E1=reliability(x1.nim_pE, x1.truth_E), E2=reliability(x.nim_pE, x.truth_E),
                E3=reliability(g.nim_pCut / (g.nim_pCut + g.nim_pDie).clip(lower=1e-9), g.truth_cut), E4=future_sizes(x),
                widths=[m['width'] for m in Mt])
     json.dump(rep, open(f'{a.out}/ncv_report.json', 'w'), indent=1, default=float)
