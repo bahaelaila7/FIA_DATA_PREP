@@ -1206,3 +1206,24 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
   - A macroplot design would give its breakpoint trees the macroplot TPA in the same way.
   - Totals of TPA and basal area per visit are computed over posterior lineage draws (mean, 10 / 90 %), with saplings and trees separate and nothing outside a tree's sampled span.
 - **Verifier.** B2 / B6 (levels from the data, consistent with every record), F3 (benchmark limit = the design's subplot level), K1–K3 (expansion rule; single-level trees keep their own TPA; one expansion per tree; totals).
+
+## D55 — Size-defined existence, MAR on measurements (MIWAE), flexible decoder (user, 2026-10-31; recorded before any D55 code)
+**Diagnosis (D54 dev runs 3–4).** Establishment calibration E1 fails: predicted 0.02 → observed 0.37–0.40, unchanged with 1,000 importance samples (so it is the model, not inference). The separate start hazard was coupled to size only through "DIA ≥ 1 in from the start". The MNAR mask term rewarded explaining "not tallied" by distorting the unobserved path (a late start plus a burst in one interval), and the flexible decoder made such a burst cheap.
+
+**User.** "MNAR provides freedom for the missing values to be as different as they want from observed … MAR would restrain the model a bit (no mask), so that the same growth model for the observed applies for the missing." Agreed: size-defined existence.
+
+**Model.**
+- **Existence from size.** E_t = 1[latent DIA_t ≥ 1 in] and t < e (end). The latent path starts at a latent initial size, which may be below 1 in (unobservable), plus non-negative increments: monotone, so exactly one appearance.
+- The start hazard, the start-interval fraction φ and the start enumeration are removed. Only the end e and cause f are enumerated. The tree is at risk from its first existing slot.
+- **MAR.** No missingness-mask likelihood: no tally-cutoff, crew-miss or interval term. Missing values follow the same generative growth model as observed ones.
+- **Design information as an OBSERVED existence variable**, scored against E_t:
+  - clean microplot pre-debut FALSE (soft);
+  - missed (codes 3 / 6 / 7) TRUE (soft);
+  - debut through the last record TRUE (hard);
+  - recorded death / cut / move FALSE from then on (hard) plus the cause;
+  - hidden benchmark visits that were tallied TRUE (interval protocol).
+  - The existence variable's own missingness depends on location (microplot or not), not on existence: MAR under the design-independence assumption.
+- **Size-existence coupling.** E_t uses a soft step σ(κ(log D_t − log(1 in − 0.05 in))), κ = 40, inside the existence evidence.
+- **Decoder kept flexible** (per-slot increments from z + context). A structural growth constraint (per-tree vigour + shared responses) is added only if the dev check still shows bursts in unobserved intervals.
+- **Unchanged:** species, damage, crown reconstruction; the fixed DIA measurement error; DReG; the outputs (bounds, monotone, undefined where no sample exists, completion span, sampled lineages, stand totals); the benchmarks and bars of D54 with amendments 1–3, 9.
+- **Name.** MIWAE on measurements (NIMIWAE with the missingness model removed).
