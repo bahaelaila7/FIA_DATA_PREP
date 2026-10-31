@@ -167,14 +167,17 @@ def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 
 # ------------------------------------------------------------------------------------------------------------------------------ model
 class Static(nn.Module):
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc):
+    """Per-tree statics -> 64-d token. use_summ: the per-tree record summaries (species revised, damage / broken / cull ever recorded) are
+    functions of the tree's OWN record sequence (they leak its survival: D55 am. 4) -> encoder only, never the prior / decoder."""
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, use_summ=True):
         super().__init__()
+        s.use_summ = use_summ
         s.e = nn.ModuleList([nn.Embedding(nsp + 1, 8), nn.Embedding(nl3 + 1, 4), nn.Embedding(nmaj + 1, 2), nn.Embedding(nfty + 1, 4),
                              nn.Embedding(8, 3), nn.Embedding(50, 3), nn.Embedding(nspc + 1, 8)])   # + species (resolved SPCD); unseen -> 0
-        s.out = nn.Linear(8 + 4 + 2 + 4 + 3 + 3 + 8 + 9 + NSUMM, D_MODEL)
+        s.out = nn.Linear(8 + 4 + 2 + 4 + 3 + 3 + 8 + 9 + (NSUMM if use_summ else 0), D_MODEL)
     def forward(s, B):
-        return s.out(torch.cat([s.e[0](B['sp']), s.e[1](B['l3']), s.e[2](B['maj']), s.e[3](B['fty']), s.e[4](B['scl']), s.e[5](B['phy']),
-                                s.e[6](B['spc']), B['snum'], B['summ']], -1))
+        x = [s.e[0](B['sp']), s.e[1](B['l3']), s.e[2](B['maj']), s.e[3](B['fty']), s.e[4](B['scl']), s.e[5](B['phy']), s.e[6](B['spc']), B['snum']]
+        return s.out(torch.cat(x + ([B['summ']] if s.use_summ else []), -1))
 
 def tenc(d, layers=2):
     return nn.TransformerEncoder(nn.TransformerEncoderLayer(d, 4, 2 * d, dropout=0.0, batch_first=True, norm_first=True), layers,
@@ -192,7 +195,7 @@ class NIMIWAE55(nn.Module):
         d = D_MODEL
         s.st_q = Static(nsp, nl3, nmaj, nfty, nspc); s.ercd = nn.Embedding(10, 4); s.ecc = nn.Embedding(6, 3)
         s.qin = nn.Linear(NCOV + NQ + 4 + 3 + NDQ, d); s.qtr = tenc(d); s.qout = nn.Linear(d, 2 * DZ)
-        s.st_p = Static(nsp, nl3, nmaj, nfty, nspc)
+        s.st_p = Static(nsp, nl3, nmaj, nfty, nspc, use_summ=False)                             # am. 4: no tree-own summaries
         s.prior = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2 * DZ))
         s.din = nn.Linear(NCOV, d); s.dz = nn.Linear(DZ, d); s.dtr = tenc(d)
         s.dout = nn.Linear(d, 2 + 3 + 1 + 5 + len(DMG_GROUPS) + 1 + 3)            # dD, dH (flex) | (survive, die, cut) | cr | cclcd | damage | broken | cull

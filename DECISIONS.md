@@ -1299,3 +1299,22 @@ The rule selects V1. The known arm beats MAR on sizes in both growth forms (MAE 
 - **Unchanged:** existence from size, (e, f) enumeration, censoring arms, benchmarks (with am. 3), bars, outputs.
 - **Dev comparison (pre-registered):** the D55 variant selected on the rescored reports (base) vs base + noise; 150k TRAIN trees, 4 epochs, K = 32; VAL only; the D55 am. 1 selection rule. Diagnostics reported alongside (not selection criteria): pre-debut width factors (closer to 1 is better calibrated), ESS, σ_D, σ_H, σ_disc. The selected model goes to the nested CV.
 - **Verification before training:** a nimiwae56 verifier extending the D55 one (brute-force (e, f) sum given the sampled (z, u); u log densities; monotone paths; DReG surrogate with both q terms detached; noise-off limit reproduces D55).
+
+**D55 rescore on the am.-3 benchmark (VAL; same trained models; widths refitted).**
+
+| Variant | A1 | A2 | A3 | P1 | E1 | E2 | E3 | E4 | bars | E1 Brier | E2 Brier | E3 Brier | size MAE lD | E4 MAE lD | Σ ratio |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| V1 known + flex | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | 3 | 0.1255 | 0.1508 | 0.0774 | 0.1981 | 0.0587 | 5.258 |
+| V3 known + struct | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✓ | ✓ | 3 | 0.1440 | 0.1720 | 0.0615 | 0.2470 | 0.0603 | 5.563 |
+| V4 mar + struct | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✓ | ✓ | 3 | 0.1577 | 0.1700 | 0.0625 | 0.3576 | 0.0613 | 6.250 |
+| V2 mar + flex | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✓ | 2 | 0.1461 | 0.1511 | 0.0765 | 0.2554 | 0.0587 | 5.701 |
+
+The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 barely moved (0.152 → 0.151), so the truncation was not the whole cause.
+
+**D55 amendment 4 (2026-10-31; bug: survivorship leak into the generative side; found diagnosing E2).**
+- **Finding:** on the full-frame benchmark the prior-predictive hazard is still 0.211 vs 0.116 on the original lineages. Of all decoder / prior inputs only the per-tree summaries differ (43 % of instances). These are species revised, damage / broken / cull ever recorded, and damage-recorded-ever.
+- They are functions of the tree's OWN record sequence, so they encode its survival: "damage ever recorded" ≈ "tallied alive at a 2013+ visit"; a species revision needs repeated visits.
+- They entered the prior p(z | statics) and the decoder's tree token, violating the design rule that the generative side never sees the tree's own records. In production a censored tree's summaries miss its unobserved future, so the leak biases real completions too, not only the benchmark.
+- **Options:** (a) drop the summaries everywhere; (b) keep them in the encoder only (a proposal may use any information) and remove them from the prior and decoder; (c) make them causal per-slot covariates ("recorded so far"), but those still depend on the tree's own observation pattern. **Chosen (b).**
+- **Check B10** (both verifiers): the prior / decoder inputs (statics token, context, padding) are identical for a censored-end instance and its original lineage (Δ = 0 over 11,567 instances; the encoder token differs, up to 0.47, as allowed). D55 46 / 46, D56 54 / 54.
+- **Consequence:** the trained D55 models are invalid (leaky); the D56 comparison retrains both arms under am. 4: base = V1 (known + flex, selected in both D55 scorings; the leak is common to all four variants, so the D55 2 × 2 is not rerun) vs V1 + noise.

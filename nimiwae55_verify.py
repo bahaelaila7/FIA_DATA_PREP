@@ -184,12 +184,26 @@ def end_bench(seq):
     check('B9 censored-end: full frame kept (slots after j exist) and similar for alive vs gone', nl.max() > 0 and abs(a_ - g_) < 0.5,
           f'mean slots after j: alive {a_:.2f} gone {g_:.2f}; share with later slots {float((nl > 0).mean()):.2f}')
 
+def gen_inputs(seq):
+    """B10 (D55 am. 4): the prior and decoder never see the tree's own records — their inputs (context, padding, prior / decoder statics
+    token) are identical for a censored-end instance (own records hidden from j) and its original lineage."""
+    s = seq[seq.split == 'train']; s = s[s.plot_key.isin(s.plot_key.drop_duplicates().sample(300, random_state=12))]
+    bb = M.bench_end(s); B, voc, sq = M.build(bb); B0, _, sq0 = M.build(s, voc)
+    inst = sq.drop_duplicates('_tid')[M.K_ + ['_tid']].copy(); inst['otree'] = inst.tree // 16
+    o = sq0.drop_duplicates('_tid')[M.K_ + ['_tid']].rename(columns={'_tid': '_t0', 'tree': 'otree'})
+    mm = inst.merge(o, on=[c for c in M.K_ if c != 'tree'] + ['otree']); a_, b_ = torch.tensor(mm._tid.to_numpy()), torch.tensor(mm._t0.to_numpy())
+    torch.manual_seed(3); model = M.make_model(voc); model.eval()
+    with torch.no_grad(): d_tok = float((model.st_p(B)[a_] - model.st_p(B0)[b_]).abs().max()); d_q = float((model.st_q(B)[a_] - model.st_q(B0)[b_]).abs().max())
+    d_cov = float((B['cov'][a_] - B0['cov'][b_]).abs().max()); d_v = float((B['v'][a_] - B0['v'][b_]).abs().max())
+    check('B10 prior / decoder inputs invariant to hiding the tree\'s own records (statics token, context, padding)', max(d_tok, d_cov, d_v) < 1e-6,
+          f'max |Δ| token {d_tok:.1e} cov {d_cov:.1e} v {d_v:.1e} over {len(mm)} instances (encoder statics may differ: {d_q:.2f})')
+
 def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); a = ap.parse_args()
     torch.set_num_threads(4); seq = pd.read_parquet(f'{a.data}/seq.parquet')
-    mode_rules(seq); end_bench(seq)
+    mode_rules(seq); end_bench(seq); gen_inputs(seq)
     for censor in ('known', 'mar'):
         for growth in ('flex', 'struct'): run(seq, censor, growth); outputs(seq, censor, growth)
     print(f"\n{sum(o for _, o in RES)}/{len(RES)} checks passed")
