@@ -116,7 +116,7 @@ def main():
         model, hist = M.train(tr, a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=lambda x: log(f'  [f{f}] {x}'), **tkw)
         w = M.fit_width(model, M.bench_sizes(inn, None, True), M.bench_end(inn)); log(f'  [f{f}] inner-val width factors {w}')
         res, P = score(model, outer, w, f'f{f}', log); P['fold'] = f
-        torch.save({'state': model.state_dict(), 'vocab': model.vocab, 'w_int': w, 'hist': hist}, f'{a.out}/fold{f}_model.pt')
+        torch.save({'state': model.state_dict(), 'vocab': model.vocab, 'w_int': w, 'hist': hist, 'impl': a.impl, 'cfg': tkw}, f'{a.out}/fold{f}_model.pt')
         P.to_parquet(f'{a.out}/fold{f}_preds.parquet'); json.dump(dict(res=res, width=w, hist=hist), open(f'{a.out}/fold{f}_meta.json', 'w'), indent=1, default=float)
         log(f'fold {f}: {time.time() - t0:.0f}s')
     if not all(os.path.exists(f'{a.out}/fold{f}_meta.json') for f in range(NF)): return
