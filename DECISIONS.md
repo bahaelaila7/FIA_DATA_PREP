@@ -1165,3 +1165,17 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
 - **The bias.** DIA at a tree's first existing visit was 1 in + the FULL interval's increment. The tree crossed 1 in somewhere inside that interval, so this overstated its size there. To match an observed debut size, the posterior then shifted the start later, which is the systematic under-prediction of existence in the 1–2 visits before the debut (E1 failing in dev runs 1–3: predicted 0.02 → observed 0.38–0.40).
 - **The fix.** A decoder head gives φ_t ∈ (0, 1), the fraction of the interval ending at t that elapsed after crossing 1 in: D[s, t] = 1 in + φ_s δD_s + Σ_{s<u≤t} δD_u (and HT likewise). The brute-force verifier is updated to the same formula.
 - **Next.** Dev run 4 (on d54b) combines amendments 5 and 6. Dev run 3 (d54, neither) is the baseline: sizes MAE 0.176, E1 fails, E2 / E3 close, E4 passes.
+
+**D54 amendment 7 (user, 2026-10-31): imputations consistent with the measurements.**
+- **User.** Imputed DIA / HT should not exceed later observed measurements ("increments only, unless damage").
+- **Before.** The latent paths were monotone, but measurements were matched softly (DIA within the FIA error, HT within the learned error), so an imputed value could sit above a later measurement or below an earlier one. Only the unconditional DIA used for P1 was capped, and only at the first record.
+- **Now.** Every imputed slot is bounded by the tree's own measurements: the largest at or before it, the smallest at or after it (running max / min, so monotonicity is preserved). This applies to DIA and HT in all outputs (and to basal area through DIA). Observed slots keep their measured value.
+- **Recorded decreases.** Where a tree's own records decrease (measurement error, or damage such as bark loss), the bounds cross and the slot is clamped between them, so the recorded decrease is kept and imputations never invent one.
+- **Height.** FIA's HT is total height (a broken top is recorded in ACTUALHT), so it should never decrease.
+- **Verifier.** I3 (bounds respected, observed values unchanged) and I4 (no decrease across existing slots).
+- **Amendment 7, details after verification.**
+  - Per-slot "size given existence" medians can dip as the mix of existing samples changes, so the bounded series also takes a running maximum. This stays within the (non-decreasing) upper bound, and observed values are restored afterwards.
+  - Interval endpoints shift with the point.
+  - Basal area is rescaled by the same adjustment.
+  - Verifier I1–I4: 7 / 7 checks in the gap set pass.
+  - Dev run 4 was started before this change, so its scoring does not include the bounds; the nested CV will.

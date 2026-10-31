@@ -314,7 +314,7 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
     existence (median log DIA / HT); 10 / 90 % predictive quantiles of the MEASURED log DIA (path + FIA measurement error + discrepancy),
     widths scaled per slot type (pre: before the debut, post: after the last record) and imputed size class; expected basal area."""
     w_int = w_int or {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}
-    keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD', 'lH', 'q10', 'q90', 'BA')
+    keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD_raw', 'BA_raw', 'lD', 'lH', 'q10', 'q90', 'BA')
     out = {k: [] for k in keys}
     ar = torch.arange(T_MAX)
     for i in range(0, B['v'].shape[0], bs):
@@ -352,11 +352,30 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
             wt = torch.where(typ_pre[:, tt], wpre, torch.where(typ_post[:, tt], wpost, torch.ones_like(wpre)))
             draw = lD[:, tt, None] + wt[:, None] * (draw - lD[:, tt, None])
             q = torch.quantile(draw, torch.tensor([0.1, 0.9]), dim=1); q10.append(q[0]); q90.append(q[1])
-        fI = b['f'][:, None]
-        for k_, v_ in (('pE', pE), ('pDie', pDie), ('pCut', pCut), ('lD_u', torch.minimum(lD_u, b['lD'].gather(1, fI))),
-                       ('lD', lD), ('lH', lH), ('q10', torch.stack(q10, 1)), ('q90', torch.stack(q90, 1)), ('BA', BA)):
+        # observation-consistent bounds: an imputed DIA / HT never exceeds a later measurement nor falls below an earlier one (am. 7)
+        lD_b = obs_bounds(lD, b['lD'], b['mD'], monotone=True); lH_b = obs_bounds(lH, b['lH'], b['mH'], monotone=True)
+        lD_ub = obs_bounds(lD_u, b['lD'], b['mD'] * (lD_u > -6).float())
+        sh = lD_b - lD; BA = BA * torch.exp(2 * sh)                                                    # rescale E[BA] by the adjustment
+        q10_, q90_ = torch.stack(q10, 1) + sh, torch.stack(q90, 1) + sh                                # interval moves with the point
+        for k_, v_ in (('pE', pE), ('pDie', pDie), ('pCut', pCut), ('lD_u', lD_ub), ('lD_raw', lD), ('BA_raw', BA * torch.exp(-2 * sh)),
+                       ('lD', lD_b), ('lH', lH_b), ('q10', q10_), ('q90', q90_), ('BA', BA)):
             out[k_].append(v_)
     return {k: torch.cat(v) for k, v in out.items()}
+
+def obs_bounds(X, obs, m, monotone=False):
+    """Observation-consistent bounds (D54 am. 7) for imputed slots: lower = largest measurement at or before t, upper = smallest at or
+    after t (running max / min, so a monotone path stays monotone). Where a tree's own records decrease the bounds cross; the slot is then
+    clamped between them. Observed slots keep their measured value."""
+    NEGI, POSI = -1e9, 1e9
+    lo = torch.cummax(torch.where(m > 0, obs, torch.full_like(obs, NEGI)), 1).values
+    hi = torch.flip(torch.cummin(torch.flip(torch.where(m > 0, obs, torch.full_like(obs, POSI)), [1]), 1).values, [1])
+    a, b = torch.minimum(lo, hi), torch.maximum(lo, hi)
+    a = torch.where(lo <= NEGI / 2, torch.full_like(a, NEGI), a); b = torch.where(hi >= POSI / 2, torch.full_like(b, POSI), b)
+    a = torch.where((lo > NEGI / 2) & (hi >= POSI / 2), lo, a); b = torch.where((hi < POSI / 2) & (lo <= NEGI / 2), hi, b)
+    out = torch.minimum(torch.maximum(X, a), b)
+    if monotone:                                                     # per-slot medians can dip as the mix of existing samples changes
+        out = torch.cummax(out, 1).values                            # running max stays within the (non-decreasing) upper bound
+    return torch.where(m > 0, obs, out)
 
 def monotone_violations(X, B, tol=1e-6):
     v, f = B['v'], B['f']; t = torch.arange(T_MAX)[None]; pre = (t <= f[:, None]) & (v > 0)
