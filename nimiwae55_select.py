@@ -25,9 +25,9 @@ def last_hist(path):
     return rec
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--root', required=True); ap.add_argument('--variants', default='V1,V2,V3,V4'); ap.add_argument('--report', default='dev_report.json')
+    ap = argparse.ArgumentParser(); ap.add_argument('--root', required=True); ap.add_argument('--variants', default='V1,V2,V3,V4'); ap.add_argument('--report', default='dev_report.json'); ap.add_argument('--prefix', default='d55_')
     a = ap.parse_args(); V = a.variants.split(',')
-    R = {v: json.load(open(f'{a.root}/d55_{v}/{a.report}')) for v in V}
+    R = {v: json.load(open(f'{a.root}/{a.prefix}{v}/{a.report}')) for v in V}
     B, T = {}, {}
     for v in V: B[v], T[v] = row(R[v])
     best = {k: min(T[v][k] for v in V) for k in TIE}
@@ -37,7 +37,7 @@ def main():
     hdr = '| Variant | ' + ' | '.join(BARS) + ' | bars | ' + ' | '.join(TIE) + ' | Σ ratio | ESS (last batch) |'
     print(hdr); print('|' + '---|' * (len(BARS) + len(TIE) + 4))
     for v in order:
-        h = last_hist(f'{a.root}/d55_{v}/run.log') or {}
+        h = last_hist(f'{a.root}/{a.prefix}{v}/run.log') or {}
         print(f"| {v} {NAMES.get(v, '')} | " + ' | '.join('✓' if B[v][b] else '✗' for b in BARS) + f' | {npass[v]} | '
               + ' | '.join(f'{T[v][k]:.4f}' for k in TIE) + f' | {score[v]:.3f} | {h.get("ess_last_batch", float("nan")):.1f} |')
     top = [v for v in order if npass[v] == npass[order[0]]]
