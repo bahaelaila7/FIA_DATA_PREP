@@ -163,12 +163,33 @@ def mode_rules(seq):
     check('B7 missingness mode of every unrecorded slot follows the written rules (8/9: none; before a missed visit: none; after the record: informative unless procedural / shrank)',
           bad == 0, f'{bad} mismatches {ex_}')
 
+def end_bench(seq):
+    """B8 (D55 am. 3): censored-end instances keep the full frame and hide the tree's own information from j on — alive and gone
+    instances must look identical in every tree-own input at every slot >= j, and their frames must extend equally."""
+    va = seq[seq.split == 'val']; va = va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(400, random_state=8))]
+    be = M.bench_end(va); B, _, sq = M.build(be, None)
+    ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
+    j = pd.Series(po, index=ti)[sq.truth_E.notna().to_numpy()]; y = pd.Series(sq.truth_E.to_numpy(), index=ti).dropna()
+    jj = np.full(B['v'].shape[0], -1); jj[j.index.to_numpy()] = j.to_numpy()
+    yy = np.full(B['v'].shape[0], np.nan); yy[y.index.to_numpy()] = y.to_numpy()
+    after = (torch.arange(M.T_MAX)[None] >= torch.tensor(jj)[:, None]) & (B['v'] > 0)
+    rows, worst = [], 0.0
+    for k_ in ('real', 'mD', 'mH', 'mcr', 'mcc', 'm_dmg', 'm_brk', 'm_cl', 'ev', 'mode'):
+        T_ = B[k_].float()
+        a_ = float(T_[after & torch.tensor(yy == 1)[:, None]].mean()); g_ = float(T_[after & torch.tensor(yy == 0)[:, None]].mean())
+        rows.append(f'{k_}: {a_:.3f}/{g_:.3f}'); worst = max(worst, abs(a_ - g_))
+    ok_ev = bool((B['ev'][after] == M.EV['none']).all()) and bool((B['mode'][after] == M.MODE['ignore']).all())
+    check('B8 censored-end: no tree-own record / evidence / code at or after j; identical for alive vs gone', worst < 1e-6 and ok_ev, '; '.join(rows))
+    nl = (B['v'].sum(1).numpy() - 1 - jj); a_, g_ = nl[yy == 1].mean(), nl[yy == 0].mean()
+    check('B9 censored-end: full frame kept (slots after j exist) and similar for alive vs gone', nl.max() > 0 and abs(a_ - g_) < 0.5,
+          f'mean slots after j: alive {a_:.2f} gone {g_:.2f}; share with later slots {float((nl > 0).mean()):.2f}')
+
 def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); a = ap.parse_args()
     torch.set_num_threads(4); seq = pd.read_parquet(f'{a.data}/seq.parquet')
-    mode_rules(seq)
+    mode_rules(seq); end_bench(seq)
     for censor in ('known', 'mar'):
         for growth in ('flex', 'struct'): run(seq, censor, growth); outputs(seq, censor, growth)
     print(f"\n{sum(o for _, o in RES)}/{len(RES)} checks passed")

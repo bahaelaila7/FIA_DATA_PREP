@@ -1263,3 +1263,25 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
 **D55 note 3 (2026-10-31, user discussion; no change to the running comparison).**
 - **Relation to NIMIWAE / not-MIWAE (checked against Lim et al., arXiv 2101.07357, Eq. 8 and Web Appendix).** NIMIWAE: encoder 1 q(z | x_obs) with missing entries set to 0 (it does NOT see r); encoder 2 q(x_m | z, x_obs, r) is the only network that sees the mask; mask model p_φ(r | x_obs, x_m) learned. not-MIWAE: no encoder 2, x_m drawn from the decoder. Ours: missing sizes are the decoder's latent path D(z) (no encoder 2, not-MIWAE-like); the mask model is FIA's fixed design rule (user: deterministic given the measurement, nothing to learn); our z encoder sees r, so it is q(z | x_obs, r, c) — a valid proposal (the true posterior depends on r under MNAR), but not NIMIWAE's encoder 1.
 - **Candidate amendment (decide after the 2 × 2; not applied).** The rule acts on the MEASURED DIA. Integrating the fixed FIA measurement error gives P(tallied | D) = Φ((log D − log limit) / σ_meas(D)) exactly; the κ = 40 logistic has sd ≈ 0.045 log units vs σ_meas ≈ 0.023 at 5 in (about 2× too soft). Options: (a) keep the logistic; (b) the exact probit (no sampler needed); (c) full NIMIWAE: per-slot process noise + encoder 2 with a proposal truncated to the rule's side. Recommendation: (b) for the selected variant if the known arm wins; (c) only as an extra variant if the user asks.
+
+**D55 2 × 2 dev comparison (VAL, amendment-2 code; 150k TRAIN trees, 4 epochs, K = 32) — recorded as scored.**
+
+| Variant | A1 | A2 | A3 | P1 | E1 | E2 | E3 | E4 | bars | E1 Brier | E2 Brier | E3 Brier | size MAE lD | E4 MAE lD | Σ ratio | ESS (K=32) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| V1 known + flex | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓ | 3 | 0.1255 | 0.1523 | 0.0780 | 0.1981 | 0.0591 | 5.274 | 2.8 |
+| V3 known + struct | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✓ | 2 | 0.1440 | 0.1746 | 0.0615 | 0.2470 | 0.0602 | 5.566 | 1.8 |
+| V2 mar + flex | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✓ | 2 | 0.1461 | 0.1547 | 0.0769 | 0.2554 | 0.0587 | 5.721 | 2.8 |
+| V4 mar + struct | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✓ | 2 | 0.1577 | 0.1674 | 0.0624 | 0.3576 | 0.0611 | 6.216 | 1.8 |
+
+The rule selects V1. The known arm beats MAR on sizes in both growth forms (MAE lD 0.198 vs 0.255; 0.247 vs 0.358; A3 BA ratio 1.09 vs 1.29 / 1.22 vs 1.53); structured growth is worse than flexible on sizes and E1/E2, better on E3.
+
+**D55 amendment 3 (2026-10-31; from diagnosing the dev results above; before any nested CV): the censored-end benchmark keeps the full frame.**
+- **Diagnosis (V1 dev model):**
+  - E2 is miscalibrated equally on TRAIN plots (0.15 → 0.28, 0.35 → 0.61), so it is not overfitting.
+  - The whole gap is in untreated intervals (VAL: predicted 0.76 vs observed 0.89 existing; treated 0.28 vs 0.30).
+  - The prior-predictive hazard at the same training intervals is 0.116 on the FULL lineage vs 0.214 on the benchmark copy truncated after j (empirical end rate 0.115).
+  - The D54 construction truncated each instance after j; the bidirectional decoder never sees a frame end there in training, and a censored tree in production keeps its subplot's later visits. The failure was the benchmark's distribution shift, not the hazard model.
+- **Options:** (a) keep the truncated construction (it scores a situation that never occurs in production); (b) keep the full frame and hide the tree's own records, end evidence and codes from j on; (c) retrain with randomly truncated frames so the model is robust to both. **Chosen (b):** it is what a censored tree looks like in production. The bars are unchanged. It applies identically to all four variants.
+- **Leak checks** (verifier B8 / B9, replacing D54 F2): no tree-own record, evidence or code at or after j; alive vs gone identical in every tree-own input at every slot ≥ j; frames extend equally (0.90 vs 0.90 slots after j). Context of later visits (other trees' BA / TPA, treatments, disturbances) is legitimately known, as in production. 45 / 45 checks pass.
+- **Rescoring:** the four trained dev models are rescored on VAL (widths refitted, since the post-record widths come from this benchmark); the selection rule is re-applied to the rescored reports.
+- **E1 (open, not a benchmark issue):** the latent early-size posterior is overconfident. At 3 / 4 slots before the first visible record, the share truly existing is 0.51 / 0.23 while mean P(exists) is 0.90 / 0.74. Medians are right (latent D 3.16 vs true 3.20 in at 2 slots back). K = 1000 and a 2–3× wider proposal leave it unchanged, so it is the model, not the importance sampling. Given z, the path is deterministic, so all spread in unobserved growth must come from z. Candidate (D56, after the rescore): per-interval process noise on growth with its own encoder (NIMIWAE's encoder 2), identifiable because the measurement error is fixed.

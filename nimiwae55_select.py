@@ -25,9 +25,9 @@ def last_hist(path):
     return rec
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--root', required=True); ap.add_argument('--variants', default='V1,V2,V3,V4')
+    ap = argparse.ArgumentParser(); ap.add_argument('--root', required=True); ap.add_argument('--variants', default='V1,V2,V3,V4'); ap.add_argument('--report', default='dev_report.json')
     a = ap.parse_args(); V = a.variants.split(',')
-    R = {v: json.load(open(f'{a.root}/d55_{v}/dev_report.json')) for v in V}
+    R = {v: json.load(open(f'{a.root}/d55_{v}/{a.report}')) for v in V}
     B, T = {}, {}
     for v in V: B[v], T[v] = row(R[v])
     best = {k: min(T[v][k] for v in V) for k in TIE}

@@ -509,10 +509,11 @@ def bench_sizes(seq: pd.DataFrame, limit=None, interval: bool = True) -> pd.Data
     return b.drop(columns=['_h', '_d0'])
 
 def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
-    """(iii)+(iv) censored-end benchmark (D54 amendments 1-2): EVERY at-risk interval (j-1, j] with a known outcome is one instance — a real
-    record at j (alive) or a definitive death / cut at j (gone) — provided the tree has >= 2 visible real records before j. Each instance is
-    a copy of the lineage truncated after j, with j hidden procedural-style (absence uninformative, end evidence / codes hidden). So the
-    benchmark's gone share equals the population's per-interval rate. Instance trees get tree = tree * 16 + instance."""
+    """(iii)+(iv) censored-end benchmark (D54 amendments 1-2; D55 amendment 3): EVERY at-risk interval (j-1, j] with a known outcome is one
+    instance — a real record at j (alive) or a definitive death / cut at j (gone) — provided the tree has >= 2 visible real records before j.
+    Each instance is a copy of the lineage with the FULL frame kept (as for a censored tree in production: the subplot's later visits and
+    their context exist) and the tree's own information hidden from j on: its records, end evidence and codes (absence uninformative).
+    So the benchmark's gone share equals the population's per-interval rate. Instance trees get tree = tree * 16 + instance."""
     s = seq.sort_values(K_ + ['measdate']).copy()
     real = s[s.slot_kind == 'real']
     rk = real.groupby(K_).cumcount().rename('_rk')
@@ -526,9 +527,8 @@ def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
     out = []
     for i, part in inst.groupby('_i'):
         b = s.merge(part.rename(columns={'measdate': '_j'}), on=K_, how='inner')
-        b = b[b.measdate <= b._j].copy()
         at = b.measdate == b._j
-        b['hidden'] = at & (b.slot_kind == 'real')
+        b['hidden'] = (b.measdate >= b._j) & (b.slot_kind == 'real')                                 # the tree's own records from j on
         b['truth_cut'] = np.where(np.isin(b.terminal_fate, CUT_FATES) | (b.dead_agent == 80), 1.0, 0.0)
         b['end_hidden'] = True; b['terminal_fate'] = 'censored_procedural'; b['dead_md'] = pd.NaT; b['dead_agent'] = np.nan; b['s0_md'] = pd.NaT
         b['truth_E'] = np.where(at, b._truth, np.nan); b['truth_cut'] = np.where(at & (b._truth == 0), b.truth_cut, np.nan)

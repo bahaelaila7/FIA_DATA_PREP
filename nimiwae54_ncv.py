@@ -84,11 +84,20 @@ def main():
     ap.add_argument('--epochs', type=int, default=4); ap.add_argument('--max-trees', type=int, default=400000)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=7)
     ap.add_argument('--impl', default='nimiwae54'); ap.add_argument('--censor', default='known'); ap.add_argument('--growth', default='flex')
+    ap.add_argument('--rescore', action='store_true', help='dev only: load OUT/dev_model.pt instead of training; refit widths and rescore (OUT/rescore_*)')
     a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
     global M; M = importlib.import_module(a.impl)
     tkw = dict(censor=a.censor, growth=a.growth) if a.impl == 'nimiwae55' else {}
     log = lambda x: (print(x, flush=True), open(f'{a.out}/run.log', 'a').write(x + '\n'))
     seq = pd.read_parquet(f'{a.data}/seq.parquet')
+    if a.dev and a.rescore:
+        ck = torch.load(f'{a.out}/dev_model.pt', weights_only=False); torch.set_num_threads(a.threads)
+        model = M.make_model(ck['vocab'], **ck['cfg']) if a.impl == 'nimiwae55' else M.make_model(ck['vocab'])
+        model.load_state_dict(ck['state']); model.eval()
+        log(f'RESCORE {a.out}/dev_model.pt ({a.impl} {tkw})')
+        vv = seq[seq.split == 'val']; w = M.fit_width(model, M.bench_sizes(vv, None, True), M.bench_end(vv)); log(f'VAL width factors {w}')
+        res, P = score(model, vv, w, 'dev-VAL', log)
+        json.dump(res, open(f'{a.out}/rescore_report.json', 'w'), indent=1, default=float); return
     if a.dev:
         model, hist = M.train(seq[seq.split == 'train'], a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=log, **tkw)
         vv = seq[seq.split == 'val']; w = M.fit_width(model, M.bench_sizes(vv, None, True), M.bench_end(vv)); log(f'VAL width factors {w}')
