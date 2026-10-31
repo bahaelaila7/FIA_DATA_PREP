@@ -9,6 +9,7 @@ Usage: python -I nimiwae54_ncv.py --data DIR --out DIR [--dev] [--epochs 4 --max
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse, json, time, zlib
 import numpy as np, pandas as pd, torch
+import importlib
 import nimiwae54 as M
 
 NF = 5
@@ -82,14 +83,17 @@ def main():
     ap.add_argument('--dev', action='store_true'); ap.add_argument('--folds', default='0,1,2,3,4')
     ap.add_argument('--epochs', type=int, default=4); ap.add_argument('--max-trees', type=int, default=400000)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=7)
+    ap.add_argument('--impl', default='nimiwae54'); ap.add_argument('--censor', default='known'); ap.add_argument('--growth', default='flex')
     a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
+    global M; M = importlib.import_module(a.impl)
+    tkw = dict(censor=a.censor, growth=a.growth) if a.impl == 'nimiwae55' else {}
     log = lambda x: (print(x, flush=True), open(f'{a.out}/run.log', 'a').write(x + '\n'))
     seq = pd.read_parquet(f'{a.data}/seq.parquet')
     if a.dev:
-        model, hist = M.train(seq[seq.split == 'train'], a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=log)
+        model, hist = M.train(seq[seq.split == 'train'], a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=log, **tkw)
         vv = seq[seq.split == 'val']; w = M.fit_width(model, M.bench_sizes(vv, None, True), M.bench_end(vv)); log(f'VAL width factors {w}')
         res, P = score(model, seq[seq.split == 'val'], w, 'dev-VAL', log)
-        torch.save({'state': model.state_dict(), 'vocab': model.vocab, 'w_int': w, 'hist': hist}, f'{a.out}/dev_model.pt')
+        torch.save({'state': model.state_dict(), 'vocab': model.vocab, 'w_int': w, 'hist': hist, 'impl': a.impl, 'cfg': tkw}, f'{a.out}/dev_model.pt')
         json.dump(res, open(f'{a.out}/dev_report.json', 'w'), indent=1, default=float); return
     keys = seq.plot_key.drop_duplicates()
     fold = {k: zlib.crc32((k + '|ncv').encode()) % NF for k in keys}; inner = {k: zlib.crc32((k + '|ncv-in').encode()) % 10 == 0 for k in keys}
@@ -99,7 +103,7 @@ def main():
         t0 = time.time()
         tr = seq[(seq._fold != f) & ~seq._inner]; inn = seq[(seq._fold != f) & seq._inner]; outer = seq[(seq._fold == f) & (seq.split != 'val')]
         log(f'fold {f}: train slots {len(tr):,}; inner {len(inn):,}; outer {len(outer):,}')
-        model, hist = M.train(tr, a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=lambda x: log(f'  [f{f}] {x}'))
+        model, hist = M.train(tr, a.epochs, a.k, a.bs, a.max_trees, threads=a.threads, log=lambda x: log(f'  [f{f}] {x}'), **tkw)
         w = M.fit_width(model, M.bench_sizes(inn, None, True), M.bench_end(inn)); log(f'  [f{f}] inner-val width factors {w}')
         res, P = score(model, outer, w, f'f{f}', log); P['fold'] = f
         torch.save({'state': model.state_dict(), 'vocab': model.vocab, 'w_int': w, 'hist': hist}, f'{a.out}/fold{f}_model.pt')
