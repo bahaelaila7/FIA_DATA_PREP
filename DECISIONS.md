@@ -1345,3 +1345,4 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - **Chosen (a).**
 - **Leak guard:** B10 extended: the prior's mean / variance are identical for a censored-end instance and its original lineage.
 - **Dev comparison (pre-registered):** base (D56, noise off) vs base + context prior; 150k TRAIN trees, 4 epochs; VAL; the D55 am. 1 selection rule. Diagnostics: E1 by planted / natural, E3 deciles. The selected model goes to nested CV (the running D56-base NCV is completed and recorded either way).
+- **E3 evidence for D57 (D56-base NCV folds 0–2, gone instances with predicted cut share 0.5–0.8, n 9,105):** cutting treatment recorded → observed 0.80 vs predicted 0.685; no cutting → 0.55 vs 0.64; disturbance code → 0.57 vs 0.67. The context effects are shrunk toward the middle, the same signature as E1. D57 should move both if the mechanism is right.
