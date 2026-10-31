@@ -1408,3 +1408,20 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - (b) redefine E1's truth set before the next nested CV with a pre-specified reliability rule (e.g. debut ≤ 1.5 in), applied to every model;
   - (c) model side, independent of (a) / (b): a label-reliability ρ that depends on the implied debut growth (debut DIA, interval length; learned), extending the user's D54 remark that ρ might "depend on the gap (learned)". Against the current E1 truth it would look worse, because it trusts the suspect labels less. Evaluate it only once (a) / (b) is settled.
 - **Recommendation:** (b) + (c). Because (b) changes a bar's truth set after seeing results, it is the user's decision.
+
+**Label investigation (user: "investigate labels more"; 2026-10-31). CORRECTS the finding above: most "implausible" labels are ordinary growth deceleration.**
+- **Population:** 153,022 microplot debuts with a clean FALSE slot just before (all splits); 69,886 have a second record. FIADB raw fields joined by the debut record (read-only).
+- **Control (no labels involved):** measured consecutive sapling intervals (three records, TPA > 50) with rate_k > 2 × rate_(k+1):
+  - by middle size: 0.134 (1–1.5 in), 0.249 (1.5–2), 0.279 (2–3), 0.273 (3–5);
+  - planted 0.314, natural 0.250;
+  - softwood 0.407, hardwoods 0.205–0.264.
+  - Fast-then-slow sapling growth is common, so the label test flags many valid labels.
+- **Label-implied flag vs control** (debut ≥ 1.5 in): overall 0.33 vs ≈ 0.27; planted 0.28 vs 0.31 (no excess); softwood 0.23 vs 0.41 (no excess); natural 0.39 vs 0.25 and hardwoods 0.38–0.43 vs 0.21–0.26 (excess ≈ 0.15).
+- **Not explained by FIA coding:** RECONCILECD 1 vs 2 (0.33 / 0.36), DIACHECK, DIAHTCD, previous-tree links (none), interval length (0.32–0.40), most MANUAL transitions (0.27–0.41).
+- **Two genuine label problems:**
+  1. **Debuts at curated procedural re-tally visits:** 0.635 flagged (rc8 0.605, silent 0.650; 1,524 debuts ≥ 1.5 in; 9 % of flagged labels). KY MANUAL 1.0 → 4.0 (the known silent re-tally) 0.608. Under the D54 rules a procedural change carries no information about earlier visits (code 8), but `build` still writes a FALSE label before such debuts. This is a label-construction gap.
+  2. **Natural hardwood saplings:** excess ≈ 0.15, consistent with crews missing small saplings in dense understory (coded as new rather than RC3).
+- **Consequence for E1:** label noise is a minor part. The model overrides labels 0.27–0.41 (rising with debut size) where perhaps ≈ 0.06 are wrong, so it under-represents fast-then-slow sapling growth. E1 is mainly a model problem, plus problem 1.
+- **Proposed next steps:**
+  - (i) **label fix:** no FALSE label and mode ignore before a debut at a procedural re-tally visit (prep gains `procedural_breaks`; data d54d). It follows the existing code-8 rule; it changes training labels and E1's truth set alike, by an a-priori rule.
+  - (ii) **model:** represent sapling growth variability (size-dependent or heavy-tailed per-interval growth). Check first whether D56's Gaussian noise underfits debut-like intervals; its E[u²] ≈ 1 check covered bracketed intervals only.
