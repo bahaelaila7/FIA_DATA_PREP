@@ -1425,3 +1425,15 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Proposed next steps:**
   - (i) **label fix:** no FALSE label and mode ignore before a debut at a procedural re-tally visit (prep gains `procedural_breaks`; data d54d). It follows the existing code-8 rule; it changes training labels and E1's truth set alike, by an a-priori rule.
   - (ii) **model:** represent sapling growth variability (size-dependent or heavy-tailed per-interval growth). Check first whether D56's Gaussian noise underfits debut-like intervals; its E[u²] ≈ 1 check covered bracketed intervals only.
+
+**D55 amendment 5 (2026-10-31; bug found answering the user's lineage-pattern question): RC9 (nonsampled) censoring is uninformative after the record.**
+- **Pattern census of the lineage frame** (1,703,185 trees; per visit T live record, F sampled / no record, u unsampled, X dead / cut record, r / m / p status-0 shrank / moved / procedural-or-nonsampled; runs collapsed):
+  - 99.97 % match `[Fu]* T [Tu]* (X|r|m|p)? [Fu]*`.
+  - Deviations (456): internal sampled absence `T F T` / `F T F T` (302) and the same followed by an end `T F T X…` / `T F T r` (104), i.e. missed then re-tallied; `T X p…` (≈ 42), a status-0 closure after the death record (still contiguous).
+  - No live-after-death, live-after-censoring or end-before-debut lineages: the curation resolves them.
+- **The bug.** 15,128 contiguous lineages end `T F$` (the record stops while later visits look sampled): censored_nonsampled 10,543, diverted_landuse 2,752, censored_procedural_unrecorded 1,654, censored_procedural 125, disappeared_inferred_removal 48, dead 6.
+  - `build` made post-record absence uninformative only for procedural / procedural_unrecorded / shrank fates. The ≈ 10.5k RC9 (nonsampled) trees therefore got the informative cutoff and, in the known arm, were forced to END, inflating the end hazards.
+  - The D54 rule (user) is that code 9 carries no information. B7 encoded the same incomplete list, so it could not catch this.
+- **Fix:** censored_nonsampled added to the ignore-after fates (nimiwae54 / 55 / 56 `build`) and to B7's written rule. D56 verifier 63 / 63.
+- **Unchanged, deliberate:** diverted_landuse (2,752) keeps the informative absence. The land left forest, so the tree is gone: the end is real, the cause inferred.
+- **Consequence:** every model trained so far (D55–D58, the D56-base NCV) carried this bug; the D58b budget runs still running too. Retrain under am. 5 before the next comparison or NCV.

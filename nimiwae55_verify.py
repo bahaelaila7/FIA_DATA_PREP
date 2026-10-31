@@ -153,14 +153,14 @@ def mode_rules(seq):
         p = po[i]; rcd = r.rcd0
         if not smp[i]: want = 'ignore'
         elif f[i] < p < l[i]: want = 'ignore'
-        elif p > l[i]: want = 'ignore' if r.terminal_fate in ('censored_procedural', 'censored_procedural_unrecorded', 'censored_shrank') else 'cutoff'
+        elif p > l[i]: want = 'ignore' if r.terminal_fate in ('censored_procedural', 'censored_procedural_unrecorded', 'censored_shrank', 'censored_nonsampled') else 'cutoff'
         elif rcd in (8, 9): want = 'ignore'
         elif rcd in (3, 6, 7): want = 'missed' if p == f[i] - 1 else 'ignore'
         else: want = 'cutoff'
         if M.MODE[want] != mode[i]:
             bad += 1
             if len(ex_) < 3: ex_.append(dict(pos=p, f=f[i], l=l[i], rcd=rcd, fate=r.terminal_fate, want=want, got=int(mode[i])))
-    check('B7 missingness mode of every unrecorded slot follows the written rules (8/9: none; before a missed visit: none; after the record: informative unless procedural / shrank)',
+    check('B7 missingness mode of every unrecorded slot follows the written rules (8/9: none; before a missed visit: none; after the record: informative unless procedural / shrank / nonsampled)',
           bad == 0, f'{bad} mismatches {ex_}')
 
 def end_bench(seq):

@@ -102,7 +102,7 @@ def build(seq: pd.DataFrame, vocab=None):
     mode[(pos > F_) & (pos < L_)] = MODE['ignore']                                          # gaps: exist, no cutoff penalty
     mode[~sampled] = MODE['ignore']
     post = pos > L_
-    ign_after = np.isin(fate, ['censored_procedural', 'censored_procedural_unrecorded', 'censored_shrank']) | end_hidden
+    ign_after = np.isin(fate, ['censored_procedural', 'censored_procedural_unrecorded', 'censored_shrank', 'censored_nonsampled']) | end_hidden   # am. 5: code 9 = no information
     mode[post & ign_after] = MODE['ignore']
     mode[missed_prev] = MODE['missed']
     # pre-debut visits that carry NO information (user): procedural change (8) / previously non-sampled area (9): all earlier visits;
