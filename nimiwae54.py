@@ -24,7 +24,7 @@ COV = ['comp', 'stems', 'tma', 'ppa', 'vpa', 'nbs', 'mnbs', 'nbp', 'mnbp', 'nbn'
 NCOV = len(COV)
 DMG_GROUPS = [1, 2, 3, 4, 5, 6, 7, 8, 9]       # DAMAGE_AGENT_CD // 10000: insect, disease, fire, animal, abiotic, competition, human, multi, other
 NDQ = len(DMG_GROUPS) + 1 + 2 + 3 + 1          # encoder damage channels: groups, recorded mask, broken (+mask), cull class one-hot, mask
-NSUMM = 8
+NSUMM = 9
 EV = {'none': 0, 'true_hard': 1, 'false_hard': 2, 'true_soft': 3, 'false_soft': 4}
 MODE = {'cutoff': 0, 'ignore': 1, 'missed': 2, 'interval': 3}
 CUT_FATES = ('harvest_explicit', 'harvest_inferred', 'disappeared_inferred_removal')
@@ -116,6 +116,9 @@ def build(seq: pd.DataFrame, vocab=None):
                can=seq.canopy_pct.to_numpy(float) / 100, mcan=seq.canopy_pct.notna().to_numpy(float), tyr=t.to_numpy() / 20, dt=dt / 10,
                **{f'trt{c}': ((tr_ >= c) & (tr_ < c + 10)).any(1).astype(float) for c in TRT},
                **{f'dst{c}': ((ds_ >= c) & (ds_ < c + 10)).any(1).astype(float) for c in DST})
+    # completion span (user): unsampled visits are completed only when sandwiched between the tree's sampled visits
+    sfirst = per_tree_minmax(sampled, 'min'); slast = per_tree_minmax(sampled, 'max')
+    in_span = (pos >= sfirst[tid]) & (pos <= slast[tid])
     # D54 am. 5: damage observations at VISIBLE real records only (masked like any measurement); DAMAGE_AGENT_CD recorded 2013+
     dcodes = np.stack([seq[c].to_numpy(float) if c in seq else np.full(N, np.nan) for c in ('dmg1', 'dmg2', 'dmg3')], 1)
     m_dmg = real & ~np.isnan(dcodes[:, 0])
@@ -131,6 +134,7 @@ def build(seq: pd.DataFrame, vocab=None):
              cc=mat(np.where(mcc, seq.cclcd.to_numpy(float), 0)), mcc=mat(mcc), v=mat(np.ones(N)), hid=mat(hid), real=mat(real),
              sampled=mat(sampled), llim=mat(np.log(limit - HALF_UNIT)), llo=mat(np.log(lo - HALF_UNIT), -20.0), fmp=mat(fmp),
              ev=mat(ev), mode=mat(mode), cov=np.stack([mat(cov[c]) for c in COV], -1),
+             in_span=mat(in_span),
              dmg=np.stack([mat(dmg[:, j]) for j in range(len(DMG_GROUPS))], -1), m_dmg=mat(m_dmg), brk=mat(brk), m_brk=mat(m_brk),
              cl=mat(cl), m_cl=mat(m_cl))
     st = g.head(1)
@@ -140,8 +144,8 @@ def build(seq: pd.DataFrame, vocab=None):
     rc0 = pd.Series(rcd, index=tid).groupby(level=0).first().reindex(range(n)).to_numpy()
     tmax = lambda a_: pd.Series(np.asarray(a_, float), index=tid).groupby(level=0).max().reindex(range(n)).fillna(0).to_numpy()
     revised = st.sp_revised.fillna(False).astype(float).to_numpy() if 'sp_revised' in st else np.zeros(n)
-    summ = np.stack([revised, tmax(dmg.sum(1) > 0), tmax(dmg[:, 0]), tmax(dmg[:, 1]), tmax(dmg[:, 4]), tmax(dmg[:, 8]),
-                     tmax(brk), tmax(m_cl & (cl > 0))], 1)                                           # visible records only
+    summ = np.stack([revised, tmax(m_dmg), tmax(dmg.sum(1) > 0), tmax(dmg[:, 0]), tmax(dmg[:, 1]), tmax(dmg[:, 4]), tmax(dmg[:, 8]),
+                     tmax(brk), tmax(m_cl & (cl > 0))], 1)          # visible records only; 'damage ever recorded' disambiguates 0 (pre-2013)
     S = dict(sp=ids('spgrpcd'), l3=ids('epa_l3'), maj=ids('major_spgrpcd'), fty=ids('fortypcd'),
              scl=np.clip(st.siteclcd.fillna(0).to_numpy(dtype=float), 0, 7).astype(int), phy=np.clip(st.physclcd.fillna(0).to_numpy(dtype=float), 0, 49).astype(int),
              snum=np.stack([st.planted.fillna(False).astype(float).to_numpy(), z_('sicond'), st.sicond.isna().to_numpy(float), z_('slope'),
@@ -314,7 +318,7 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
     existence (median log DIA / HT); 10 / 90 % predictive quantiles of the MEASURED log DIA (path + FIA measurement error + discrepancy),
     widths scaled per slot type (pre: before the debut, post: after the last record) and imputed size class; expected basal area."""
     w_int = w_int or {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}
-    keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD_raw', 'BA_raw', 'lD', 'lH', 'q10', 'q90', 'BA')
+    keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD_raw', 'BA_raw', 'lD', 'lH', 'q10', 'q90', 'BA', 'in_span')
     out = {k: [] for k in keys}
     ar = torch.arange(T_MAX)
     for i in range(0, B['v'].shape[0], bs):
@@ -333,7 +337,8 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
         Df = o['D'].permute(0, 2, 1, 3).reshape(Kk * T_MAX, n, T_MAX); Hf = o['H'].permute(0, 2, 1, 3).reshape(Kk * T_MAX, n, T_MAX)
         Wf = Wks.permute(0, 2, 1).reshape(Kk * T_MAX, n)
         lD_u = torch.log(wmedian(Df, Wf).clamp(min=1e-3))
-        ex = (Df > 0).float(); Wc = Wf[..., None] * ex; Wc = Wc / Wc.sum(0, keepdim=True).clamp(min=1e-12)
+        ex = (Df > 0).float(); Wc = Wf[..., None] * ex; wsum = Wc.sum(0); Wc = Wc / wsum[None].clamp(min=1e-12)
+        defined = wsum > 1e-9                                                                          # some posterior mass exists at t
         def cmed(X):
             Xs, ix = torch.sort(X, 0); cw = torch.cumsum(Wc.gather(0, ix), 0)
             return Xs.gather(0, (cw < 0.5).sum(0, keepdim=True).clamp(max=X.shape[0] - 1))[0]
@@ -354,15 +359,16 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
             q = torch.quantile(draw, torch.tensor([0.1, 0.9]), dim=1); q10.append(q[0]); q90.append(q[1])
         # observation-consistent bounds: an imputed DIA / HT never exceeds a later measurement nor falls below an earlier one (am. 7)
         lD_b = obs_bounds(lD, b['lD'], b['mD'], monotone=True); lH_b = obs_bounds(lH, b['lH'], b['mH'], monotone=True)
-        lD_ub = obs_bounds(lD_u, b['lD'], b['mD'] * (lD_u > -6).float())
+        lD_ub = obs_bounds(lD_u, b['lD'], b['mD'], lower=False)                                       # P1: never above a later record
         sh = lD_b - lD; BA = BA * torch.exp(2 * sh)                                                    # rescale E[BA] by the adjustment
         q10_, q90_ = torch.stack(q10, 1) + sh, torch.stack(q90, 1) + sh                                # interval moves with the point
-        for k_, v_ in (('pE', pE), ('pDie', pDie), ('pCut', pCut), ('lD_u', lD_ub), ('lD_raw', lD), ('BA_raw', BA * torch.exp(-2 * sh)),
-                       ('lD', lD_b), ('lH', lH_b), ('q10', q10_), ('q90', q90_), ('BA', BA)):
+        undef = lambda X: torch.where(defined | (b['mD'] > 0), X, torch.full_like(X, float('nan')))   # size given existence undefined
+        for k_, v_ in (('pE', pE), ('pDie', pDie), ('pCut', pCut), ('lD_u', lD_ub), ('lD_raw', undef(lD)), ('BA_raw', undef(BA * torch.exp(-2 * sh))),
+                       ('lD', undef(lD_b)), ('lH', undef(lH_b)), ('q10', undef(q10_)), ('q90', undef(q90_)), ('BA', undef(BA)), ('in_span', b['in_span'])):
             out[k_].append(v_)
     return {k: torch.cat(v) for k, v in out.items()}
 
-def obs_bounds(X, obs, m, monotone=False):
+def obs_bounds(X, obs, m, monotone=False, lower=True):
     """Observation-consistent bounds (D54 am. 7) for imputed slots: lower = largest measurement at or before t, upper = smallest at or
     after t (running max / min, so a monotone path stays monotone). Where a tree's own records decrease the bounds cross; the slot is then
     clamped between them. Observed slots keep their measured value."""
@@ -372,10 +378,45 @@ def obs_bounds(X, obs, m, monotone=False):
     a, b = torch.minimum(lo, hi), torch.maximum(lo, hi)
     a = torch.where(lo <= NEGI / 2, torch.full_like(a, NEGI), a); b = torch.where(hi >= POSI / 2, torch.full_like(b, POSI), b)
     a = torch.where((lo > NEGI / 2) & (hi >= POSI / 2), lo, a); b = torch.where((hi < POSI / 2) & (lo <= NEGI / 2), hi, b)
+    if not lower: a = torch.full_like(a, NEGI)
     out = torch.minimum(torch.maximum(X, a), b)
     if monotone:                                                     # per-slot medians can dip as the mix of existing samples changes
         out = torch.cummax(out, 1).values                            # running max stays within the (non-decreasing) upper bound
     return torch.where(m > 0, obs, out)
+
+@torch.no_grad()
+def sample_lineages(model, B, n_draws=10, K=100, bs=512):
+    """The cohort product: n_draws coherent lineages per tree from the posterior. Each draw picks one (z_k, start s, end e, cause f) with
+    probability W, takes that sample's DIA / HT path, bounds it by the tree's own earlier / later measurements (monotone paths stay
+    monotone), and gates it by existence (s <= t < e). Observed slots keep their measured values; slots outside the tree's sampled span
+    are not completed (NaN). -> dict of [n, n_draws, T] arrays: exists, dia, ht; and [n, n_draws]: start, end, cause (0 death, 1 cut, -1 none)."""
+    outs = {k: [] for k in ('exists', 'dia', 'ht', 'start', 'end', 'cause')}
+    ar = torch.arange(T_MAX)
+    for i in range(0, B['v'].shape[0], bs):
+        b = sub(B, slice(i, i + bs)); o = model.joint(b, K)
+        W = torch.softmax(o['lw'], 0)[..., None, None, None] * torch.exp(o['lpost'])                # [K, n, S, E, 2]
+        Kk, n = W.shape[:2]
+        flat = W.permute(1, 0, 2, 3, 4).reshape(n, -1)
+        idx = torch.multinomial(flat + 1e-30, n_draws, replacement=True)                              # [n, d]
+        k_, rem = idx // (T_MAX * (T_MAX + 1) * 2), idx % (T_MAX * (T_MAX + 1) * 2)
+        s_, rem = rem // ((T_MAX + 1) * 2), rem % ((T_MAX + 1) * 2)
+        e_, f_ = rem // 2, rem % 2
+        nidx = torch.arange(n)[:, None].expand(-1, n_draws)
+        Dp = o['D'][k_, nidx, s_]; Hp = o['H'][k_, nidx, s_]                                           # [n, d, T]
+        nv = b['v'].sum(1).long()[:, None, None]
+        ex = (ar[None, None] >= s_[..., None]) & ((ar[None, None] < e_[..., None]) | (e_[..., None] == T_MAX)) & (ar[None, None] < nv)
+        lDp = torch.log(Dp.clamp(min=1e-3)); lHp = torch.log(Hp.clamp(min=1.0))
+        rs = lambda X: X.reshape(n * n_draws, T_MAX)
+        rep_ = lambda X: X[:, None].expand(-1, n_draws, -1).reshape(n * n_draws, T_MAX)
+        lDb = obs_bounds(rs(lDp), rep_(b['lD']), rep_(b['mD'])).reshape(n, n_draws, T_MAX)
+        lHb = obs_bounds(rs(lHp), rep_(b['lH']), rep_(b['mH'])).reshape(n, n_draws, T_MAX)
+        span = (b['in_span'] > 0)[:, None].expand(-1, n_draws, -1)
+        nan = torch.full_like(lDb, float('nan'))
+        outs['exists'].append(torch.where(span, ex.float(), nan))
+        outs['dia'].append(torch.where(span & ex, torch.exp(lDb), torch.where(span, torch.zeros_like(lDb), nan)))
+        outs['ht'].append(torch.where(span & ex, torch.exp(lHb), torch.where(span, torch.zeros_like(lHb), nan)))
+        outs['start'].append(s_); outs['end'].append(e_); outs['cause'].append(torch.where(e_ < T_MAX, f_, torch.full_like(f_, -1)))
+    return {k: torch.cat(v).numpy() for k, v in outs.items()}
 
 def monotone_violations(X, B, tol=1e-6):
     v, f = B['v'], B['f']; t = torch.arange(T_MAX)[None]; pre = (t <= f[:, None]) & (v > 0)
@@ -453,7 +494,7 @@ def fit_width(model, b_pre, b_post, lo=0.5, hi=8.0, iters=10):
         wi = {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}; wi[typ] = (w, 1.0) if cls == 0 else (1.0, w)
         sq, _ = predictions(model, b_pre if typ == 'pre' else b_post, w_int=wi)
         h = sq[sq.hidden] if typ == 'pre' else sq[sq.truth_E == 1]
-        h = h[h.dia.notna()]
+        h = h[h.dia.notna() & h.nim_lD.notna()]
         sel = (np.exp(h.nim_lD) < 2) if cls == 0 else (np.exp(h.nim_lD) >= 2)
         ld = np.log(h.dia); inside = ((ld >= h.nim_q10) & (ld <= h.nim_q90))[sel]
         return None if inside.sum() + (~inside).sum() < 50 else float(inside.mean())

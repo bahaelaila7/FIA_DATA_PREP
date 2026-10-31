@@ -26,7 +26,7 @@ def size_criteria(h, viol, limit):
     """A1 |median log DIA error| <= 0.10 overall / per true 1-in class / per major group (n >= 200); A2 80 % coverage of the measured log
     DIA in [0.75, 0.85] overall and per class; A3 median predicted / true basal area per subplot-visit in [0.9, 1.1]; P1 no violations.
     Diagnostic: bias binned by the predicted class."""
-    h = h[h.dia.notna()].copy(); ld = np.log(h.dia)
+    h = h[h.dia.notna() & h.nim_lD.notna()].copy(); ld = np.log(h.dia)
     h['eD'] = h.nim_lD - ld; h['inside'] = (ld >= h.nim_q10) & (ld <= h.nim_q90); h['ba'] = M.BA_K * h.dia ** 2
     edges = np.arange(1.0, limit + 1e-9, 1.0)
     lab = lambda x: pd.cut(x, list(edges) + [np.inf], right=False, labels=[f'{int(a)}-{int(a) + 1} in' for a in edges]).astype(str)
@@ -46,7 +46,7 @@ def size_criteria(h, viol, limit):
                 P1_violations=list(viol), P1_pass=ok4, mae_lD=float(h.eD.abs().mean()), benchmark_pass=bool(ok1 and ok2 and ok3 and ok4))
 
 def future_sizes(x):
-    a = x[(x.truth_E == 1) & x.dia.notna()].copy(); ld = np.log(a.dia)
+    a = x[(x.truth_E == 1) & x.dia.notna() & x.nim_lD.notna()].copy(); ld = np.log(a.dia)
     a['eD'] = a.nim_lD - ld; a['inside'] = (ld >= a.nim_q10) & (ld <= a.nim_q90); a['ba'] = M.BA_K * a.dia ** 2
     a1 = [dict(cell='overall', n=len(a), bias_lD=float(a.eD.median()))] + \
          [dict(cell=f'major={g}', n=len(d), bias_lD=float(d.eD.median())) for g, d in a.groupby('major_spgrpcd') if len(d) >= 200]

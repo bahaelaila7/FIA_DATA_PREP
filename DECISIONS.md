@@ -1179,3 +1179,12 @@ Decisive configuration: 5 in / interval, 33,160 hidden visits, inner-val widths 
   - Basal area is rescaled by the same adjustment.
   - Verifier I1–I4: 7 / 7 checks in the gap set pass.
   - Dev run 4 was started before this change, so its scoring does not include the bounds; the nested CV will.
+
+**D54 amendment 8 (2026-10-31; semantic audit before the nested CV and the diagram update).**
+1. **Sampled lineages, the cohort product, were promised but not implemented.** Added `sample_lineages`: each draw picks one (z, start, end, cause) from the posterior and takes that path, bounded by the tree's own measurements (monotone paths stay monotone). It is gated by existence, observed values are kept, and it has NaN outside the tree's sampled span.
+2. **Completion span per tree.** Leading / trailing slots where the tree's spot was not sampled (e.g. land-use diversion, afforestation) are not completed; only sandwiched unsampled slots are. The `in_span` output flag.
+3. **"Damage ever recorded" in the per-tree summaries.** DAMAGE_AGENT_CD exists only from 2013, so a summary of 0 was ambiguous between "no damage" and "not recorded".
+4. **The P1 internal size takes only the upper bound.** It is never above a later record; a lower bound would wrongly lift post-death zeros.
+5. **Size given existence is undefined (NaN) where no posterior sample has the tree existing.** Before, a placeholder median and a random interval were reported there. The scoring and width fitting skip undefined slots.
+6. **Not implemented.** The sapling-total split rule for stand totals is a production aggregation step, outside the model; it remains planned.
+- **Verifier:** checks I0 and J1–J3 added; the full verifier passes 24 / 24 core and 13 / 13 gap checks.

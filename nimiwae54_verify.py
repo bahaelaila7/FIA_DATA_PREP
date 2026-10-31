@@ -330,21 +330,26 @@ def part_i(model, seq):
     with torch.no_grad(): o = model.joint(B, 1)
     W = torch.exp(o['lpost'])[0].sum((-1, -2)).double()                                              # p(s | z) [n, S]
     D = o['D'][0].double(); BA = (W[..., None] * (D > 0) * M.BA_K * D ** 2).sum(1) / (W[..., None] * (D > 0)).sum(1).clamp(min=1e-12)
-    err = float((BA - R['BA_raw'].double()).abs().max())
-    err2 = float((R['BA'].double() - R['BA_raw'].double() * torch.exp(2 * (R['lD'] - R['lD_raw'])).double()).abs().max())
+    okb = ~torch.isnan(R['BA_raw'])
+    err = float((BA - R['BA_raw'].double())[okb].abs().max())
+    err2 = float((R['BA'].double() - R['BA_raw'].double() * torch.exp(2 * (R['lD'] - R['lD_raw'])).double())[okb].abs().max())
     check('I1 expected basal area given existence = Σ p(s) · 0.005454 · D[s]² (K = 1), then the bound adjustment', err < 1e-3 and err2 < 1e-3,
           f'max |Δ| {err:.2e} / {err2:.2e} ft²')
-    v = (B['v'] > 0) & (B['mD'] == 0); inside = ((R['q10'] <= R['lD'] + 1e-6) & (R['lD'] <= R['q90'] + 1e-6))[v]
+    v = (B['v'] > 0) & (B['mD'] == 0) & ~torch.isnan(R['lD']); inside = ((R['q10'] <= R['lD'] + 1e-6) & (R['lD'] <= R['q90'] + 1e-6))[v]
+    und = (B['v'] > 0) & torch.isnan(R['lD'])
+    check('I0 size given existence is undefined (NaN) exactly where no posterior sample exists', bool((R['pE'][und] < 1e-6).all()) and bool((~torch.isnan(R['lD'][B['mD'] > 0])).all()),
+          f'{int(und.sum())} undefined slots')
     check('I2 predictive interval brackets the point estimate (imputed slots)', float(inside.float().mean()) > 0.99, f'{float(inside.float().mean()):.4f}')
     # I3 observation-consistent bounds: imputed DIA / HT never above a later measurement nor below an earlier one (where records increase)
     bad = 0
-    for X, obs, m in ((R['lD'], B['lD'], B['mD']), (R['lH'], B['lH'], B['mH'])):
+    for X, obs, m in ((torch.nan_to_num(R['lD'], nan=-50.0), B['lD'], B['mD']), (torch.nan_to_num(R['lH'], nan=-50.0), B['lH'], B['mH'])):
         for i in range(X.shape[0]):
             o_ = [(t, float(obs[i, t])) for t in range(M.T_MAX) if m[i, t] > 0]
             if len(o_) > 1 and any(o_[j + 1][1] < o_[j][1] for j in range(len(o_) - 1)): continue      # own records decrease: skip
             for t in range(int(B['v'][i].sum())):
                 if m[i, t] > 0: bad += abs(float(X[i, t]) - float(obs[i, t])) > 1e-6; continue
                 later = [v_ for (u, v_) in o_ if u > t]; earlier = [v_ for (u, v_) in o_ if u < t]
+                if float(X[i, t]) <= -49: continue                                                       # undefined slot
                 bad += (bool(later) and float(X[i, t]) > min(later) + 1e-6) or (bool(earlier) and float(X[i, t]) < max(earlier) - 1e-6)
     check('I3 imputed DIA / HT within earlier / later measurements; observed slots keep their value', bad == 0, f'{bad} violations')
     inc = torch.ones(B['v'].shape[0], dtype=torch.bool)
@@ -352,8 +357,38 @@ def part_i(model, seq):
         for i in range(obs.shape[0]):
             o_ = [float(obs[i, t]) for t in range(M.T_MAX) if m[i, t] > 0]
             if any(o_[j + 1] < o_[j] for j in range(len(o_) - 1)): inc[i] = False
-    mono = sum(int((((X[:, 1:] - X[:, :-1]) < -1e-6) & (B['v'][:, 1:] > 0)).any(1)[inc].sum()) for X in (R['lD'], R['lH']))
+    mono = sum(int((((torch.nan_to_num(X, nan=-50.0)[:, 1:] - torch.nan_to_num(X, nan=-50.0)[:, :-1]) < -1e-6) & (B['v'][:, 1:] > 0)).any(1)[inc].sum()) for X in (R['lD'], R['lH']))
     check('I4 DIA / HT never decrease across slots (trees whose own records increase)', mono == 0, f'{mono} trees')
+    # J: coherent sampled lineages
+    torch.manual_seed(1); L = M.sample_lineages(model, B, n_draws=8, K=50)
+    v = B['v'].numpy() > 0; f = B['f'].numpy(); l = B['l'].numpy(); span = B['in_span'].numpy() > 0
+    ex, dia, st_, en, ca = L['exists'], L['dia'], L['start'], L['end'], L['cause']
+    bad = {'contiguous': 0, 'start<=f': 0, 'end>l': 0, 'cause': 0, 'monotone': 0, '>=1in': 0, 'observed': 0, 'bounds': 0, 'span': 0}
+    for i in range(ex.shape[0]):
+        nv = int(v[i].sum()); o_ = [(t, float(np.exp(B['lD'][i, t]))) for t in range(nv) if B['mD'][i, t] > 0]
+        inc = not any(o_[j + 1][1] < o_[j][1] for j in range(len(o_) - 1))
+        for d_ in range(ex.shape[1]):
+            e_ = ex[i, d_, :nv]; sp = span[i, :nv]
+            bad['span'] += bool(np.isnan(e_[sp]).any() or (~np.isnan(e_[~sp])).any())
+            ee = np.nan_to_num(e_, nan=0); on = np.where(ee > 0)[0]
+            bad['contiguous'] += bool(len(on) and (on.max() - on.min() + 1 != len(on)))
+            bad['start<=f'] += int(st_[i, d_] > f[i]); bad['end>l'] += int(en[i, d_] <= l[i])
+            bad['cause'] += int((ca[i, d_] == -1) != (en[i, d_] == M.T_MAX))
+            dd = dia[i, d_, :nv]; dd_on = dd[(ee > 0)]
+            bad['monotone'] += bool(inc and len(dd_on) > 1 and (np.diff(dd_on) < -1e-6).any())
+            bad['>=1in'] += bool(len(dd_on) and (dd_on < 1.0 - 1e-6).any() and inc)
+            for (t, ov) in o_:
+                if sp[t]: bad['observed'] += abs(dd[t] - ov) > 1e-4 * ov
+            if inc:
+                for t in range(nv):
+                    if ee[t] > 0 and B['mD'][i, t] == 0:
+                        later = [ov for (u, ov) in o_ if u > t]; earlier = [ov for (u, ov) in o_ if u < t]
+                        bad['bounds'] += (bool(later) and dd[t] > min(later) * (1 + 1e-5)) or (bool(earlier) and dd[t] < max(earlier) * (1 - 1e-5))
+    check('J1 sampled lineages are coherent (one start <= first record, one end > last record, cause iff ended, contiguous existence)',
+          bad['contiguous'] + bad['start<=f'] + bad['end>l'] + bad['cause'] == 0, str({k: bad[k] for k in ('contiguous', 'start<=f', 'end>l', 'cause')}))
+    check('J2 sampled DIA monotone, >= 1 in while existing, inside measurement bounds, observed values kept', bad['monotone'] + bad['>=1in'] + bad['bounds'] + bad['observed'] == 0,
+          str({k: bad[k] for k in ('monotone', '>=1in', 'bounds', 'observed')}))
+    check('J3 slots outside the tree\'s sampled span are not completed (NaN); inside always defined', bad['span'] == 0, f"{int(span[v].mean() * 1000) / 1000} of slots in span")
 
 
 if __name__ == '__main__':
