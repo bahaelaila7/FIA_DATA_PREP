@@ -1699,3 +1699,9 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 | p ≥ 0.7 | 0.85 / 0.88 | 0.23 / 0.24 |
 
   Recall at p ≥ 0.5 by size: under 2 in 0.06–0.08, 2–3 in 0.17–0.21, 3–4 in 0.37–0.38, 4–5 in 0.65–0.69.
+
+**D65 amendment 11 (2026-11-01; user: train on normal and after-move plots together).** There was no need to keep the after-move plots out: five-fold cross-fitting by plot still scores every plot out of fold. Training pairs 56,087 (5,276 true). Calibration out of fold, normal / after: 0.15 → 0.15 / 0.15, 0.35 → 0.35 / 0.35, 0.62 → 0.63 / 0.64, 0.85 → 0.89 / 0.89.
+- Graduated, link probability: 9.0 / 9.2 / 8.4 (unchanged). By size, moved 1.5 / 5.4 / 16.9 / 44.2.
+- Precision normal / after, recall on live graduates: p ≥ 0.3 0.64 / 0.65, 0.49 / 0.48; p ≥ 0.5 0.77 / 0.79, 0.37 / 0.36; p ≥ 0.7 0.87 / 0.87, 0.25 / 0.26.
+- Silent (all numbers hidden; 233,876 pairs, 13,282 true): link probability 7.0 vs after-move plots 6.5 (true 8.2) and normal KY + TN 6.3 (true 7.8).
+- Keep this pooled model. Moved plots are the same plots as the after-move list, so it is also the closest training population.
