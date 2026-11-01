@@ -1684,3 +1684,18 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 20.0 / 47.8; after move 1.7 / 6.0 / 19.7 / 47.7; moved 1.5 / 5.2 / 16.5 / 43.9.
 
 **D65 amendment 9 (2026-11-01; user: include silent re-tally in the table).** Silent moves with a 10–15 yr horizon: 906 saplings on 177 plots (883 KY, 15 GA, 8 TN), 9.4 yr to the next visit against 5.8 in normal plots. None keeps its number even at ≥ 5 in, and 899 have no record at all, so death, cut and survival at the next visit are unknown. The closure-based model does not fit: its first pass gave 1.7, because it had learned that first-interval debuts are never graduates. Refit with all numbers hidden from the start, no visit-gap features, on normal plots out of fold (calibration 0.03 / 0.03, 0.15 / 0.15, 0.35 / 0.35, 0.61 / 0.63, 0.83 / 0.90). Standardised to the silent mix by wood × size, graduated: normal KY + TN true 7.8, relinked 20.2, link probability 6.3; silent relinked 24.8, link probability 6.7.
+
+**D65 amendment 10 (2026-11-01; user: exclude dead graduates from recall). Bug found doing this; corrects am. 6–8.** The hidden-number test added the later records of trees already ≥ 5 in at the next visit to the candidate pool, which a real move would not have (2,880 false pool entries in normal plots, 3,408 after the move). Fixed by restricting the pool to hidden saplings. am. 9 and the am. 5 pseudo-move were built differently and are not affected. Moved-plot relinked values have no such pool and do not change.
+- **Corrected table, % of saplings at A:** graduated relinked 16.6 / 17.0 / 15.6 (was 17.1 / 17.5 / 15.6); link probability 9.0 / 9.2 / 8.4; not graduated relinked 53.6 / 54.2 / 53.6; link probability 61.2 / 62.0 / 60.8.
+- **By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability:** normal 1.6 / 6.4 / 20.1 / 47.5; after move 1.8 / 6.2 / 19.7 / 47.5; moved 1.5 / 5.4 / 16.8 / 44.0.
+- **Hard limits:** 16.6 → 15.3 → 15.2 → 15.2 (normal, true 9.9), precision 0.17 to 0.20.
+- **Accuracy, out of fold on all plots, recall on graduates alive at 5 in (2,410 normal, 2,994 after the move):**
+
+| Method | Precision normal / after | Recall normal / after |
+|---|---|---|
+| Relinked | 0.17 / 0.17 | 0.53 / 0.51 |
+| p ≥ 0.3 | 0.62 / 0.64 | 0.48 / 0.48 |
+| p ≥ 0.5 | 0.76 / 0.80 | 0.35 / 0.35 |
+| p ≥ 0.7 | 0.85 / 0.88 | 0.23 / 0.24 |
+
+  Recall at p ≥ 0.5 by size: under 2 in 0.06–0.08, 2–3 in 0.17–0.21, 3–4 in 0.37–0.38, 4–5 in 0.65–0.69.
