@@ -1535,7 +1535,7 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 
 ## D65 — The "re-tally" at MANUAL 1.0 is a microplot move, not a re-census (diagnostic, 2026-11-01; nothing changed yet)
 - **Finding:** PLOT.MICROPLOT_LOC goes CENTER → OFFSET at the end of MANUAL 1.0 (guide §2.4: the offset center is 12 ft due east of subplot center). All 28,295 MANUAL 1.0 visits are CENTER; no later one is. Saplings after the move stand on different ground.
-- **Coverage:** 13,334 of 13,653 detected breaks (97.7 %) are moves, as are 13,737 visits in total.
+- **Coverage:** of the 13,653 detected breaks with saplings on the old list, 13,334 (97.7 %) are moves; 13,737 such visits are moves in total.
   - 403 moves are not in `procedural_breaks` (1,531 saplings).
   - 319 breaks are not moves (2,385 saplings, 80 % continuing).
 - **Census at moves:** 100,378 old live saplings: 8,201 continue (5,063 past 5 in, 3,138 still saplings, 3.1 % of the old list), 89,259 closed RC8, 2,406 unrecorded. New microplot list 97,583. Circles of 6.8 ft radius 12 ft apart overlap on 4.8 % of their area.
