@@ -1560,3 +1560,15 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - Size-less closure on a plot with sized closures: a soft "gone" signal with label noise. Never hard.
   - Both together: adding only the sized ones would select survivors and bias mortality low over that interval.
   - Stand tables at the seam use one list, never the sum.
+
+**D65 amendment 1 (2026-11-01; user: link saplings that graduate to subplot-level records).** The relinking rejected above was old list to new list. This is a different link, and it works as a constraint.
+- **Why it can work:** the CENTER circle lies inside the 24-ft subplot, and the subplot tally of trees ≥ 5 in continues through the move. A closed sapling that reaches 5 in must reappear as a new number at subplot level.
+- **Measured:** 91,665 closed or unrecorded at moves; 88,415 have a later visit. A same-species subplot debut with growth 0–0.6 in/yr and height not lower by more than 5 ft exists for 29,304 (33 %), and for none of 59,111 (67 %).
+- **Candidate rate, own subplot vs placebo (mean of the plot's other subplots):** sized 36 % vs 20 %, size-less 27 % vs 19 %. Excess about 11,200 trees, an upper bound because species cluster.
+- **Next visit, sized closures:** expected graduates from normal saplings by size class 4,958; excess 4,468. By size it does not line up: excess is too high under 3 in (spatial autocorrelation) and about half of expected at 4 in and over (1,617 of 3,149). The shortfall is unexplained.
+- **One-to-one links are not safe:** 3.25 candidates per tree that has any, 2.35 per debut. Mutual-unique pairs: 4,121 (precision ≈ 0.45); at ≥ 4 in 1,572 (0.59); at ≥ 4.5 in 879 (0.63). With numbers hidden on normal visits, 91.5 % of true graduates pass the band and a unique candidate is right 97.7 % of the time, but 59 % of those passing have a rival debut.
+- **Proposed (not applied):**
+  - No candidate at a later visit: the slot is a below-5-in cutoff, not `ignore`, so the tree stayed under 5 in or died.
+  - Candidates: stays `ignore` at first; later a soft mixture over candidates plus no-graduate.
+  - No tree is renumbered.
+  - Item 2 of D65 keeps the subplot-level 5-in limit before the move; only the microplot-level evidence goes.
