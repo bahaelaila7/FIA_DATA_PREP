@@ -1589,7 +1589,10 @@ con.execute(f"""
 CREATE TEMP TABLE st AS
 SELECT S.CN scn, S.PLT_CN, S.CONDID, S.SPCD, S.DIA, S.AGEDIA, CAST(S.SUBP AS BIGINT) subp_i, S.TREE
 FROM f.SITETREE S JOIN f.PLOT P ON P.CN=S.PLT_CN JOIN f.SURVEY SV ON SV.CN = P.SRV_CN AND SV.ANN_INVENTORY = 'Y'
-WHERE S.AGEDIA > 0 AND {scope('S')}""")
+WHERE S.AGEDIA > 0 AND {scope('S')}
+  -- a row repeating an earlier row's age, DIA and height is carried forward, not a new core: its age is not the age at this visit
+  AND NOT EXISTS (SELECT 1 FROM f.SITETREE E WHERE E.STATECD = S.STATECD AND E.UNITCD = S.UNITCD AND E.COUNTYCD = S.COUNTYCD AND E.PLOT = S.PLOT
+                  AND E.TREE = S.TREE AND E.SPCD = S.SPCD AND E.INVYR < S.INVYR AND E.AGEDIA = S.AGEDIA AND E.DIA = S.DIA AND E.HT = S.HT)""")
 # r7 E28 (investigated): SITETREE.TREE is the SITE-tree number of the condition, not the tally tree
 # number. Of the R4 annual aged site trees with a SUBP, a same-numbered tally tree on the plot has
 # the same species in only 30-60 % (per state) and a DIA within 1 in in ~20 %, so the old "key"
