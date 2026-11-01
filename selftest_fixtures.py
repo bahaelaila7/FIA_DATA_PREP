@@ -108,7 +108,7 @@ def _event_visit_case():
 
 def _full_removal_case():
     r = _Rows()
-    r.add(1, D1, 0, 1000.0, "real", 1, "harvest_explicit", 6.0, D3, True)
+    r.add(1, D1, 0, 1000.0, "real", 1, "silvicultural_death", 6.0, D3, True)
     r.add(9, D1, 0, 700.0, "real", 1, "alive_censored", 8.0)      # another cohort (different birth year) keeps v3 visited
     r.rows[-1]["age_calc"] = 50
     r.add(9, D3, 10, 900.0, "real", 1, "alive_censored", 9.0)

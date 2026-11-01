@@ -16,7 +16,7 @@ Idea (per user spec):
 r7 D41: a removal counts only AT ITS EVENT VISIT. The events come from
 cohorts_landis.disturbance_events — the ONE disturbance definition shared with subp_has_dstrb,
 curated_cohorts and the trajectories' terminal_fate: the tree's first dead / cut record that is a
-cut (harvest_explicit / harvest_inferred) or a disturbance death (AGENTCD 10-50 or a DSTRBCD other
+cut (silvicultural_death / harvest_inferred) or a disturbance death (AGENTCD 10-50 or a DSTRBCD other
 than 0 / 60), or an inferred removal (disappeared_inferred_removal, at the first scaffold visit
 after its last record). NATURAL deaths, censoring, diversions and misrecorded deaths never count.
 r7 D38: a removal whose event record is first_record_dead (a first-seen death) is not counted
@@ -49,7 +49,7 @@ COHORT_SEVERITY_FRAC = 0.40   # cohort-level gate
 APPLY_COHORT_GATE    = False  # toggle the cohort-level gate (test both)
 GF_FLOOR, GF_CEIL    = 0.5, 3.0  # clamp survivor growth factor to sane bounds
 
-DISTURB_FATES = ["dead_disturbance", "harvest_explicit", "harvest_inferred", "disappeared_inferred_removal"]
+DISTURB_FATES = ["dead_disturbance", "silvicultural_death", "harvest_inferred", "disappeared_inferred_removal"]
 NATURAL_FATES = ["dead_natural"]   # diagnostics only: removals count from the D41 events (load)
 
 

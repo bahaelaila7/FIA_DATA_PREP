@@ -1009,7 +1009,7 @@ def classify_tree_fate(df: pl.DataFrame, landuse_exits: pl.DataFrame | None = No
     """
     Classify each tree-measurement's status:
       - alive: STATUSCD=1
-      - harvest_explicit: STATUSCD=3 or (STATUSCD=2 + AGENTCD=80)
+      - silvicultural_death: STATUSCD=3 or (STATUSCD=2 + AGENTCD=80)
       - harvest_inferred: STATUSCD=2 + condition has TRTCD=10 +
             no other tree in the same condition-year has explicit harvest +
             AGENTCD is NULL (r2 M7: a recorded non-harvest agent 10-70 is FIA's own
@@ -1066,7 +1066,7 @@ def classify_tree_fate(df: pl.DataFrame, landuse_exits: pl.DataFrame | None = No
         .when(is_cut & (pl.col("cond_status_cd") != 1).fill_null(False))
             .then(pl.lit("diverted_landuse"))
         .when(is_cut)
-            .then(pl.lit("harvest_explicit"))
+            .then(pl.lit("silvicultural_death"))
         .when(pl.col("STATUSCD") == 2)
             .then(pl.lit("dead_raw"))
         .otherwise(pl.lit("unknown"))
@@ -1075,7 +1075,7 @@ def classify_tree_fate(df: pl.DataFrame, landuse_exits: pl.DataFrame | None = No
 
     # Find condition-years where at least one tree has explicit harvest (first records only)
     explicit_harvest_conds = (
-        df.filter((pl.col("_fate_raw") == "harvest_explicit") & ~pl.col("rerecord_dead"))
+        df.filter((pl.col("_fate_raw") == "silvicultural_death") & ~pl.col("rerecord_dead"))
         .select(COND_KEY)
         .unique()
         .with_columns(pl.lit(True).alias("_cond_has_explicit"))

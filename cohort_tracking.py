@@ -168,7 +168,7 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
     Per-interval events (a tree's FIRST dead/cut record; re-records, misrecorded deaths and,
     r7 D38, first_record_dead records — first-seen deaths, not mortality of the interval — are
     not events):
-      n_harvested        trees with tree_fate in {harvest_explicit, harvest_inferred}
+      n_harvested        trees with tree_fate in {silvicultural_death, harvest_inferred}
       n_disturbance_dead trees with tree_fate == dead under the ONE disturbance definition
                          (r7 D41, cohorts_landis.disturbance_death_expr): AGENTCD 10-50 or a
                          condition DSTRBCD other than 0 / 60

@@ -163,7 +163,7 @@ def _(
         "alive_censored":               ("o", "none"),
         "dead_natural":                 ("v", "full"),
         "dead_disturbance":             ("X", "full"),
-        "harvest_explicit":             ("s", "full"),
+        "silvicultural_death":             ("s", "full"),
         "harvest_inferred":             ("s", "none"),
         "disappeared_inferred_removal": ("D", "none"),
     }

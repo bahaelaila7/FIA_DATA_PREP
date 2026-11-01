@@ -501,7 +501,7 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
     is_dist = pl.col("dist_death_def")   # r7 D41 (cohorts_landis.disturbance_death_expr)
 
     last = last.with_columns(
-        pl.when(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred", "diverted_landuse"]))
+        pl.when(pl.col("tree_fate").is_in(["silvicultural_death", "harvest_inferred", "diverted_landuse"]))
             .then(pl.col("tree_fate"))      # r3 M6: a cut on now-nonforest land = diverted_landuse
         .when((pl.col("STATUSCD") == 2) & is_dist)
             .then(pl.lit("dead_disturbance"))
@@ -557,7 +557,7 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     cut events, r3 I1); r7 D38: a first_record_dead cut (no observed live tree) is not an event.
     """
     cut_rows = (
-        full.filter(pl.col("tree_fate").is_in(["harvest_explicit", "harvest_inferred"])
+        full.filter(pl.col("tree_fate").is_in(["silvicultural_death", "harvest_inferred"])
                     & ~pl.col("rerecord_dead").fill_null(False)
                     & ~pl.col("first_record_dead").fill_null(False))
         .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")

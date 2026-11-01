@@ -175,7 +175,7 @@ def load_base_data(con) -> pl.DataFrame:
 #   * the Sim B drops (cohort_disturbance: a removal counts only at its event visit).
 DISTURBANCE_AGENTS = (10, 20, 30, 40, 50)
 NON_DISTURBANCE_DSTRBCD = (0, 60)
-HARVEST_FATES = ("harvest_explicit", "harvest_inferred")
+HARVEST_FATES = ("silvicultural_death", "harvest_inferred")
 
 
 def disturbance_death_sql(alias: str = "") -> str:
@@ -201,7 +201,7 @@ def disturbance_events(con, states=None) -> pl.DataFrame:
     event_kind, first_record_dead). The event is
       * 'cut' / 'disturbance_death': the tree's FIRST dead / cut record (misrecorded deaths, D26,
         are not records of death; a first record that is a re-record, PREV_STATUS_CD = 2, is not
-        an event: the death preceded the record's interval), with tree_fate harvest_explicit /
+        an event: the death preceded the record's interval), with tree_fate silvicultural_death /
         harvest_inferred, or tree_fate 'dead' under the disturbance definition above. A cut on
         now-nonforest land is 'diverted_landuse' (r3 M6), not a cut event.
       * 'inferred_removal': final_tree_fate 'disappeared_inferred_removal' (alive at the last

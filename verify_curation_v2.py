@@ -926,7 +926,7 @@ o2 AS (SELECT *, (k > 1 OR ps IS NOT DISTINCT FROM 2) rr, (STATUSCD = 3 OR AGENT
 ex AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,INVYR,CONDID FROM o2 WHERE is_cut AND cs = 1 AND NOT rr)
 SELECT o2.*, (k = 1) is_first,
        CASE WHEN is_cut AND cs <> 1 THEN 'diverted_landuse'
-            WHEN is_cut THEN 'harvest_explicit'
+            WHEN is_cut THEN 'silvicultural_death'
             WHEN STATUSCD = 2 AND AGENTCD IS NULL AND NOT rr AND 10 IN (COALESCE(TRTCD1,-1), COALESCE(TRTCD2,-1), COALESCE(TRTCD3,-1))
                  AND ex.PLOT IS NULL THEN 'harvest_inferred'
             ELSE 'dead' END cls
@@ -991,7 +991,7 @@ WHERE g.comp IN ('CUT','MORTALITY','DIVERSION') GROUP BY ALL ORDER BY 1, 3 DESC"
 # ---- r7 D41 / E6 / E8: disturbance events, subp_has_dstrb and the Sim B drops re-derived from raw ----
 # ONE definition (D41): a disturbance death is a death (raw class 'dead') with AGENTCD in
 # {10, 20, 30, 40, 50} or a DSTRBCD1-3 of its condition other than 0 / 60. A tree's removal EVENT
-# is its FIRST dead/cut record when that record is not a re-record and is a cut (harvest_explicit /
+# is its FIRST dead/cut record when that record is not a re-record and is a cut (silvicultural_death /
 # harvest_inferred) or a disturbance death; diversions and natural deaths are not events; a tree
 # that disappeared (final fate disappeared_inferred_removal, D19 DISTURB_FATES) is removed at the
 # first scaffold visit after its last record. Misrecorded deaths (D26) are not records of death.
@@ -1000,12 +1000,12 @@ WHERE g.comp IN ('CUT','MORTALITY','DIVERSION') GROUP BY ALL ORDER BY 1, 3 DESC"
 con.execute("""
 CREATE TEMP TABLE myev AS
 SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, ctree TREE, md ev_md,
-       CASE WHEN cls IN ('harvest_explicit', 'harvest_inferred') THEN 'cut' ELSE 'disturbance_death' END kind
+       CASE WHEN cls IN ('silvicultural_death', 'harvest_inferred') THEN 'cut' ELSE 'disturbance_death' END kind
 FROM rawcls
 WHERE is_first AND NOT rr
   AND NOT EXISTS (SELECT 1 FROM rc7 WHERE rc7.STATECD = rawcls.STATECD AND rc7.UNITCD = rawcls.UNITCD AND rc7.COUNTYCD = rawcls.COUNTYCD
                   AND rc7.PLOT = rawcls.PLOT AND rc7.SUBP = rawcls.SUBP AND rc7.TREE = rawcls.TREE AND rawcls.md < rc7.d7)
-  AND (cls IN ('harvest_explicit', 'harvest_inferred')
+  AND (cls IN ('silvicultural_death', 'harvest_inferred')
       OR (cls = 'dead' AND (COALESCE(AGENTCD IN (10, 20, 30, 40, 50), FALSE) OR COALESCE(DSTRBCD1 NOT IN (0, 60), FALSE)
                             OR COALESCE(DSTRBCD2 NOT IN (0, 60), FALSE) OR COALESCE(DSTRBCD3 NOT IN (0, 60), FALSE))))
 UNION ALL

@@ -27,7 +27,7 @@ NDQ = len(DMG_GROUPS) + 1 + 2 + 3 + 1          # encoder damage channels: groups
 NSUMM = 9
 EV = {'none': 0, 'true_hard': 1, 'false_hard': 2, 'true_soft': 3, 'false_soft': 4}
 MODE = {'cutoff': 0, 'ignore': 1, 'missed': 2, 'interval': 3}
-CUT_FATES = ('harvest_explicit', 'harvest_inferred', 'disappeared_inferred_removal')
+CUT_FATES = ('silvicultural_death', 'harvest_inferred', 'disappeared_inferred_removal')
 
 def ls_dia(lD):
     return 0.5 * torch.log(0.02 ** 2 + (0.06 / torch.exp(lD)) ** 2)
