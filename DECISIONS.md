@@ -1511,3 +1511,8 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 ## D62 — Region 4 only until the pipeline settles (user, 2026-11-01)
 - Forest Explorer's FIA plots layer shrinks from the old table's 48 states to the 8 R4 states, which also removes the pre-fix national rows from the map.
 - **No other region is built** until this pipeline is solid and checked further downstream. Many downstream products will move from bare curation to NIMIWAE-completed data once that work succeeds, so the consumer contracts in `docs/FIA_TRUTH.md` should expect a completed-data source later.
+
+## D63 — Work deferred until after NIMIWAE (user, 2026-11-01)
+- **After NIMIWAE, because some of it moves to completed data:** the interval-product rebuilds for HBAD v2, HBAD3P and HBAD4P, and the genveg table run.
+- **After NIMIWAE:** the Forest Explorer restart; the explorer will move to completed data.
+- **FVS stays on direct FIA for now** (D61): it is calibrated on it.
