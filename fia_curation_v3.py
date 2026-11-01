@@ -352,7 +352,7 @@ def sql_excluded_trees(con, scope: str = ""):
                              non-RC7 records + saplings left UNRECORDED at a break
                              (reason 'procedural_unrecorded')
       tree_landuse_exits     live records on a nonforest/water own condition (M6); r7: one row
-                             per record (CN, PREV_TRE_CN, PREV_STATUS_CD kept)
+                             per record (CN, PREV_STATUS_CD kept)
     r7 D36: tree_status0_events, tree_censor_events and tree_landuse_exits carry TREE_RAW (FIA's
     tree number); their TREE is re-keyed to the post-split tree id in run_pipeline
     (rekey_tree_events), and tree_reconcile_events is rebuilt from the re-keyed events.
@@ -399,15 +399,15 @@ def sql_excluded_trees(con, scope: str = ""):
     # M6: live records on a NONFOREST / WATER own condition (excluded by the live rule): the
     # tree still exists but its land left forest -> terminal fate 'diverted_landuse'.
     # r7 A7-2: ONE ROW PER such record (was: per tree with the FIRST date), so a fate looks for an
-    # exit AFTER the tree's last curated record. r7 D44 (D26 land-use path): CN / PREV_TRE_CN /
-    # PREV_STATUS_CD are kept, so a misrecorded death is matched by the PREV_TRE_CN -> CN link.
+    # exit AFTER the tree's last curated record. r7 D44 (D26 land-use path): CN and
+    # PREV_STATUS_CD are kept, so a misrecorded death is matched by the next record's PREV_STATUS_CD.
     # r7 D36: TREE is re-keyed to the post-split tree id (rekey_tree_events), TREE_RAW = FIA's.
     con.execute(f"""
     DROP TABLE IF EXISTS tree_landuse_exits;
     CREATE TABLE tree_landuse_exits AS
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE,
            MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS exit_measdate,
-           -- r6 D26: this live record is linked back (PREV_TRE_CN) to a dead record (PREV_STATUS_CD 2):
+           -- r6 D26: this live record says its previous record was dead (PREV_STATUS_CD 2):
            -- a misrecorded death whose tree then left forest land
            CASE WHEN T.PREV_STATUS_CD = 2 THEN
                MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15))
@@ -481,27 +481,34 @@ def sql_rc7_withdrawn_visits(con, scope: str = ""):
 
 
 def sql_cond_link(con, scope: str = ""):
-    """D59 / audit F1: conditions across visits. CONDID is per visit ("can change at remeasurement",
-    guide §2.5.8), so the only cross-visit link is FIA's SUBP_COND_CHNG_MTRX (§2.9; SUBPTYP = 1, the
-    subplot). That table has no natural key columns: each row is resolved to natural ids at both ends
-    and kept only if both are product visits of the SAME canonical plot and both conditions exist.
-    cond_link: (plot key, CONDID, MEASDATE) <- (PREV_CONDID, PREV_MEASDATE), prop = subplot proportions."""
+    """D59 / audit F1, D67: conditions across visits. CONDID is per visit ("can change at remeasurement",
+    guide §2.5.8), so the link comes from the trees: TREE.PREVCOND names the condition a remeasured tree
+    stood on at the plot's previous visit. Both visits must be product visits of the same canonical plot
+    and both conditions must exist. A condition with no remeasured tree has no link.
+    cond_link: (plot key, CONDID, INVYR) <- (PREV_CONDID, PREV_INVYR), prop = remeasured trees on the link."""
     con.execute(f"""
     DROP TABLE IF EXISTS cond_link;
     CREATE TABLE cond_link AS
-    SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, CAST(M.CONDID AS BIGINT) AS CONDID, V.MEASDATE,
-           CAST(M.PREVCOND AS BIGINT) AS PREV_CONDID, V0.MEASDATE AS PREV_MEASDATE, sum(M.SUBPTYP_PROP_CHNG) AS prop,
-           V.INVYR, V0.INVYR AS PREV_INVYR
-    FROM SUBP_COND_CHNG_MTRX M
-    JOIN PLOT P ON P.CN = M.PLT_CN
-    JOIN PLOT O ON O.CN = M.PREV_PLT_CN
-    JOIN product_visits V ON {dbconn.nk('V', 'P')}
-    JOIN product_visits V0 ON {dbconn.nk('V0', 'O')}
-    JOIN COND C ON {dbconn.nk('C', 'P')} AND C.CONDID = M.CONDID
-    JOIN COND C0 ON {dbconn.nk('C0', 'O')} AND C0.CONDID = M.PREVCOND
-    WHERE M.SUBPTYP = 1 AND M.SUBPTYP_PROP_CHNG > 0 AND V0.MEASDATE < V.MEASDATE
-      AND P.UNITCD = O.UNITCD AND P.COUNTYCD = O.COUNTYCD AND P.PLOT = O.PLOT {scope}
-    GROUP BY ALL ORDER BY ALL
+    WITH pv AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR,
+                       lag(INVYR) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY INVYR) AS PREV_INVYR
+                FROM PLOT),
+    tl AS (SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR, pv.PREV_INVYR,
+                  CAST(T.CONDID AS BIGINT) AS CONDID, CAST(T.PREVCOND AS BIGINT) AS PREV_CONDID, count(*) AS n
+           FROM TREE T JOIN pv ON pv.STATECD = T.STATECD AND pv.UNITCD = T.UNITCD AND pv.COUNTYCD = T.COUNTYCD
+                AND pv.PLOT = T.PLOT AND pv.INVYR = T.INVYR
+           WHERE T.PREVCOND IS NOT NULL AND T.PREV_STATUS_CD IS NOT NULL {scope.replace('P.', 'T.')}
+           GROUP BY ALL)
+    SELECT tl.STATECD, tl.UNITCD, tl.COUNTYCD, tl.PLOT, tl.CONDID, V.MEASDATE, tl.PREV_CONDID, V0.MEASDATE AS PREV_MEASDATE,
+           CAST(tl.n AS DOUBLE) AS prop, V.INVYR, V0.INVYR AS PREV_INVYR
+    FROM tl
+    JOIN product_visits V ON {dbconn.nk('V', 'tl')}
+    JOIN product_visits V0 ON V0.STATECD = tl.STATECD AND V0.UNITCD = tl.UNITCD AND V0.COUNTYCD = tl.COUNTYCD
+         AND V0.PLOT = tl.PLOT AND V0.INVYR = tl.PREV_INVYR
+    JOIN COND C ON {dbconn.nk('C', 'tl')} AND C.CONDID = tl.CONDID
+    JOIN COND C0 ON C0.STATECD = tl.STATECD AND C0.UNITCD = tl.UNITCD AND C0.COUNTYCD = tl.COUNTYCD
+         AND C0.PLOT = tl.PLOT AND C0.INVYR = tl.PREV_INVYR AND C0.CONDID = tl.PREV_CONDID
+    WHERE V0.MEASDATE < V.MEASDATE
+    ORDER BY ALL
     """)
     print(f"[step2c] cond_link: {con.execute('SELECT count(*) FROM cond_link').fetchone()[0]:,} condition links")
 
@@ -557,7 +564,7 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
         T.CN,
         CSY.MEASDATE, CSY.CYCLE,
         T.CONDID, T.STATUSCD, T.RECONCILECD, T.AGENTCD,
-        T.PREV_STATUS_CD AS prev_status_cd, CAST(T.PREV_TRE_CN AS VARCHAR) AS prev_tre_cn,
+        T.PREV_STATUS_CD AS prev_status_cd,
         T.SPCD, T.SPGRPCD, SP.STOCKING_SPGRPCD, SP.JENKINS_SPGRPCD,
         T.DIA, T.HT, T.ACTUALHT, T.CR, T.CCLCD,
         T.DRYBIO_AG, T.CARBON_AG, T.TPA_UNADJ,
@@ -671,11 +678,10 @@ def lineage_break_visits(con, st: int) -> pl.DataFrame:
 def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.DataFrame:
     """
     r3 M3 — tree-number reuse. A tree key (STATECD..SUBP, TREE) can be re-used for a new tree,
-    e.g. a dead tree's number given to a new RC1 tree. Following the PREV_TRE_CN chain, a record
-    starts a NEW tree when the key's previous record (in this table)
-      * was dead/cut and this record's PREV_TRE_CN is NULL, or
-      * is a different CN than this record's PREV_TRE_CN, or
-      * r7 D36 (A7-1): this record's PREV_TRE_CN is NULL and its RECONCILECD is a new-tree code
+    e.g. a dead tree's number given to a new RC1 tree. A remeasured tree carries PREV_STATUS_CD,
+    so a record starts a NEW tree when the key has a previous record (in this table) and
+      * that record was dead/cut and this record has no PREV_STATUS_CD, or
+      * r7 D36 (A7-1): this record has no PREV_STATUS_CD and its RECONCILECD is a new-tree code
         (NEW_TREE_RC: 1 ingrowth / 2 through-growth / 3 missed live / 4 missed dead), whatever the
         previous record's status (a live predecessor used to merge two physically different
         trees: species relabelled, ages and cohorts mixed, censoring lost).
@@ -690,8 +696,7 @@ def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.Data
         pl.col("STATUSCD").shift(1).over(TREE_ID, order_by="MEASDATE").alias("_pst"),
         pl.col("MEASDATE").shift(1).over(TREE_ID, order_by="MEASDATE").alias("_pmd"),
     ])
-    # D59: FIA records PREV_STATUS_CD on a remeasured tree; a same-number record without one is a new
-    # tree (equals the CN link on all 2.76M same-number successors of the 8 states)
+    # D59: FIA records PREV_STATUS_CD on a remeasured tree; a same-number record without one is a new tree
     no_link = pl.col("prev_status_cd").is_null()
     r_dead = no_link & pl.col("_pst").is_in([2, 3])
     r_newrc = no_link & pl.col("RECONCILECD").cast(pl.Int32).is_in(list(NEW_TREE_RC))
@@ -1286,9 +1291,9 @@ def detect_condition_resets(df: pl.DataFrame, link: pl.DataFrame):
     TRTCD 10 alone (a partial cut), including at a condition's first visit, is NOT a reset, and
     neither is an STDAGE drop without the loss (STDAGE re-estimation).
 
-    D59 / audit F1 (replaces D40): the predecessor comes from cond_link (FIA's change matrix), never
-    from CONDID equality. A previous condition's trees are shared among its successors by area
-    (prop), so re-delineation, splits and merges need no special case. The STDAGE of the predecessor
+    D59 / audit F1 (replaces D40), D67: the predecessor comes from cond_link (TREE.PREVCOND), never
+    from CONDID equality. A previous condition's trees are shared among its successors by the number
+    of remeasured trees on each link (prop), so re-delineation, splits and merges need no special case. The STDAGE of the predecessor
     is that of the largest link.
 
     Returns (reset_flag, reset_reasons, first_reset): the first two keyed by COND_ID + INVYR;
@@ -2550,7 +2555,7 @@ FIX_COLUMNS = [
     "censor_reconcilecd", "censor_reason", "spgrpcd_resolved", "final_tree_fate",
     "censor_last_measdate", "censor_last_reconcilecd", "censor_last_reason",
     "dead_at_first_visit", "estage_mapped", "age_domain",
-    "rerecord_dead", "tree_key_split", "prev_status_cd", "prev_tre_cn",
+    "rerecord_dead", "tree_key_split", "prev_status_cd",
     "age_stratum", "unitcd_raw", "countycd_raw", "plot_raw",          # r5 M-5 / M-2
     "misrecorded_death",                                               # r6 R4
     "first_record_dead", "all_live_withdrawn_rc7",                     # r7 D38 / D39
@@ -2610,12 +2615,12 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
                 [",".join(str(int(x)) for x in sorted(states)) if states else None,
                  ",".join(f"{int(a)}:{int(b)}" for a, b in sorted(counties)) if counties else None,
                  uuid.uuid4().hex, _dt.datetime.now().replace(microsecond=0)])
-    # r6: the plot-key remaps (M-2, PREV_PLT_CN renumbers; reason 'prev_plt_cn') and the plot
+    # r6: the plot-key remaps (M-2, D67: found from tree records; reason 'tree_evidence') and the plot
     # locations (D28) of this run, for reports and the verifier (r8 D48: no coordinate links /
     # duplicate visits any more)
     con.execute("CREATE OR REPLACE TABLE plot_key_remap AS SELECT * FROM plot_canon_map ORDER BY ALL")
     con.execute("CREATE OR REPLACE TABLE plot_location AS SELECT * FROM plot_loc_visit")
-    # D59: identity provenance. plot_renumber = every key-changing FIA link with its tree evidence;
+    # D59: identity provenance. plot_renumber = every key change found from tree records (D67);
     # id_quarantine = rows excluded because CN and natural id disagree (views in dbconn)
     con.execute("CREATE OR REPLACE TABLE plot_renumber AS SELECT * FROM TEMP.plot_renumber ORDER BY ALL")
     nq = dbconn.write_id_quarantine(con, dbconn.state_filter(states, col="t.STATECD"))

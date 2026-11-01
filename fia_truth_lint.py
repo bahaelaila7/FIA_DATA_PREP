@@ -5,15 +5,16 @@
   L4 no row-order logic;
   L5 no time arithmetic on INVYR;
   L6 no date as a key (D69): MEASDATE and its derivatives order records and measure time, they never join or group them.
-Allowed: sql_cond_link (SUBP_COND_CHNG_MTRX has no natural key columns), dbconn's PREV_PLT_CN chain and the CN
-validation in its views, and verify_curation_v2 (it uses FIA's CN links on purpose, as an independent check)."""
+  L7 no pipeline stage reads FIA's CN links (PREV_PLT_CN, PREV_TRE_CN, SUBP_COND_CHNG_MTRX): D67.
+Allowed: the CN validation in dbconn's views, the TreeAge load by CN, fia_truth_assemble's conversion of raw CNs to natural ids
+(cn-boundary), and verify_curation_v2, which uses FIA's CN links on purpose, as an independent check."""
 import re, sys, os, argparse
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STAGES = ["fia_curation_v3.py", "age_imputation.py", "cohort_tracking.py", "cohorts_landis.py", "build_tree_trajectories.py", "cohorts_landis2.py",
           "build_stdorg.py", "cohorts_landis_simB.py", "attach_disturbance_simB.py", "cohort_disturbance.py", "export_reference_tables.py",
-          "fia_truth_assemble.py", "trees_fvs.py", "nimiwae_prep.py"]
+          "fia_truth_assemble.py", "trees_fvs.py", "nimiwae_prep.py", "dbconn.py"]
 JOIN = re.compile(r"\b\w+\.(PLT_CN|CN|TRE_CN|PREV_PLT_CN|PREV_TRE_CN|SRV_CN)\s*=\s*(CAST\()?\w*\.?\w+|=\s*\w+\.(PLT_CN|TRE_CN|SRV_CN)\b", re.I)
-ALLOW_BLOCK = {"fia_curation_v3.py": ("def sql_cond_link", "def sql_product_visits")}
+ALLOW_BLOCK = {}
 
 
 def scan(path, name, findings):
@@ -44,6 +45,8 @@ def scan(path, name, findings):
                 or re.search(r"USING\s*\([^)]*\bmeasdate\b", s, re.I)
                 or re.search(r"PARTITION BY [^)]*\bmeasdate\b", s.split(" ORDER BY")[0], re.I)):
             findings.append(f"L6 {name}:{i}: {ln.strip()[:110]}")
+        if name != "fia_truth_assemble.py" and "cn-boundary" not in ln and not ln.lstrip().startswith("#") and re.search(r"\b(PREV_PLT_CN|PREV_TRE_CN|SUBP_COND_CHNG_MTRX)\b", ln) and '"""' not in ln:
+            findings.append(f"L7 {name}:{i}: {ln.strip()[:110]}")
         # COND_ID (plot key + CONDID) is a condition only together with its visit
         if re.search(r"(over|group_by|shift|partition_by)\(\s*(COND_ID|cond_id_cols)\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
             findings.append(f"L2 {name}:{i}: {ln.strip()[:110]}")

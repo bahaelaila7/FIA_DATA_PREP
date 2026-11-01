@@ -108,12 +108,23 @@ def parse_states(s) -> list[int] | None:
 
 def build_plot_canon_map(con, max_iter: int = 50) -> int:
     """r5 M-2: a few FIA plots change their (UNITCD, COUNTYCD, PLOT) key between annual visits
-    (e.g. GA 13/2/87 146 -> 45 -> 146; most are county corrections). The PREV_PLT_CN chain links
-    the visits. Each annual plot visit is mapped to the CANONICAL key = the key at its chain's
-    FIRST ANNUAL visit (the chain is followed only through annual-inventory plots).
+    (e.g. GA 13/2/87 146 -> 45 -> 146; most are county corrections). Each annual plot visit is
+    mapped to the CANONICAL key = the key at its chain's FIRST ANNUAL visit.
 
-    r8 D48: identity uses FIA's own links only. The r6 D29 coordinate links (and the D35 / D37
-    layers built on them) are removed: coordinates are fuzzed and species is unreliable.
+    D67 (user: natural ids, no CNs): the chain is built from natural ids and tree records alone.
+    A visit's predecessor is the same key's previous annual visit, unless tree evidence says the
+    plot arrived from another key (TEMP plot_renumber):
+      * the visit is an orphan: its trees' PREVDIA do not match its own key's previous visit, of
+        any inventory type (fewer than RENUM_MIN_SHARE agree, of at least RENUM_MIN_PAIRS trees);
+      * a candidate is a visit of another key in the state with the same (SUBP, TREE) and PREVDIA =
+        its DIA on >= RENUM_MIN_SHARE of the orphan's trees, at least RENUM_MIN_PAIRS of them, earlier
+        by date and by INVYR, and after the orphan key's own previous annual visit;
+      * a plot is in one key at a time: the candidate's key is not visited again before the
+        orphan's key last is (two keys visited side by side are two plots);
+      * the link must be one-to-one. A tie is reported and left unlinked.
+    FIA's own plot links are not read here; the verifier compares the result with them.
+
+    r8 D48: no coordinate links (coordinates are fuzzed, species is unreliable).
 
     r6 R7 (D28): the plot's LOCATION comes from its MOST RECENT annual visit (later records carry
     FIA's coordinate / county corrections; Pan uses one location per plot). TEMP plot_loc_visit
@@ -121,46 +132,62 @@ def build_plot_canon_map(con, max_iter: int = 50) -> int:
     LAT/LON/ELEV and raw key (the PLOT view and data_plot_eco use it). Identity stays the
     first-visit key.
 
-    D59 (user: do not trust CN keys): the natural id is the identity. PREV_PLT_CN is only FIA's
-    CLAIM that a visit whose key changed continues another key; it is accepted only when the trees
-    agree on natural ids (TEMP plot_renumber: the same (SUBP, TREE) on both visits, PREVDIA = the
-    earlier DIA on >= RENUM_MIN_SHARE of >= RENUM_MIN_PAIRS trees). A rejected claim leaves two plots.
-
     TEMP plot_canon_map holds ONLY the visits whose key changes:
       CN (attribute only), UNITCD/COUNTYCD/PLOT (canonical), *_RAW (as recorded), INVYR,
-      reason ('prev_plt_cn': a renumber along the PREV_PLT_CN chain).
+      reason ('tree_evidence').
     Returns the plot_canon_map row count."""
     con.execute("""CREATE OR REPLACE TEMP VIEW ANNUAL_INV AS
         SELECT DISTINCT STATECD, INVYR FROM fia.main.SURVEY WHERE ANN_INVENTORY = 'Y' AND P3_OZONE_IND = 'N'""")
-    # the natural visit id; PREV_PLT_CN is read once, here, as FIA's claim about which visit came before (D66)
     VID = "CAST({a}.STATECD AS VARCHAR) || '_' || CAST({a}.UNITCD AS VARCHAR) || '_' || CAST({a}.COUNTYCD AS VARCHAR) || '_' || CAST({a}.PLOT AS VARCHAR) || '_' || CAST({a}.INVYR AS VARCHAR)"
+    K = "STATECD, UNITCD, COUNTYCD, PLOT"
     con.execute(f"""CREATE OR REPLACE TEMP TABLE _canon_ap AS
-        WITH ap AS (SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.LAT, P.LON, P.ELEV,
+        WITH ap AS (SELECT P.CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.LAT, P.LON, P.ELEV,
                            MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON, 0), 6) AS BIGINT),
                                      CAST(COALESCE(NULLIF(P.MEASDAY, 0), 15) AS BIGINT)) AS md
                     FROM fia.main.PLOT P JOIN ANNUAL_INV A ON A.STATECD = P.STATECD AND A.INVYR = P.INVYR)
-        SELECT a.CN, a.STATECD, a.UNITCD, a.COUNTYCD, a.PLOT, a.INVYR, a.LAT, a.LON, a.ELEV, a.md, {VID.format(a='a')} AS vid,
-               {VID.format(a='b')} AS prev_vid
-        FROM ap a LEFT JOIN ap b ON b.CN = a.PREV_PLT_CN   -- cn-boundary""")
+        SELECT a.*, {VID.format(a='a')} AS vid,
+               lag({VID.format(a='a')}) OVER w AS prev_vid, lag(a.md) OVER w AS prev_md, lead(a.md) OVER w AS next_md,
+               max(a.md) OVER (PARTITION BY a.STATECD, a.UNITCD, a.COUNTYCD, a.PLOT) AS last_md
+        FROM ap a WINDOW w AS (PARTITION BY a.STATECD, a.UNITCD, a.COUNTYCD, a.PLOT ORDER BY a.INVYR)""")
+    # the previous visit of ANY inventory type: a first annual visit has a periodic predecessor
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE _canon_any AS
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, lag(INVYR) OVER (PARTITION BY {K} ORDER BY INVYR) AS pinv
+        FROM fia.main.PLOT""")
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE _canon_s AS
+        SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR, T.SUBP, T.TREE, T.PREVDIA
+        FROM fia.main.TREE T JOIN _canon_ap a USING ({K}, INVYR)
+        WHERE T.PREVDIA IS NOT NULL AND T.PREV_STATUS_CD IS NOT NULL""")
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE _canon_orphan AS
+        SELECT s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.INVYR, count(*) AS nt
+        FROM _canon_s s JOIN _canon_any v USING ({K}, INVYR)
+        LEFT JOIN fia.main.TREE o ON o.STATECD = s.STATECD AND o.UNITCD = s.UNITCD AND o.COUNTYCD = s.COUNTYCD
+             AND o.PLOT = s.PLOT AND o.INVYR = v.pinv AND o.SUBP = s.SUBP AND o.TREE = s.TREE
+        GROUP BY ALL
+        HAVING count(*) >= {RENUM_MIN_PAIRS}
+           AND count(*) FILTER (WHERE abs(s.PREVDIA - o.DIA) <= 0.05) < {RENUM_MIN_SHARE} * count(*)""")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE plot_renumber AS
-        WITH e AS (SELECT a.CN, a.vid, a.STATECD, a.UNITCD, a.COUNTYCD, a.PLOT, a.INVYR, a.md,
-                          b.UNITCD AS UNITCD_PREV, b.COUNTYCD AS COUNTYCD_PREV, b.PLOT AS PLOT_PREV, b.INVYR AS INVYR_PREV
-                   FROM _canon_ap a JOIN _canon_ap b ON b.vid = a.prev_vid
-                   WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS DISTINCT FROM (b.UNITCD, b.COUNTYCD, b.PLOT)),
-        t AS (SELECT e.vid, count(*) AS n_pairs, count(*) FILTER (WHERE abs(x.PREVDIA - o.DIA) <= 0.05) AS n_prevdia_ok,
-                     count(*) FILTER (WHERE x.SPCD = o.SPCD) AS n_same_spcd
-              FROM e JOIN fia.main.TREE x ON x.STATECD = e.STATECD AND x.UNITCD = e.UNITCD AND x.COUNTYCD = e.COUNTYCD
-                          AND x.PLOT = e.PLOT AND x.INVYR = e.INVYR
-                     JOIN fia.main.TREE o ON o.STATECD = e.STATECD AND o.UNITCD = e.UNITCD_PREV AND o.COUNTYCD = e.COUNTYCD_PREV
-                          AND o.PLOT = e.PLOT_PREV AND o.INVYR = e.INVYR_PREV AND o.SUBP = x.SUBP AND o.TREE = x.TREE
-              WHERE x.PREVDIA IS NOT NULL GROUP BY 1)
-        SELECT e.* EXCLUDE (vid), COALESCE(t.n_pairs, 0) AS n_pairs, COALESCE(t.n_prevdia_ok, 0) AS n_prevdia_ok, COALESCE(t.n_same_spcd, 0) AS n_same_spcd,
-               COALESCE(t.n_pairs >= {RENUM_MIN_PAIRS} AND t.n_prevdia_ok >= {RENUM_MIN_SHARE} * t.n_pairs, FALSE) AS accepted, e.vid
-        FROM e LEFT JOIN t USING (vid)""")
+        WITH x AS (SELECT s.*, o.nt, a.CN, a.vid, a.md, a.prev_md, a.last_md
+                   FROM _canon_s s JOIN _canon_orphan o USING ({K}, INVYR) JOIN _canon_ap a USING ({K}, INVYR)),
+        e AS (SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR, T.SUBP, T.TREE, T.DIA, a.md, a.next_md, a.vid
+              FROM fia.main.TREE T JOIN _canon_ap a USING ({K}, INVYR) WHERE T.DIA IS NOT NULL),
+        h AS (SELECT x.CN, x.vid, x.STATECD, x.UNITCD, x.COUNTYCD, x.PLOT, x.INVYR, x.md, x.nt,
+                     e.UNITCD AS UNITCD_PREV, e.COUNTYCD AS COUNTYCD_PREV, e.PLOT AS PLOT_PREV, e.INVYR AS INVYR_PREV,
+                     e.vid AS prev_vid, count(*) AS n_prevdia_ok
+              FROM x JOIN e ON e.STATECD = x.STATECD AND e.SUBP = x.SUBP AND e.TREE = x.TREE
+                   AND abs(x.PREVDIA - e.DIA) <= 0.05 AND e.INVYR < x.INVYR AND e.md < x.md
+                   AND (x.prev_md IS NULL OR x.prev_md < e.md) AND (e.next_md IS NULL OR e.next_md > x.last_md)
+              WHERE (e.UNITCD, e.COUNTYCD, e.PLOT) IS DISTINCT FROM (x.UNITCD, x.COUNTYCD, x.PLOT)
+              GROUP BY ALL HAVING count(*) >= {RENUM_MIN_PAIRS} AND count(*) >= {RENUM_MIN_SHARE} * x.nt)
+        SELECT h.* EXCLUDE (nt), h.nt AS n_pairs,
+               count(*) OVER (PARTITION BY h.vid) = 1 AND count(*) OVER (PARTITION BY h.prev_vid) = 1 AS accepted
+        FROM h""")
+    ties = con.execute("SELECT count(*) FROM plot_renumber WHERE NOT accepted").fetchone()[0]
+    if ties:
+        print(f"[dbconn] plot_renumber: {ties} tied candidate links left unlinked")
     def _roots(tab: str):
         con.execute("""CREATE OR REPLACE TEMP TABLE _canon_prev AS
-            SELECT a.vid, CASE WHEN COALESCE(r.accepted, TRUE) THEN a.prev_vid END AS prev
-            FROM _canon_ap a LEFT JOIN plot_renumber r ON r.vid = a.vid""")
+            SELECT a.vid, COALESCE(r.prev_vid, a.prev_vid) AS prev
+            FROM _canon_ap a LEFT JOIN plot_renumber r ON r.vid = a.vid AND r.accepted""")
         con.execute(f"CREATE OR REPLACE TEMP TABLE {tab} AS SELECT a.vid, a.vid AS root FROM _canon_ap a")
         for _ in range(max_iter):
             n = con.execute(f"""SELECT count(*) FROM {tab} r JOIN _canon_prev p ON p.vid = r.root
@@ -171,11 +198,11 @@ def build_plot_canon_map(con, max_iter: int = 50) -> int:
                 SELECT r.vid, COALESCE(p.prev, r.root) AS root FROM {tab} r JOIN _canon_prev p ON p.vid = r.root""")
         sys.exit("[dbconn] plot chain did not terminate (cycle?)")
 
-    _roots("_canon_root")          # chains by FIA's links only (r8 D48), on natural visit ids
+    _roots("_canon_root")
     con.execute("""CREATE OR REPLACE TEMP TABLE plot_canon_map AS
         SELECT a.CN, a.vid, a.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
                a.UNITCD AS UNITCD_RAW, a.COUNTYCD AS COUNTYCD_RAW, a.PLOT AS PLOT_RAW, a.INVYR,
-               'prev_plt_cn' AS reason
+               'tree_evidence' AS reason
         FROM _canon_root r JOIN _canon_ap a ON a.vid = r.vid JOIN _canon_ap o ON o.vid = r.root
         WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS DISTINCT FROM (o.UNITCD, o.COUNTYCD, o.PLOT)""")
     # D28: one location per plot = its most recent annual visit (chains with a remapped visit)
@@ -196,7 +223,7 @@ def build_plot_canon_map(con, max_iter: int = 50) -> int:
                              GROUP BY ALL HAVING count(*) > 1)""").fetchone()[0]
     if dup:
         sys.exit(f"[dbconn] canonical plot keys collide on {dup} plot-INVYRs")
-    con.execute("DROP TABLE _canon_ap; DROP TABLE _canon_root; DROP TABLE _canon_prev")
+    con.execute("DROP TABLE _canon_ap; DROP TABLE _canon_any; DROP TABLE _canon_s; DROP TABLE _canon_orphan; DROP TABLE _canon_root; DROP TABLE _canon_prev")
     return con.execute("SELECT count(*) FROM plot_canon_map").fetchone()[0]
 
 
@@ -242,7 +269,7 @@ def connect(out_db: str, fiadb: str, curated_db: str | None = None) -> duckdb.Du
                        "AND lv.COUNTYCD_RAW = t.COUNTYCD AND lv.PLOT_RAW = t.PLOT AND lv.INVYR = t.INVYR")
             # D59: a row whose natural key names no plot, or whose PLT_CN disagrees with it, is quarantined
             # (write_id_quarantine); it never reaches a stage (bahaelaila7/FIA_DATA_PREP#1)
-            qf = (f"WHERE EXISTS (SELECT 1 FROM fia.main.PLOT q WHERE {nk('q', 't')} AND q.CN = t.PLT_CN)"
+            qf = (f"WHERE EXISTS (SELECT 1 FROM fia.main.PLOT q WHERE {nk('q', 't')} AND q.CN = t.PLT_CN)"   # cn-boundary: the load check
                   if t in QUARANTINED else "")
             con.execute(f"""CREATE TEMP VIEW "{t}" AS SELECT t.* REPLACE ({rep})
                 FROM fia.main."{t}" t LEFT JOIN plot_canon_map m ON m.STATECD = t.STATECD AND m.UNITCD_RAW = t.UNITCD
@@ -291,7 +318,7 @@ def write_id_quarantine(con, scope: str = "") -> int:
                         CASE WHEN bool_or(EXISTS (SELECT 1 FROM fia.main.PLOT q WHERE {nk('q', 't')}))
                              THEN 'plt_cn_is_another_plot' ELSE 'natural_key_names_no_plot' END AS reason
                  FROM fia.main."{t}" t
-                 WHERE NOT EXISTS (SELECT 1 FROM fia.main.PLOT q WHERE {nk('q', 't')} AND q.CN = t.PLT_CN) {scope}
+                 WHERE NOT EXISTS (SELECT 1 FROM fia.main.PLOT q WHERE {nk('q', 't')} AND q.CN = t.PLT_CN) {scope}   -- cn-boundary: the load check
                  GROUP BY ALL""" for t in QUARANTINED]
     con.execute("DROP TABLE IF EXISTS id_quarantine")
     con.execute("CREATE TABLE id_quarantine AS " + " UNION ALL ".join(parts))

@@ -36,7 +36,7 @@ for ct in a.counties.split(","):
                 ca = [x for x in ca if x not in ("run_id", "created_at")]
             miss = [x for x in ca if x not in cb]
             if miss:
-                bad.append(f"{n} lost columns {miss}"); continue
+                bad.append(f"{n} lost columns {miss}"); ca = [x for x in ca if x in cb]
             extra = [x for x in cb if x not in ca]
             if extra:
                 added[n] = extra

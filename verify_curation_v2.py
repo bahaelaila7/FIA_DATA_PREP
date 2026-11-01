@@ -1805,6 +1805,16 @@ SELECT count(*), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM zdead z WHERE z.ST
        AND z.COUNTYCD=br.countycd AND z.PLOT=br.plot AND z.SUBP=br.subp AND z.TREE=br.tree AND z.zmd > br.p AND z.zmd <= br.n)) FROM br""").fetchone()
 if r[0]:
     check("(n3) E18: no gap-interpolated slot at / across a dead or cut record of the tree", r[1] == 0, f"({r[1]} of {r[0]:,} gap slots)")
+# D67: the curation finds condition links from TREE.PREVCOND; FIA's change matrix is the independent check
+_cl = [r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE database_name='new' AND table_name='cond_link'").fetchall()]
+if "PREV_INVYR" in _cl:
+    r = con.execute(f"""WITH m AS (SELECT P.STATECD, P.INVYR, P.PLOT, P.COUNTYCD, P.UNITCD, M.CONDID, M.PREVCOND, O.INVYR PI FROM fraw.main.SUBP_COND_CHNG_MTRX M
+                                   JOIN fraw.main.PLOT P ON P.CN = M.PLT_CN JOIN fraw.main.PLOT O ON O.CN = M.PREV_PLT_CN
+                                   WHERE M.SUBPTYP = 1 AND M.SUBPTYP_PROP_CHNG > 0 AND {scope('P')} GROUP BY ALL),
+        c AS (SELECT * FROM new.cond_link WHERE {scope()})
+        SELECT count(*), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM m WHERE m.STATECD = c.STATECD AND m.UNITCD = c.UNITCD AND m.COUNTYCD = c.COUNTYCD
+                  AND m.PLOT = c.PLOT AND m.INVYR = c.INVYR AND m.CONDID = c.CONDID AND m.PREVCOND = c.PREV_CONDID AND m.PI = c.PREV_INVYR)) FROM c""").fetchone()
+    info("(D67) cond_link rows (TREE.PREVCOND) also in FIA's SUBP_COND_CHNG_MTRX", f"({r[1]:,} of {r[0]:,})")
 # D69: a visit is (plot, INVYR); its date is a timestamp. One date per visit, dates follow INVYR, no tree twice in a visit
 r = con.execute(f"""WITH v AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, count(DISTINCT MEASDATE) nd, min(MEASDATE) d0, max(MEASDATE) d1
                                FROM new.curated_trees WHERE {scope()} GROUP BY ALL),
@@ -1950,19 +1960,19 @@ SELECT count(*) FILTER (WHERE (ct.UNITCD,ct.COUNTYCD,ct.PLOT) IS DISTINCT FROM (
        count(DISTINCT (ct.STATECD,ct.UNITCD,ct.COUNTYCD,ct.PLOT)) FILTER (WHERE (ct.PLOT, ct.COUNTYCD, ct.UNITCD) <> (ct.plot_raw, ct.countycd_raw, ct.unitcd_raw))
 FROM new.curated_trees ct JOIN f.TREE ft ON CAST(ft.CN AS VARCHAR) = CAST(ct.CN AS VARCHAR)
 JOIN fraw.main.TREE rt ON rt.CN = ft.CN AND rt.STATECD = ft.STATECD WHERE {scope('ct')} AND {scope('ft')}""").fetchone()
-check("(n6) M-2: curated plot keys = canonical keys (PREV_PLT_CN chain), *_raw = as recorded", r[0] == 0 and r[1] == 0,
+check("(n6) M-2, D67: curated plot keys (found from tree records) = canonical keys by FIA's PREV_PLT_CN chain, *_raw = as recorded", r[0] == 0 and r[1] == 0,
       f"({r[0]} key / {r[1]} raw-key mismatches; {r[2]:,} records on {r[3]} renumbered plots remapped)")
 # r8 D48: the coordinate-link layer is removed — no link / relink / duplicate-visit artefact remains
 _pkr = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE database_name='new' AND table_name='plot_key_remap'").fetchall()}
 r = con.execute(f"""SELECT
     (SELECT count(*) FROM new.tree_censor_events WHERE reason = 'procedural_relink'),
     (SELECT count(*) FROM new.procedural_breaks WHERE break_kind = 'coord_link'),
-    (SELECT count(*) FROM new.plot_key_remap WHERE {"reason IS DISTINCT FROM 'prev_plt_cn'" if "reason" in _pkr else "FALSE"}
+    (SELECT count(*) FROM new.plot_key_remap WHERE {"reason IS DISTINCT FROM 'tree_evidence'" if "reason" in _pkr else "FALSE"}
             AND {scope()}),   -- (plot_key_remap is national: the run's scope only)
     (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'new' AND table_name = 'plot_key_coord_links')""").fetchone()
 check("(n6) D48: no coordinate-link artefacts (procedural_relink censorings, coord_link breaks, coord_link / duplicate_visit "
       "remaps, plot_key_coord_links)", r == (0, 0, 0, 0) and "kept_cn" not in _pkr,
-      f"(relink censorings {r[0]}, coord_link breaks {r[1]}, non-prev_plt_cn remaps {r[2]}, plot_key_coord_links {r[3]}, "
+      f"(relink censorings {r[0]}, coord_link breaks {r[1]}, remaps of another kind {r[2]}, plot_key_coord_links {r[3]}, "
       f"kept_cn column {'present' if 'kept_cn' in _pkr else 'absent'})")
 # every raw annual visit's records are in the views (no visit is dropped as a duplicate any more)
 r = con.execute(f"""SELECT count(*) FROM fraw.main.TREE T JOIN fraw.main.PLOT P ON P.CN = T.PLT_CN
@@ -1974,14 +1984,14 @@ check("(n6) D48: the canonical views drop no raw annual TREE record (no duplicat
 # n7 (suspected, not confirmed in r5): tree-number splits through a dropped STATUSCD 0 record
 # without evidence of a different tree (same species, no DIA drop, no dead/cut record before)
 r = con.execute(f"""
-WITH s AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE, CN, prev_tre_cn, SPCD, DIA, STATUSCD,
+WITH s AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE, CN, SPCD, DIA, STATUSCD,
              lag(STATUSCD) OVER w pst, lag(SPCD) OVER w psp, lag(DIA) OVER w pdia, TREE // 100000 sg
            FROM new.curated_trees WHERE tree_key_split AND {scope()}
            WINDOW w AS (PARTITION BY STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE % 100000 ORDER BY MEASDATE)),
 f1 AS (SELECT * FROM s WHERE sg > 0 QUALIFY row_number() OVER (PARTITION BY STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE ORDER BY CN) = 1)
 SELECT count(*), count(*) FILTER (WHERE T.STATUSCD = 0), count(*) FILTER (WHERE T.STATUSCD = 0 AND COALESCE(f1.pst,1) NOT IN (2,3)
        AND f1.SPCD = f1.psp AND NOT (f1.DIA < f1.pdia - 1))
-FROM f1 LEFT JOIN fraw.main.TREE T ON CAST(T.CN AS VARCHAR) = f1.prev_tre_cn""").fetchone()
+FROM f1 LEFT JOIN fraw.main.TREE R ON CAST(R.CN AS VARCHAR) = f1.CN LEFT JOIN fraw.main.TREE T ON T.CN = R.PREV_TRE_CN""").fetchone()
 # r7 E13: D21 says act if this is ever > 0, so it is enforced
 check("(n7) tree-number splits linked through a STATUSCD 0 record WITHOUT evidence of a different tree = 0", r[2] == 0,
       f"(segments {r[0]} / linked through a STATUSCD 0 record {r[1]} / of those without evidence {r[2]})")
