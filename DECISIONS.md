@@ -1744,3 +1744,9 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
   - `fia_truth_lint.py` gains L4 (no `keep=`, no unordered shift or cumulative window, no bare `.first()` in an aggregate, no row index) and catches `cond_id_cols`.
   - `fia_order_test.py`: steps 1–10 on a county, plain vs loaded trees shuffled and every table rewritten in random order after each step. GA 13:87 and KY 21:175: all 40 tables identical.
 - **Consequence:** age-model bootstrap draws change with the id, so model ages move slightly. Full R4 rebuild goes to a separate folder and through the verifier before it replaces the truth DB.
+
+**D66 amendment 1 (2026-11-01): full R4 rebuild with the revision, in `FIA/truth/r4_ids`; the live truth DB is unchanged.**
+- **Verifier:** 213 passed, 0 failed, same 4 KNOWN cells within the drift guard ((j) FL 15+ −5.0, KY 5–10 −4.5). Full-region determinism was not rerun.
+- **Against the current `FIA/truth/r4`:** curated_trees has the same 4,496,120 records and keys, same columns. Only age columns change, plus 12 last-bit floats in `subp_forest_subpcond_prop` (1e-16), a float sum still to round. Live model ages move 0.48 yr on average (−0.12 signed, 5.6 at most), from the new draws. Sim A rows −4,712 (−0.12 %), trajectories −4,688, Sim B −36, cohort_disturbance −6. Plot renumbering and remaps are identical.
+- **`docs/RETALLY_AUDIT.json` final:** shuffled and plain runs byte-identical, with tree ids and no sorting. Relinked 16.4 / 16.9 / 15.6; probability 8.8 / 9.0 / 8.3. Accuracy normal / after: relinked 0.20 / 0.19, recall 0.60 / 0.58; p ≥ 0.3 0.63 / 0.64, 0.44 / 0.44; p ≥ 0.5 0.76 / 0.78, 0.33 / 0.33; p ≥ 0.7 0.87 / 0.86, 0.22 / 0.23. All inputs: average precision 0.629 / 0.620, p ≥ 0.7 0.88 / 0.88, recall 0.24 / 0.25. Silent unchanged. These replace the accuracy figures of D65 am. 12–13.
+- **Next:** the closure fix (D65) needs another rebuild, so the live DB is replaced once, with both.
