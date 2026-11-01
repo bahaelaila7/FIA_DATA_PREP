@@ -72,6 +72,7 @@ External datasets keyed by CN (TreeMap, TreeAge) are resolved once at the bounda
 | Pan BS, HBAD, PnET | tiny-budget nested-CV smoke, fold k1, through test | All 41 steps complete |
 | Forest Explorer plots layer | real loader, summary, points and 3 plot trajectories | Works; 36,313 plots |
 | Harvest models | `build_dataset.py`, `build_model3.py` | Build |
+| NIMIWAE | `nimiwae_prep.py` (`--scheme r3`) from the truth DB, then `nimiwae56_verify.py` | 64 / 64; same 6,985,700 slots, 1,703,185 trees, plot splits and damage coverage as `d54c`; about 3.2 h. Data in `FIA/nimiwae_r8/truth_v1` |
 | Genveg | 21 of 22 FIA queries planned against the DB | Resolve; the `table` stage has not been run |
 | TreeAge, climate, fold and volume tools | queries planned against the DB | Resolve; not run |
 
