@@ -901,8 +901,8 @@ def apply_age_model(df: pl.DataFrame,
                                                   alive_w_dia["DIA"].to_numpy()))
     raw    = np.asarray(raw).clip(1.0, 999.0)
 
-    # Build candidates: TREE_ID + MEASDATE + src_age (raw prediction)
-    candidates = alive_w_dia.select(TREE_ID + ["MEASDATE"]).with_columns(
+    # Build candidates: TREE_ID + MEASDATE + INVYR + src_age (raw prediction)
+    candidates = alive_w_dia.select(TREE_ID + ["MEASDATE", "INVYR"]).with_columns(
         pl.Series("src_age", raw, dtype=pl.Float64)
     )
 

@@ -178,7 +178,7 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
     live_agg = (
         live
         .with_columns((pl.col("DRYBIO_AG") * pl.col("TPA_UNADJ")).alias("_bio"))
-        .group_by(["cohort_id", "MEASDATE"])
+        .group_by(["cohort_id", "INVYR"])
         .agg([
             pl.len().alias("n_trees_live"),
             pl.col("_bio").sum().round(6).alias("biomass_per_acre"),          # D66: rounded, so a float sum does not carry the row order
@@ -202,31 +202,30 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
 
     harvest_agg = (
         dead.filter(pl.col("tree_fate").is_in(["silvicultural_death", "harvest_inferred"]))
-        .group_by(["cohort_id", "MEASDATE"])
+        .group_by(["cohort_id", "INVYR"])
         .agg(pl.len().alias("n_harvested"))
     )
 
     disturbance_death_agg = (
         dead.filter((pl.col("tree_fate") == "dead") & disturbed_cond)
-        .group_by(["cohort_id", "MEASDATE"])
+        .group_by(["cohort_id", "INVYR"])
         .agg(pl.len().alias("n_disturbance_dead"))
     )
 
     # ---- Scaffold: all (cohort, year) pairs with any tree activity ----
     scaffold = (
         pl.concat([
-            live.select(["cohort_id", "MEASDATE"]),
-            dead.select(["cohort_id", "MEASDATE"]),
+            live.select(["cohort_id", "INVYR", "MEASDATE"]),
+            dead.select(["cohort_id", "INVYR", "MEASDATE"]),
         ])
         .unique()
-        .sort(["cohort_id", "MEASDATE"])
     )
 
     meas = (
         scaffold
-        .join(live_agg,              on=["cohort_id", "MEASDATE"], how="left")
-        .join(harvest_agg,           on=["cohort_id", "MEASDATE"], how="left")
-        .join(disturbance_death_agg, on=["cohort_id", "MEASDATE"], how="left")
+        .join(live_agg,              on=["cohort_id", "INVYR"], how="left")
+        .join(harvest_agg,           on=["cohort_id", "INVYR"], how="left")
+        .join(disturbance_death_agg, on=["cohort_id", "INVYR"], how="left")
         .with_columns([
             pl.col("n_trees_live").fill_null(0),
             pl.col("biomass_per_acre").fill_null(0.0),
@@ -273,18 +272,19 @@ def check_tree_continuity(df: pl.DataFrame, age_tol: float = 0.5) -> int:
        that is handled by the backfill in cohorts_landis.py.
     """
     subp_prev = (
-        df.select(SUBPLOT_ID + ["MEASDATE"])
+        df.select(SUBPLOT_ID + ["INVYR", "MEASDATE"])
         .unique()
         .with_columns(
             pl.col("MEASDATE").shift(1).over(SUBPLOT_ID, order_by="MEASDATE").alias("prev_measdate"),
+            pl.col("INVYR").shift(1).over(SUBPLOT_ID, order_by="MEASDATE").alias("prev_invyr"),
         )
     )
 
     live = (
         df.filter(pl.col("STATUSCD") == 1)
         .join(
-            subp_prev.select(SUBPLOT_ID + ["MEASDATE", "prev_measdate"]),
-            on=SUBPLOT_ID + ["MEASDATE"],
+            subp_prev.select(SUBPLOT_ID + ["INVYR", "prev_measdate", "prev_invyr"]),
+            on=SUBPLOT_ID + ["INVYR"],
             how="left",
         )
         .with_columns(
@@ -300,10 +300,9 @@ def check_tree_continuity(df: pl.DataFrame, age_tol: float = 0.5) -> int:
     # Previous alive visit per tree
     prev_alive = (
         df.filter(pl.col("STATUSCD") == 1)
-        .select(TREE_ID + ["MEASDATE", pl.col("estimated_age").alias("prev_estimated_age")])
-        .rename({"MEASDATE": "prev_measdate"})
+        .select(TREE_ID + [pl.col("INVYR").alias("prev_invyr"), pl.col("estimated_age").alias("prev_estimated_age")])
     )
-    live = live.join(prev_alive, on=TREE_ID + ["prev_measdate"], how="left")
+    live = live.join(prev_alive, on=TREE_ID + ["prev_invyr"], how="left")
 
     # First-ever record per tree (any STATUSCD)
     tree_first = (
@@ -430,7 +429,7 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
 # Standalone entry point
 # =============================================================================
 
-LOAD_COLS = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "estimated_age", "DRYBIO_AG",
+LOAD_COLS = TREE_ID + ["MEASDATE", "INVYR", "STATUSCD", "tree_fate", "estimated_age", "DRYBIO_AG",
                        "TPA_UNADJ", "AGENTCD", "DSTRBCD1", "DSTRBCD2", "DSTRBCD3",
                        "TRTCD1", "TRTCD2", "TRTCD3", "cond_stdorgcd", "rerecord_dead",
                        "misrecorded_death", "first_record_dead"]

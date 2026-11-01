@@ -224,7 +224,7 @@ def _sql_procedural_breaks(con, scope: str = ""):
               LEAD(MANUAL) OVER w AS next_manual, LEAD(PLOT_STATUS_CD) OVER w AS next_ps
     FROM _pv WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY MEASDATE);
     CREATE OR REPLACE TEMP TABLE _retally_saplings AS
-    SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, v.MEASDATE, v.next_md,
+    SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, v.MEASDATE, v.next_md, v.next_invyr,
            v.MANUAL AS prev_manual, v.next_manual, (T2.TREE IS NULL) AS unrecorded,
            T2.STATUSCD AS next_statuscd, CAST(T2.RECONCILECD AS INTEGER) AS next_rc
     FROM TREE T
@@ -250,15 +250,15 @@ def _sql_procedural_breaks(con, scope: str = ""):
     DROP TABLE IF EXISTS procedural_breaks;
     CREATE TABLE procedural_breaks AS
     WITH rc8 AS (
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE,
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, ANY_VALUE(MEASDATE) AS MEASDATE,
                COUNT(*) AS n_closed_rc8,
                COUNT(*) FILTER (WHERE PREVDIA < 5) AS n_closed_rc8_prev_sapling
-        FROM tree_status0_events WHERE RC = 8 GROUP BY ALL),
+        FROM tree_status0_events WHERE RC = 8 GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, INVYR),
     pv AS (
-        SELECT s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.next_md AS MEASDATE,
+        SELECT s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.next_invyr AS INVYR, ANY_VALUE(s.next_md) AS MEASDATE,
                ANY_VALUE(s.prev_manual) AS prev_manual, ANY_VALUE(s.next_manual) AS next_manual,
                COUNT(*) AS n_prev_saplings, COUNT(*) FILTER (WHERE s.unrecorded) AS n_unrecorded_saplings
-        FROM _retally_saplings s GROUP BY s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.next_md),
+        FROM _retally_saplings s GROUP BY s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.next_invyr),
     unrec AS (
         SELECT pv.*,
                CASE WHEN pv.n_unrecorded_saplings >= {RETALLY_MIN_N}
@@ -276,20 +276,21 @@ def _sql_procedural_breaks(con, scope: str = ""):
            COALESCE(u.n_prev_saplings, 0) AS n_prev_saplings,
            COALESCE(u.n_unrecorded_saplings, 0) AS n_unrecorded_saplings,
            u.detect_tier,
-           CASE WHEN r.PLOT IS NOT NULL THEN 'rc8' ELSE 'unrecorded' END AS break_kind
+           CASE WHEN r.PLOT IS NOT NULL THEN 'rc8' ELSE 'unrecorded' END AS break_kind,
+           COALESCE(r.INVYR, u.INVYR) AS INVYR
     FROM rc8 r
     FULL JOIN (SELECT * FROM unrec WHERE detect_tier IS NOT NULL) u
       ON u.STATECD=r.STATECD AND u.UNITCD=r.UNITCD AND u.COUNTYCD=r.COUNTYCD
-     AND u.PLOT=r.PLOT AND u.MEASDATE=r.MEASDATE
+     AND u.PLOT=r.PLOT AND u.INVYR=r.INVYR
     """)
     # an rc8 break plot-visit also needs its unrecorded-sapling count (they are censored too)
     con.execute("""
     UPDATE procedural_breaks b SET n_prev_saplings = pv.n, n_unrecorded_saplings = pv.u
-    FROM (SELECT STATECD, UNITCD, COUNTYCD, PLOT, next_md, COUNT(*) n,
+    FROM (SELECT STATECD, UNITCD, COUNTYCD, PLOT, next_invyr, COUNT(*) n,
                  COUNT(*) FILTER (WHERE unrecorded) u
           FROM _retally_saplings GROUP BY ALL) pv
     WHERE b.break_kind = 'rc8' AND pv.STATECD=b.STATECD AND pv.UNITCD=b.UNITCD
-      AND pv.COUNTYCD=b.COUNTYCD AND pv.PLOT=b.PLOT AND pv.next_md=b.MEASDATE
+      AND pv.COUNTYCD=b.COUNTYCD AND pv.PLOT=b.PLOT AND pv.next_invyr=b.INVYR
     """)
 
 
@@ -382,14 +383,14 @@ def sql_excluded_trees(con, scope: str = ""):
     SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE, RC,
            CASE RC WHEN 5 THEN 'shrank' WHEN 6 THEN 'moved' WHEN 8 THEN 'procedural'
                    WHEN 9 THEN 'nonsampled' ELSE 'not_in_sample' END AS reason,
-           TREE AS TREE_RAW
+           TREE AS TREE_RAW, INVYR
     FROM tree_status0_events WHERE RC IS DISTINCT FROM 7
     UNION ALL
     SELECT s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.SUBP, s.TREE, s.next_md, NULL,
-           'procedural_unrecorded', s.TREE
+           'procedural_unrecorded', s.TREE, s.next_invyr
     FROM _retally_saplings s
     JOIN procedural_breaks b ON b.STATECD=s.STATECD AND b.UNITCD=s.UNITCD
-         AND b.COUNTYCD=s.COUNTYCD AND b.PLOT=s.PLOT AND b.MEASDATE=s.next_md
+         AND b.COUNTYCD=s.COUNTYCD AND b.PLOT=s.PLOT AND b.INVYR=s.next_invyr
     WHERE s.unrecorded
     """)
     # r8 D48: the coordinate-link layer (D29 links, D35 procedural_relink censoring and the
@@ -489,7 +490,8 @@ def sql_cond_link(con, scope: str = ""):
     DROP TABLE IF EXISTS cond_link;
     CREATE TABLE cond_link AS
     SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, CAST(M.CONDID AS BIGINT) AS CONDID, V.MEASDATE,
-           CAST(M.PREVCOND AS BIGINT) AS PREV_CONDID, V0.MEASDATE AS PREV_MEASDATE, sum(M.SUBPTYP_PROP_CHNG) AS prop
+           CAST(M.PREVCOND AS BIGINT) AS PREV_CONDID, V0.MEASDATE AS PREV_MEASDATE, sum(M.SUBPTYP_PROP_CHNG) AS prop,
+           V.INVYR, V0.INVYR AS PREV_INVYR
     FROM SUBP_COND_CHNG_MTRX M
     JOIN PLOT P ON P.CN = M.PLT_CN
     JOIN PLOT O ON O.CN = M.PREV_PLT_CN
@@ -1250,7 +1252,7 @@ def propagate_totage(df: pl.DataFrame,
     """
     sources = (
         df.filter(pl.col("TOTAGE").is_not_null())
-        .select(TREE_ID + ["MEASDATE",
+        .select(TREE_ID + ["MEASDATE", "INVYR",
                             pl.col("TOTAGE").cast(pl.Float64).alias("src_age")])
     )
 
@@ -1289,58 +1291,59 @@ def detect_condition_resets(df: pl.DataFrame, link: pl.DataFrame):
     (prop), so re-delineation, splits and merges need no special case. The STDAGE of the predecessor
     is that of the largest link.
 
-    Returns (reset_flag, reset_reasons, first_reset): the first two keyed by COND_ID + MEASDATE;
+    Returns (reset_flag, reset_reasons, first_reset): the first two keyed by COND_ID + INVYR;
     first_reset gives each condition-visit the earliest reset along its largest links (a condition
     that split off an untouched part does not inherit the reset of the other part).
     """
     COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
+    CV = COND_ID + ["INVYR"]            # a condition-visit's natural id (D69)
     live = pl.col("STATUSCD") == 1
     dfb = df.with_columns((pl.col("DIA").pow(2) * 0.005454 * pl.col("TPA_UNADJ")).alias("_ba"))
     cv = (
-        dfb.group_by(COND_ID + ["MEASDATE"])
+        dfb.group_by(CV)
         .agg([
+            pl.col("MEASDATE").max().alias("MEASDATE"),         # one value per visit
             pl.col("cond_stdage").max().alias("cond_stdage"),   # one value per condition-visit
             live.sum().alias("n_live"),
             pl.col("_ba").filter(live).sum().alias("ba_live"),
             pl.any_horizontal([pl.col(c) == 10 for c in ("TRTCD1", "TRTCD2", "TRTCD3")]).any().alias("cut"),
             pl.any_horizontal([pl.col(c).is_in([30, 40]) for c in ("TRTCD1", "TRTCD2", "TRTCD3")]).any().alias("regen"),
         ])
-        .sort(COND_ID + ["MEASDATE"])
     )
     PLOT_KEY = ["STATECD", "UNITCD", "COUNTYCD", "PLOT"]
-    link = link.with_columns([pl.col(c).cast(cv.schema[c]) for c in COND_ID]).with_columns(
-        pl.col("PREV_CONDID").cast(cv.schema["CONDID"]))
-    prev_keys = PLOT_KEY + ["PREV_CONDID", "PREV_MEASDATE"]
+    link = link.with_columns([pl.col(c).cast(cv.schema[c]) for c in CV]).with_columns(
+        pl.col("PREV_CONDID").cast(cv.schema["CONDID"]), pl.col("PREV_INVYR").cast(cv.schema["INVYR"]))
+    prev_keys = PLOT_KEY + ["PREV_CONDID", "PREV_INVYR"]
     lk = (link.with_columns((pl.col("prop") / pl.col("prop").sum().over(prev_keys)).alias("_share"))
-          .join(cv.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("MEASDATE").alias("PREV_MEASDATE"),
+          .join(cv.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("INVYR").alias("PREV_INVYR"),
                                       pl.col("cond_stdage").alias("_pstd"), pl.col("n_live").alias("_pn"), pl.col("ba_live").alias("_pba")]),
                 on=prev_keys, how="inner"))
-    prev = lk.group_by(COND_ID + ["MEASDATE"]).agg(
+    prev = lk.group_by(CV).agg(
         (pl.col("_share") * pl.col("_pn")).sum().alias("_prev_n"),
         (pl.col("_share") * pl.col("_pba")).sum().alias("_prev_ba"),
         pl.col("_pstd").sort_by(["prop", "PREV_CONDID"], descending=[True, False]).first().alias("_prev_stdage"))
-    cv = cv.join(prev, on=COND_ID + ["MEASDATE"], how="left").with_columns(
+    cv = cv.join(prev, on=CV, how="left").with_columns(
         (((pl.col("_prev_n") > 0) & (pl.col("n_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
          ((pl.col("_prev_ba") > 0) & (pl.col("ba_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
         .fill_null(False).alias("_loss"))
     drop = (pl.col("_prev_stdage").is_not_null() & pl.col("cond_stdage").is_not_null()
             & (pl.col("cond_stdage") < pl.col("_prev_stdage")))
     parts = [
-        cv.filter(drop & pl.col("_loss")).select(COND_ID + ["MEASDATE"]).with_columns(pl.lit("stdage_drop_with_loss").alias("reset_reason")),
-        cv.filter(pl.col("cut") & pl.col("regen")).select(COND_ID + ["MEASDATE"]).with_columns(pl.lit("cut_with_regen").alias("reset_reason")),
-        cv.filter(pl.col("cut") & pl.col("_loss")).select(COND_ID + ["MEASDATE"]).with_columns(pl.lit("cut_with_loss").alias("reset_reason")),
+        cv.filter(drop & pl.col("_loss")).select(CV).with_columns(pl.lit("stdage_drop_with_loss").alias("reset_reason")),
+        cv.filter(pl.col("cut") & pl.col("regen")).select(CV).with_columns(pl.lit("cut_with_regen").alias("reset_reason")),
+        cv.filter(pl.col("cut") & pl.col("_loss")).select(CV).with_columns(pl.lit("cut_with_loss").alias("reset_reason")),
     ]
     all_resets = pl.concat(parts)
-    reset_reasons = (all_resets.group_by(COND_ID + ["MEASDATE"])
+    reset_reasons = (all_resets.group_by(CV)
                      .agg(pl.col("reset_reason").unique().sort().alias("reset_reasons")))
-    reset_flag = reset_reasons.select(COND_ID + ["MEASDATE"]).unique().with_columns(pl.lit(True).alias("is_reset"))
+    reset_flag = reset_reasons.select(CV).unique().with_columns(pl.lit(True).alias("is_reset"))
     # forward along each condition-visit's largest link
-    dom = pick(link, COND_ID + ["MEASDATE"], ["prop", "PREV_CONDID"], descending=[True, False])
-    fr = reset_flag.select(COND_ID + ["MEASDATE", pl.col("MEASDATE").alias("first_reset")])
+    dom = pick(link, CV, ["prop", "PREV_CONDID"], descending=[True, False])
+    fr = reset_flag.join(cv.select(CV + [pl.col("MEASDATE").alias("first_reset")]), on=CV, how="left").select(CV + ["first_reset"])
     for _ in range(32):
-        nxt = (dom.join(fr.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("MEASDATE").alias("PREV_MEASDATE"), "first_reset"]),
-                        on=prev_keys, how="inner").select(COND_ID + ["MEASDATE", "first_reset"]))
-        new = (pl.concat([fr, nxt]).group_by(COND_ID + ["MEASDATE"]).agg(pl.col("first_reset").min()))
+        nxt = (dom.join(fr.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("INVYR").alias("PREV_INVYR"), "first_reset"]),
+                        on=prev_keys, how="inner").select(CV + ["first_reset"]))
+        new = (pl.concat([fr, nxt]).group_by(CV).agg(pl.col("first_reset").min()))
         if new.height == fr.height and new["first_reset"].cast(pl.Int64).sum() == fr["first_reset"].cast(pl.Int64).sum():
             break
         fr = new
@@ -1380,19 +1383,14 @@ def assign_stdage(df: pl.DataFrame,
     reset_flag, reset_reasons, first_reset = detect_condition_resets(df, cond_link)
 
     # Attach per-measurement-date reset flag
-    df = df.join(
-        reset_flag.rename({"MEASDATE": "_reset_measdate"}),
-        left_on=COND_ID + ["MEASDATE"],
-        right_on=COND_ID + ["_reset_measdate"],
-        how="left",
-    ).with_columns(pl.col("is_reset").fill_null(False))
+    df = df.join(reset_flag, on=COND_ID + ["INVYR"], how="left").with_columns(pl.col("is_reset").fill_null(False))
 
     # D59 / audit F1: a reset belongs to the ground a tree stands on, and no condition id persists,
     # so the date is read per TREE: the earliest reset over its own condition-visits (each carrying
     # first_reset along its links). cond_ever_reset = such a date exists.
     tree_first_reset = (
-        df.select(TREE_ID + COND_ID[-1:] + ["MEASDATE"]).join(
-            first_reset, on=COND_ID + ["MEASDATE"], how="inner")
+        df.select(TREE_ID + COND_ID[-1:] + ["INVYR"]).join(
+            first_reset, on=COND_ID + ["INVYR"], how="inner")
         .group_by(TREE_ID).agg(pl.col("first_reset").min().alias("stdage_cond_first_reset_measdate"))
     )
     df = df.join(tree_first_reset, on=TREE_ID, how="left").with_columns(
@@ -1511,7 +1509,7 @@ def assign_stdage(df: pl.DataFrame,
             pl.col("cond_stdage").is_not_null() &
             (pl.col("cond_stdage") > 0)
         )
-        .select(TREE_ID + ["MEASDATE", "cond_stdorgcd",
+        .select(TREE_ID + ["MEASDATE", "INVYR", "cond_stdorgcd",
                             pl.col("cond_stdage").cast(pl.Float64).alias("src_age")])
     )
 
@@ -1521,9 +1519,9 @@ def assign_stdage(df: pl.DataFrame,
     anchor_meta = (
         cand_std
         .join(
-            anchors_std.select(TREE_ID + ["anchor_date"]),
-            left_on=TREE_ID + ["MEASDATE"],
-            right_on=TREE_ID + ["anchor_date"],
+            anchors_std.select(TREE_ID + ["anchor_invyr"]),
+            left_on=TREE_ID + ["INVYR"],
+            right_on=TREE_ID + ["anchor_invyr"],
             how="inner",
         )
         .select(TREE_ID + [
@@ -1605,8 +1603,8 @@ def assign_stdage(df: pl.DataFrame,
                 pl.col("age_from_stdage").is_not_null() &
                 (pl.col("stdage_context") == "confirmed_reset")
             )
-            .select(COND_ID + ["MEASDATE"]).unique()
-            .join(reset_reasons, on=COND_ID + ["MEASDATE"], how="left")
+            .select(COND_ID + ["INVYR"]).unique()
+            .join(reset_reasons, on=COND_ID + ["INVYR"], how="left")
         )
         # Explode reset_reasons and count
         reason_counts = (
@@ -1775,6 +1773,7 @@ def _select_best_anchor(candidates: pl.DataFrame,
         )
         .select(TREE_ID + [
             pl.col("MEASDATE").alias("anchor_date"),
+            pl.col("INVYR").alias("anchor_invyr"),
             pl.col("anchor_age"),
             pl.col("src_age").cast(pl.Float64).alias("anchor_src_age"),
             pl.col("min_shift"),
@@ -1954,17 +1953,7 @@ def anchor_estage(df: pl.DataFrame, cand_est: pl.DataFrame,
     anchors_est = _select_best_anchor(cand_est, tree_bounds, apply_min_shift=True)
 
     # Retrieve INVYR at anchor date for the diagnostic column
-    anchor_invyr = (
-        cand_est
-        .join(
-            anchors_est.select(TREE_ID + ["anchor_date"]),
-            left_on=TREE_ID + ["MEASDATE"],
-            right_on=TREE_ID + ["anchor_date"],
-            how="inner",
-        )
-        .select(TREE_ID + ["INVYR"])
-        .rename({"INVYR": "estage_anchor_invyr"})
-    )
+    anchor_invyr = anchors_est.select(TREE_ID + [pl.col("anchor_invyr").alias("estage_anchor_invyr")])
 
     df = df.join(
         anchors_est.select(TREE_ID + ["anchor_date", "anchor_age", "anchor_src_age"])
@@ -2165,7 +2154,7 @@ def build_snapshots(df: pl.DataFrame, scaffold: pl.DataFrame) -> pl.DataFrame:
             (pl.col("DRYBIO_AG") * pl.col("TPA_UNADJ")).alias("biomass_contrib")
         )
         .group_by(
-            SUBPLOT_INVYR + ["MEASDATE", "SPCD", "SPGRPCD",
+            SUBPLOT_INVYR + ["SPCD", "SPGRPCD",
                              "estimated_age", "age_source"]
         )
         .agg([
@@ -2197,7 +2186,7 @@ def build_snapshots(df: pl.DataFrame, scaffold: pl.DataFrame) -> pl.DataFrame:
     # Subplot-years with trees: join scaffold + tree_agg (one-to-many on species/age)
     snapshots_with = (
         scaffold.join(subp_years_with_trees, on=SUBPLOT_INVYR, how="semi")
-        .join(tree_agg, on=SUBPLOT_INVYR + ["MEASDATE"], how="left")
+        .join(tree_agg, on=SUBPLOT_INVYR, how="left")
         .join(fate_agg, on=SUBPLOT_INVYR, how="left")
     )
 

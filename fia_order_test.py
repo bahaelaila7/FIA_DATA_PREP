@@ -5,6 +5,7 @@
 Runs steps 1-10 on a county twice: once normally, once with the loaded trees shuffled and every table rewritten in a random order after each step.
 All tables of both runs must be identical (EXCEPT ALL both ways). Exits 1 on any difference."""
 import sys, os, subprocess, argparse, shutil
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import duckdb
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -12,7 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def chain(a, tag, seed=None):
     d = os.path.join(a.work, tag); shutil.rmtree(d, ignore_errors=True); os.makedirs(d)
     env = dict(os.environ, PY=sys.executable, FIADB=a.fiadb, FIA_CURATED_DB=f"{d}/curated.duckdb", FIA_SIMB_DB=f"{d}/simB.duckdb", FIA_ESTAGE_DIR=a.estage_dir,
-               FIA_STATES=a.counties.split(":")[0], FIA_COUNTIES=a.counties, TO_STEP="10", FIA_DUCKDB_THREADS="4", FIA_DUCKDB_MEMORY="8GB", POLARS_MAX_THREADS="4")
+               FIA_STATES=a.counties.split(":")[0], FIA_COUNTIES=a.counties, TO_STEP=getattr(a, "to_step", "10"), FIA_DUCKDB_THREADS="4", FIA_DUCKDB_MEMORY="8GB", POLARS_MAX_THREADS="4")
     env.pop("FIA_SHUFFLE_SEED", None)
     if seed is not None:
         env["FIA_SHUFFLE_SEED"] = str(seed)
