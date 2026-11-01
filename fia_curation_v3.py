@@ -141,8 +141,9 @@ def sql_clean_subplot_years(con):
     CREATE TABLE clean_subplot_years AS
     SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE,
            BOOL_OR(COND_STATUS_CD = 3)                                   AS has_cond_status3,
-           SUM(CASE WHEN COND_STATUS_CD = 1 THEN SUBPCOND_PROP ELSE 0 END) AS forest_subpcond_prop,
-           SUM(CASE WHEN COND_STATUS_CD = 1 THEN MICRCOND_PROP ELSE 0 END) AS forest_micrcond_prop
+           -- rounded: a float sum depends on the summation order (thread count)
+           ROUND(SUM(CASE WHEN COND_STATUS_CD = 1 THEN SUBPCOND_PROP ELSE 0 END), 9) AS forest_subpcond_prop,
+           ROUND(SUM(CASE WHEN COND_STATUS_CD = 1 THEN MICRCOND_PROP ELSE 0 END), 9) AS forest_micrcond_prop
     FROM base_subplot_cond
     GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE
     """)
