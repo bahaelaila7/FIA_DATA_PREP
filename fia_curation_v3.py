@@ -212,7 +212,9 @@ RETALLY_TRANS_MIN_N = 20
 # D65 am. 2: an RC8 closure of a tree alive at the previous visit is one of three things. With AGENTCD the crew
 # recorded it dead or cut (a dead / cut record, AGENTCD 80 -> removed); with a size it was alive and measured
 # (its size is kept in tree_status0_events, the tree is censored); with neither it is unknown (censored).
-CLOSURE_DEAD = "(T.STATUSCD = 0 AND T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 AND COALESCE(T.AGENTCD, 0) > 0)"
+# Only on a sampled condition: a closure on a nonsampled subplot (COND_STATUS_CD 5) stays censored.
+CLOSURE_DEAD = ("(T.STATUSCD = 0 AND T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 AND COALESCE(T.AGENTCD, 0) > 0 "
+                "AND C.COND_STATUS_CD IN (1, 2, 3, 4))")
 
 
 def _sql_procedural_breaks(con, scope: str = ""):
@@ -395,7 +397,7 @@ def sql_excluded_trees(con, scope: str = ""):
            T.TREE AS TREE_RAW, CAST(T.CN AS VARCHAR) AS CN, T.SPCD,
            T.DIA, T.HT, T.ACTUALHT, T.TPA_UNADJ, T.TREECLCD, T.AGENTCD,
            CASE WHEN T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 THEN
-                CASE WHEN COALESCE(T.AGENTCD, 0) > 0 THEN 'dead_cut' WHEN T.DIA IS NOT NULL THEN 'sized' ELSE 'unknown' END
+                CASE WHEN {CLOSURE_DEAD} THEN 'dead_cut' WHEN T.DIA IS NOT NULL THEN 'sized' ELSE 'unknown' END
            END AS closure_kind
     FROM TREE T
     JOIN PLOT P ON P.STATECD = T.STATECD AND P.UNITCD = T.UNITCD AND P.COUNTYCD = T.COUNTYCD AND P.PLOT = T.PLOT AND P.INVYR = T.INVYR

@@ -465,11 +465,11 @@ WHERE (nu >= 3 AND nu >= 0.5 * n)
                            AND rb.COUNTYCD = pvv.COUNTYCD AND rb.PLOT = pvv.PLOT AND rb.ry = pvv.ny))""")
 _ub = con.execute("""SELECT (SELECT count(*) FROM ub),
     (SELECT count(*) FROM (SELECT STATECD,UNITCD,COUNTYCD,PLOT,MEASDATE FROM new.procedural_breaks
-                           WHERE break_kind='unrecorded' OR n_unrecorded_saplings > 0
+                           WHERE break_kind <> 'move' AND (break_kind='unrecorded' OR n_unrecorded_saplings > 0)
                            EXCEPT SELECT STATECD,UNITCD,COUNTYCD,PLOT,bd FROM ub)),
     (SELECT count(*) FROM (SELECT STATECD,UNITCD,COUNTYCD,PLOT,bd FROM ub
                            EXCEPT SELECT STATECD,UNITCD,COUNTYCD,PLOT,MEASDATE FROM new.procedural_breaks
-                           WHERE break_kind='unrecorded' OR n_unrecorded_saplings > 0))""").fetchone()
+                           WHERE break_kind <> 'move' AND (break_kind='unrecorded' OR n_unrecorded_saplings > 0)))""").fetchone()
 check("(b) raw re-tally candidate set = pipeline procedural_breaks (unrecorded part; r7 E13: enforced)",
       _ub[1] == 0 and _ub[2] == 0, f"(raw {_ub[0]:,}; pipeline-only {_ub[1]:,}; raw-only {_ub[2]:,})")
 # member debut (first live record meeting the cohort-table filter)
@@ -633,11 +633,11 @@ check_n("(n16) E7: tree_trajectories: one birth year per tree and debut age_calc
 # ---- r7 E9: record values and units re-derived from RAW TREE (by CN) ---------------------------
 LB_G, M2_AC = 453.592, 4046.86   # lbs -> g; m2 per acre (the products' documented constants)
 # D65 am. 2: an RC8 closure with AGENTCD, of a tree alive at the previous visit, is a dead (80: cut) record
-CLOSURE_RAW = "(T.STATUSCD = 0 AND T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 AND COALESCE(T.AGENTCD, 0) > 0)"
+CLOSURE_RAW = "(T.STATUSCD = 0 AND T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 AND COALESCE(T.AGENTCD, 0) > 0 AND C.COND_STATUS_CD IN (1, 2, 3, 4))"
 con.execute(f"""CREATE TEMP TABLE rt AS SELECT CAST(T.CN AS VARCHAR) cn,
                        CASE WHEN {CLOSURE_RAW} THEN (CASE WHEN T.AGENTCD = 80 THEN 3 ELSE 2 END) ELSE T.STATUSCD END STATUSCD,
                        T.SPCD, T.DIA, T.TPA_UNADJ, T.DRYBIO_AG
-                FROM f.TREE T WHERE {scope('T')}""")
+                FROM f.TREE T JOIN f.COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID WHERE {scope('T')}""")
 r = con.execute(f"""SELECT count(*),
        count(*) FILTER (WHERE r.cn IS NULL),
        count(*) FILTER (WHERE r.STATUSCD IS DISTINCT FROM c.STATUSCD OR r.SPCD IS DISTINCT FROM c.SPCD OR r.DIA IS DISTINCT FROM c.DIA),
@@ -859,8 +859,10 @@ FROM u LEFT JOIN (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,INVYR, bool_or(r
 # raw re-tally plot-visit, ub) equal the pipeline's, in both directions
 r = con.execute("""
 WITH e AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,ctree TREE,ny INVYR FROM us2
-           WHERE unrec AND EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=us2.STATECD AND ub.UNITCD=us2.UNITCD
-                 AND ub.COUNTYCD=us2.COUNTYCD AND ub.PLOT=us2.PLOT AND ub.ny=us2.ny)),
+           WHERE unrec AND (EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=us2.STATECD AND ub.UNITCD=us2.UNITCD
+                 AND ub.COUNTYCD=us2.COUNTYCD AND ub.PLOT=us2.PLOT AND ub.ny=us2.ny)
+              OR EXISTS (SELECT 1 FROM rm WHERE rm.STATECD=us2.STATECD AND rm.UNITCD=us2.UNITCD
+                 AND rm.COUNTYCD=us2.COUNTYCD AND rm.PLOT=us2.PLOT AND rm.ry=us2.ny))),
 p AS (SELECT DISTINCT c.STATECD,c.UNITCD,c.COUNTYCD,c.PLOT,c.SUBP,c.TREE,c.INVYR FROM new.tree_censor_events c
       WHERE c.reason = 'procedural_unrecorded')
 SELECT (SELECT count(*) FROM e), (SELECT count(*) FROM (SELECT * FROM e EXCEPT SELECT * FROM p)),
