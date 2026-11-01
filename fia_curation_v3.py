@@ -1936,8 +1936,8 @@ def process_estage(df: pl.DataFrame, estage_raw: pl.DataFrame,
 
 def anchor_estage(df: pl.DataFrame, cand_est: pl.DataFrame,
                   tree_bounds: pl.DataFrame) -> pl.DataFrame:
-    """(Re)compute the estage anchor columns from candidate records (TREE_ID + MEASDATE +
-    INVYR + src_age): estage_anchor_value / _measdate / _invyr, age_from_estage (float) and
+    """(Re)compute the estage anchor columns from candidate records (TREE_ID, MEASDATE,
+    INVYR, src_age): estage_anchor_value / _measdate / _invyr, age_from_estage (float) and
     estage (int). Existing columns of those names are replaced."""
     df = df.drop([c for c in ("estage_anchor_value", "estage_anchor_measdate", "estage_anchor_invyr",
                               "age_from_estage", "estage") if c in df.columns])
