@@ -220,8 +220,8 @@ CLOSURE_DEAD = ("(T.STATUSCD = 0 AND T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 
 def _sql_procedural_breaks(con, scope: str = ""):
     """procedural_breaks = per plot visit re-tally visits, break_kind 'rc8' (STATUSCD=0
     + RECONCILECD=8 closures), 'unrecorded' (silent re-tally, detector above) or 'move' (a microplot
-    move with neither). D65: a move is read from MICROPLOT_LOC, CENTER at the plot's previous annual
-    visit and OFFSET at this one (is_microplot_move), whatever the closures say. Also leaves
+    move with neither). D65: a move is read from MICROPLOT_LOC, CENTER at the plot's previous sampled
+    annual visit and OFFSET at this one (is_microplot_move), whatever the closures say. Also leaves
     _retally_saplings (every previous-visit live sapling with its next-visit status)."""
     con.execute(f"""
     CREATE OR REPLACE TEMP TABLE _pv AS
@@ -237,7 +237,7 @@ def _sql_procedural_breaks(con, scope: str = ""):
     CREATE OR REPLACE TEMP TABLE _moves AS
     SELECT * FROM (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, MEASDATE, MICROPLOT_LOC AS loc,
                           LAG(MICROPLOT_LOC) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY INVYR) AS prev_loc
-                   FROM _pv)
+                   FROM _pv WHERE PLOT_STATUS_CD < 3)   -- sampled visits: a move during a nonsampled visit shows at the next sampled one
     WHERE prev_loc = 'CENTER' AND loc = 'OFFSET';
     CREATE OR REPLACE TEMP TABLE _retally_saplings AS
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, v.MEASDATE, v.next_md, v.next_invyr,

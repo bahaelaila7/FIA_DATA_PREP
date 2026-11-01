@@ -416,14 +416,14 @@ SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR ry,
        bool_or(T.PREVDIA < 5) AS sap_closed
 FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y'
 WHERE T.STATUSCD=0 AND T.RECONCILECD=8 AND T.SUBP<=4 AND {scope('T')} GROUP BY ALL""")
-# D65: raw microplot moves: MICROPLOT_LOC CENTER at the plot's previous annual visit, OFFSET at this one
+# D65: raw microplot moves: MICROPLOT_LOC CENTER at the plot's previous sampled annual visit, OFFSET at this one
 con.execute(f"""
 CREATE TEMP TABLE rm AS
 SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR ry, bd FROM (
   SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.MICROPLOT_LOC loc,
          MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS bd,
          lag(P.MICROPLOT_LOC) OVER (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY P.INVYR) ploc
-  FROM f.PLOT P JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y' WHERE {scope('P')})
+  FROM f.PLOT P JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y' WHERE P.PLOT_STATUS_CD < 3 AND {scope('P')})
 WHERE ploc = 'CENTER' AND loc = 'OFFSET'""")
 # raw RC7/RC8 closures (for the RC3 >= 5 in re-tally pairing of rule a)
 con.execute(f"""
