@@ -1588,3 +1588,22 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Graduation constraint:** applies to the alive and unknown closures only. Alive with no compatible debut: 37,272 of 58,340 with a later visit (64 %).
 - **MORTYR (user):** a crew's estimate, not a measurement. Use it only as a flag that the tree died, together with AGENTCD; the death date stays interval-censored in (previous visit, move visit]. Its exact year is never a model input or a time axis.
 - **Proposed fix (not applied):** curation turns a closure with AGENTCD into a dead or cut record with the agent (80 → `silvicultural_death`), dated by the visit like any other dead record, and a sized closure into a real last record, then censored. Disturbance, drops and cut events follow; verifier (c1) re-derives it from raw. Needs a chain rerun and a NIMIWAE rebuild.
+
+**D65 amendment 3 (2026-11-01; user: is graduation in moved plots the same as in normal plots?).**
+- **Same graduation rates.** Share of live microplot saplings ≥ 5 in, alive, one interval later, under their own number, by start size (< 2 / 2–3 / 3–4 / 4–4.5 / 4.5+ in):
+  - normal OFFSET plots: 0.007 / 0.027 / 0.095 / 0.256 / 0.512;
+  - CENTER list, previous visit to the move: 0.007 / 0.027 / 0.092 / 0.244 / 0.508;
+  - new OFFSET list, move to next visit: 0.007 / 0.025 / 0.104 / 0.255 / 0.497.
+  - Observed vs expected from normal plots, standardised on state × wood × size: 0.96 and 0.97.
+- **Correction to am. 1:** "about half of expected at 4 in and over" was wrong. That expected count included dead records ≥ 5 in. With live graduates only, using the OFFSET list in the same plots:
+
+| Size at closure | Closures | Expected graduates | Found (chance-corrected) | P(graduated given no candidate) |
+|---|---|---|---|---|
+| < 2 in | 22,210 | 0.5 % | 0.1 %+ | under 1 % |
+| 2–3 in | 16,063 | 2.0 % | all | under 3 % at worst |
+| 3–4 in | 9,836 | 8.7 % | all | 0 to about 12 % |
+| 4–4.5 in | 3,571 | 24 % | 0.68–0.93 | 3–12 % |
+| 4.5+ in | 3,208 | 49 % | 0.67–0.79 | 21–33 % |
+
+  The lower end of each range uses the estimate as measured; the upper end removes the species-clustering uplift seen in the small classes. Found is above 1 under 4 in, which is that same uplift. Widening the filters gains little (0.79 to 0.82 at 4.5+ in).
+- **Consequence:** the no-candidate signal is safe under about 4 in and biased above it. Apply it for closures under 4 in (92 % of no-candidate trees at the next visit) as a soft signal with label noise, and keep `ignore` at 4 in and over. Tested at the next visit only; not tested for later visits, where the tree's size is unknown.
