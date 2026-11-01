@@ -1507,3 +1507,7 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Situation:** the FVS engine starts from `FVS_STANDINIT_PLOT` / `FVS_TREEINIT_PLOT` in `SQLite_FIADB_ENTIRE.db`, picked by TreeMap's CN, and FVS's DBS reads SQLite. These are FIA's own FVS-ready tables, not curated records.
 - **Options:** (a) keep them as a documented exception; (b) copy them into the truth DB, which moves the same uncurated rows and adds a DuckDB-to-SQLite step; (c) derive FVS inputs from curated trees, a new model input needing its own validation and FVS re-baselining. **Chosen (a)**; (c) is open if FVS should start from curated trees.
 - **Audit:** R4 has 358,303 stands. 358,254 STAND_CNs resolve to a PLOT; all 358,254 agree on plot number, and state, county and INVYR agree wherever the stand records an inventory year. The 49 others are in the SQLite but not in FIADB.duckdb, so they are not in the truth DB.
+
+## D62 — Region 4 only until the pipeline settles (user, 2026-11-01)
+- Forest Explorer's FIA plots layer shrinks from the old table's 48 states to the 8 R4 states, which also removes the pre-fix national rows from the map.
+- **No other region is built** until this pipeline is solid and checked further downstream. Many downstream products will move from bare curation to NIMIWAE-completed data once that work succeeds, so the consumer contracts in `docs/FIA_TRUTH.md` should expect a completed-data source later.

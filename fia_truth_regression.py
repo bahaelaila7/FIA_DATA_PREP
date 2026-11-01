@@ -17,29 +17,31 @@ def main():
     a = ap.parse_args()
     c = duckdb.connect(); c.execute(f"ATTACH '{a.truth}' AS n (READ_ONLY)")
     L = ["# FIA Truth regression", "", f"Truth DB vs `{a.old_dir}`, one previous DB per state.", "",
-         "| State | Records old → new | Same key in both | Only old | Only new | Live old → new | Changed fate (trees) | Mean \\|Δ age\\| (live, yr) |", "|---|---|---|---|---|---|---|---|"]
-    T = ["", "## Row counts of the product tables, old → new", "", "| State | " + " | ".join(t[0] for t in TABS) + " |", "|---|" + "---|" * len(TABS)]
+         "| State | Records old → new | Same key in both | Only old | Only new | Live old → new | Changed fate (trees, A2 label normalised) | Mean \\|Δ age\\| live / model / other (yr) | Changed age source | \\|Δ age\\| > 5 yr |", "|---|---|---|---|---|---|---|---|---|---|"]
+    T = ["", "## Row counts of the product tables, old → new", "", "| State | " + " | ".join(t[0] for t in TABS) + " | Sim A real / phantom |", "|---|" + "---|" * (len(TABS) + 1)]
     for p in sorted(glob.glob(f"{a.old_dir}/*/curated.duckdb")):
         st = c.execute(f"ATTACH '{p}' AS o (READ_ONLY); SELECT DISTINCT STATECD FROM o.curated_trees").fetchall()
         if len(st) != 1:
             c.execute("DETACH o"); continue
         s = st[0][0]
         r = c.execute(f"""
-          WITH o AS (SELECT {K}, STATUSCD, estimated_age, final_tree_fate FROM o.curated_trees),
-               x AS (SELECT {K}, STATUSCD, estimated_age, final_tree_fate FROM n.curated_trees WHERE STATECD = {s}),
-               j AS (SELECT o.STATUSCD os, x.STATUSCD ns, o.estimated_age oa, x.estimated_age na, o.final_tree_fate ofate, x.final_tree_fate nfate,
+          WITH o AS (SELECT {K}, STATUSCD, estimated_age, age_source, replace(final_tree_fate, 'harvest_explicit', 'silvicultural_death') final_tree_fate FROM o.curated_trees),
+               x AS (SELECT {K}, STATUSCD, estimated_age, age_source, final_tree_fate FROM n.curated_trees WHERE STATECD = {s}),
+               j AS (SELECT o.STATUSCD os, x.STATUSCD ns, o.estimated_age oa, x.estimated_age na, o.age_source oas, x.age_source nas, o.final_tree_fate ofate, x.final_tree_fate nfate,
                             o.TREE ot, x.TREE nt, COALESCE(o.PLOT, x.PLOT) pl, COALESCE(o.SUBP, x.SUBP) sb, COALESCE(o.UNITCD, x.UNITCD) u, COALESCE(o.COUNTYCD, x.COUNTYCD) cc, COALESCE(o.TREE, x.TREE) tr
                      FROM o FULL JOIN x USING ({K}))
           SELECT count(ot), count(nt), count(*) FILTER (WHERE ot IS NOT NULL AND nt IS NOT NULL), count(*) FILTER (WHERE nt IS NULL), count(*) FILTER (WHERE ot IS NULL),
                  count(*) FILTER (WHERE os = 1), count(*) FILTER (WHERE ns = 1),
                  count(DISTINCT (u, cc, pl, sb, tr)) FILTER (WHERE ot IS NOT NULL AND nt IS NOT NULL AND ofate IS DISTINCT FROM nfate),
-                 avg(abs(oa - na)) FILTER (WHERE os = 1 AND ns = 1) FROM j""").fetchone()
-        L.append(f"| {s} | {r[0]:,} → {r[1]:,} | {r[2]:,} | {r[3]:,} | {r[4]:,} | {r[5]:,} → {r[6]:,} | {r[7]:,} | {r[8]:.2f} |")
+                 avg(abs(oa - na)) FILTER (WHERE os = 1 AND ns = 1), avg(abs(oa - na)) FILTER (WHERE os = 1 AND ns = 1 AND nas = 'model'), avg(abs(oa - na)) FILTER (WHERE os = 1 AND ns = 1 AND nas <> 'model'), count(*) FILTER (WHERE os = 1 AND ns = 1 AND oas IS DISTINCT FROM nas), count(*) FILTER (WHERE os = 1 AND ns = 1 AND abs(oa - na) > 5) FROM j""").fetchone()
+        L.append(f"| {s} | {r[0]:,} → {r[1]:,} | {r[2]:,} | {r[3]:,} | {r[4]:,} | {r[5]:,} → {r[6]:,} | {r[7]:,} | {r[8]:.2f} / {r[9]:.2f} / {r[10]:.2f} | {r[11]:,} | {r[12]:,} |")
         row = [str(s)]
         for t, _ in TABS:
             col = "STATECD" if t == "curated_trees" else "statecd"
             ov = c.execute(f'SELECT count(*) FROM o."{t}"').fetchone()[0]; nv = c.execute(f'SELECT count(*) FROM n."{t}" WHERE {col} = {s}').fetchone()[0]
             row.append(f"{ov:,} → {nv:,}")
+        pc = [c.execute(f"SELECT count(*) FILTER (WHERE intro_type IS NULL), count(*) FILTER (WHERE intro_type IS NOT NULL) FROM {db}.curated_cohorts_landis WHERE statecd = {s}").fetchone() for db in ("o", "n")]
+        row.append(f"{pc[0][0]:,} → {pc[1][0]:,} / {pc[0][1]:,} → {pc[1][1]:,}")
         T.append("| " + " | ".join(row) + " |")
         c.execute("DETACH o"); print(L[-1], flush=True)
     open(a.out, "w").write("\n".join(L + T) + "\n"); print("wrote", a.out)

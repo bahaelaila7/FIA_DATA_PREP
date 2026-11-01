@@ -1050,7 +1050,7 @@ t AS (SELECT statecd, unitcd, countycd, plot, subp, tree, count(DISTINCT termina
              any_value(death_cause) dc FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')} GROUP BY ALL)
 SELECT count(*), count(*) FILTER (WHERE t.nf > 1 OR t.tf IS DISTINCT FROM e.etf),
        count(*) FILTER (WHERE t.dc IS DISTINCT FROM CASE WHEN e.etf = 'dead_disturbance' THEN 'disturbance' WHEN e.etf = 'dead_natural' THEN 'natural'
-                                                   WHEN e.etf LIKE 'harvest%' THEN e.etf WHEN e.etf = 'disappeared_inferred_removal' THEN 'harvest_inferred' END)
+                                                   WHEN e.etf IN ('silvicultural_death', 'harvest_inferred') THEN e.etf WHEN e.etf = 'disappeared_inferred_removal' THEN 'harvest_inferred' END)
 FROM t LEFT JOIN e USING (statecd, unitcd, countycd, plot, subp, tree)""").fetchone()
 check_n("(n21) D41 / E23: tree_trajectories terminal_fate / death_cause = the final fate with the one disturbance definition",
         r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} trees; terminal_fate differs {r[1]:,}; death_cause differs {r[2]:,})")
@@ -1646,10 +1646,17 @@ r = con.execute(f"""SELECT count(*) FILTER (WHERE terminal_fate IN ('silvicultur
                            count(*) FILTER (WHERE terminal_fate = 'silvicultural_death')
                     FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')}""").fetchone()
 check("(l2) every harvest fate carries its death_cause in the trajectories", r[0] == 0, f"({r[1]:,} silvicultural rows; missing {r[0]:,})")
-r = con.execute(f"""WITH f AS (SELECT count(*) n FROM new.curated_trees WHERE {scope()} AND STATUSCD IN (2, 3) AND NOT COALESCE(rerecord_dead, FALSE)
-                               AND tree_fate IN ('silvicultural_death', 'harvest_inferred'))
-                    SELECT (SELECT n FROM f), (SELECT sum(n_harvested) FROM new.curated_snapshots WHERE {scope()})""").fetchone()
-check("(l2) curated_snapshots.n_harvested counts every first harvest record", r[0] > 0 and r[0] == r[1], f"(records {r[0]:,}, snapshots {r[1]:,})")
+r = con.execute(f"""WITH v AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR, min(n_harvested) a, max(n_harvested) b
+                               FROM new.curated_snapshots WHERE {scope()} GROUP BY ALL),
+                         f AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR, count(*) n FROM new.curated_trees
+                               WHERE {scope()} AND STATUSCD IN (2, 3) AND NOT COALESCE(rerecord_dead, FALSE) AND NOT COALESCE(misrecorded_death, FALSE)
+                                 AND tree_fate IN ('silvicultural_death', 'harvest_inferred') GROUP BY ALL)
+                    SELECT count(*) FILTER (WHERE v.a IS NOT NULL AND (v.a <> v.b OR v.b <> COALESCE(f.n, 0))), sum(v.b),
+                           count(*) FILTER (WHERE v.a IS NULL), COALESCE(sum(f.n) FILTER (WHERE v.a IS NULL), 0)
+                    FROM v FULL JOIN f USING (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR)""").fetchone()
+check("(l2) curated_snapshots.n_harvested = the first harvest records of each subplot-visit", r[0] == 0,
+      f"({r[1]:,} records; subplot-visits that differ {r[0]:,})")
+info("(l2) harvest records at subplot-visits outside the snapshot scaffold", f"({r[3]:,} records on {r[2]:,} subplot-visits)")
 
 # ---- (l) M1 / M2 / M3 / I4 --------------------------------------------------------------------------
 if a.simb_db:

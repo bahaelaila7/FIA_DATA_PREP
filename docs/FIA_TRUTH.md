@@ -59,3 +59,20 @@ External datasets keyed by CN (TreeMap, TreeAge) are resolved once at the bounda
 | PRISM extraction | `raw.PLOT` | `pan_climate/scripts/01_extract.py` |
 
 **Exception (D61):** Forest Explorer's FVS engine reads FIA's own `FVS_STANDINIT_PLOT` and `FVS_TREEINIT_PLOT` from the master SQLite file. See D61 for why and for the key audit.
+
+## Verification state (2026-11-01, R4)
+
+- **Verifier:** 217 passed, 0 failed, 4 KNOWN cells (D60). Steps 4–10 rerun is EXCEPT-identical across all 37 curated and 3 Sim B tables. The steps 1–10 determinism check at two thread counts was not run on this build.
+- **Lint:** clean.
+- **Regression:** `docs/FIA_TRUTH_REGRESSION.md`. Records and fates are unchanged from `curated_r8`; natural-stand sapling model ages are 1–7 yr younger under the regional age fit.
+- **Consumers:**
+
+| Consumer | Check | Result |
+|---|---|---|
+| Pan BS, HBAD, PnET | tiny-budget nested-CV smoke, fold k1, through test | All 41 steps complete |
+| Forest Explorer plots layer | real loader, summary, points and 3 plot trajectories | Works; 36,313 plots |
+| Harvest models | `build_dataset.py`, `build_model3.py` | Build |
+| Genveg | 21 of 22 FIA queries planned against the DB | Resolve; the `table` stage has not been run |
+| TreeAge, climate, fold and volume tools | queries planned against the DB | Resolve; not run |
+
+- **Before calibrating HBAD v2, HBAD3P or HBAD4P:** rebuild their interval products. Those smoke runs were not done, and the products in `results/` still come from `slim_r4`.
