@@ -27,7 +27,7 @@ def pick(df: pl.DataFrame, key, by, which: str = "first", descending=None, nulls
     return out.select(df.columns)
 
 
-def natural_record_id(cols=("STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE", "MEASDATE")) -> pl.Expr:
+def natural_record_id(cols=("STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE", "INVYR")) -> pl.Expr:
     return pl.concat_str([pl.col(c).cast(pl.Utf8) for c in cols], separator="_")
 
 

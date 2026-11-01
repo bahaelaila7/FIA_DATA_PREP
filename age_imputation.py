@@ -161,7 +161,7 @@ def plot_fold(plot_keys) -> np.ndarray:
     import zlib
     return np.array([zlib.crc32(str(k).encode()) % N_FOLDS for k in plot_keys], dtype=np.int64)
 CAL_SLOPE_MIN, CAL_SLOPE_MAX = 0.25, 1.5
-CAL_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE", "MEASDATE", "SPCD", "spcd_resolved", "spgrpcd_resolved",
+CAL_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE", "INVYR", "MEASDATE", "SPCD", "spcd_resolved", "spgrpcd_resolved",
             "cond_stdorgcd", "STATUSCD", "DIA", "estage_raw", "age_from_totage", "age_from_stdage", "age_stratum"]
 
 
