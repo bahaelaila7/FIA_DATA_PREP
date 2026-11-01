@@ -1,7 +1,10 @@
 """fia_truth_lint.py — D59 static rules over the pipeline and its consumers. Exit 1 on any finding.
   L1 no join on a CN column (PLT_CN, TRE_CN, PREV_*_CN, SRV_CN, .CN) in a pipeline stage or consumer;
   L2 no cross-visit keying of a condition: a key list holding CONDID without INVYR / MEASDATE;
-  L3 no consumer reads raw FIADB.
+  L3 no consumer reads raw FIADB;
+  L4 no row-order logic;
+  L5 no time arithmetic on INVYR;
+  L6 no date as a key (D69): MEASDATE and its derivatives order records and measure time, they never join or group them.
 Allowed: sql_cond_link (SUBP_COND_CHNG_MTRX has no natural key columns), dbconn's PREV_PLT_CN chain and the CN
 validation in its views, and verify_curation_v2 (it uses FIA's CN links on purpose, as an independent check)."""
 import re, sys, os, argparse
@@ -29,8 +32,18 @@ def scan(path, name, findings):
         if re.search(r"\.(first|last)\(\)\.alias", s) and "sort_by" not in s:
             findings.append(f"L4 {name}:{i}: {ln.strip()[:110]}")
         # D68: INVYR is part of the natural id and may order a plot's visits; it never enters a time calculation
-        if "invyr-ok" not in ln and re.search(r"\bINVYR\s+[-+]\s+\w|\w\s+[-+]\s+[a-z_.]*INVYR\b|year_diff\([^)]*INVYR|date_diff\([^)]*INVYR", s):
+        s5 = re.sub(r"\w*_ID(\s\+\s\w+)+", "", s)   # key names in prose: SUBPLOT_ID + INVYR + MEASDATE
+        if "invyr-ok" not in ln and re.search(r"\bINVYR\s+[-+]\s+\w|\w\s+[-+]\s+[a-z_.]*INVYR\b|year_diff\([^)]*INVYR|date_diff\([^)]*INVYR", s5):
             findings.append(f"L5 {name}:{i}: {ln.strip()[:110]}")
+        # D69: a date is a timestamp, never an identifier (mark a deliberate date-valued grouping with date-ok)
+        if "date-ok" not in ln and name not in ("fia_truth_lint.py",) and (
+                re.search(r"\bon\s*=\s*[^)]*[\"'](MEASDATE|measdate|prior_measdate)[\"']", s)
+                or re.search(r"group_by\([^)]*[\"'](MEASDATE|measdate|prior_measdate)[\"']", s)
+                or re.search(r"over\([^)]*[\"'](MEASDATE|measdate)[\"'][^)]*\)", s.replace('order_by="MEASDATE"', "").replace('order_by="measdate"', "").replace("order_by='measdate'", ""))
+                or re.search(r"\w+\.(MEASDATE|measdate)\s*=\s*\w+\.(MEASDATE|measdate)\b", s)
+                or re.search(r"USING\s*\([^)]*\bmeasdate\b", s, re.I)
+                or re.search(r"PARTITION BY [^)]*\bmeasdate\b", s.split(" ORDER BY")[0], re.I)):
+            findings.append(f"L6 {name}:{i}: {ln.strip()[:110]}")
         # COND_ID (plot key + CONDID) is a condition only together with its visit
         if re.search(r"(over|group_by|shift|partition_by)\(\s*(COND_ID|cond_id_cols)\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
             findings.append(f"L2 {name}:{i}: {ln.strip()[:110]}")
@@ -42,6 +55,10 @@ def main():
     for f in STAGES:
         p = os.path.join(ROOT, f)
         if os.path.exists(p): scan(p, f, out)
+    keys = []   # the verifier and the current model file: L6 only (the verifier uses CNs on purpose)
+    for f in ("verify_curation_v2.py", "nimiwae56.py"):
+        scan(os.path.join(ROOT, f), f, keys)
+    out += [x for x in keys if x.startswith("L6")]
     for p in a.consumers:
         scan(p, p, out)
         if "FIADB.duckdb" in open(p, errors="ignore").read(): out.append(f"L3 {p}: names raw FIADB")

@@ -41,7 +41,7 @@ def prepare(c):
       FROM PLOT""")
     c.execute(f"""CREATE OR REPLACE TEMP TABLE vv AS
       SELECT *, row_number() OVER w - 1 vn, lag(loc) OVER w ploc, max(CASE WHEN loc = 'CENTER' THEN 1 ELSE 0 END) OVER (PARTITION BY {PK}) ever_center
-      FROM v WINDOW w AS (PARTITION BY {PK} ORDER BY md)""")
+      FROM v WINDOW w AS (PARTITION BY {PK} ORDER BY INVYR)""")
     c.execute(f"""CREATE OR REPLACE TEMP TABLE t AS
       SELECT r.STATECD, r.UNITCD, r.COUNTYCD, r.PLOT, r.INVYR, r.SUBP, r.TREE, r.SPCD, r.DIA, r.HT, r.STATUSCD st, r.RECONCILECD rc,
              r.PREV_STATUS_CD ps, r.TPA_UNADJ tpa, r.AGENTCD agent, vv.vn, vv.md
@@ -60,7 +60,7 @@ def windows(c, min_b_gap=2):
                      FROM vv a JOIN vv b USING ({PK})
                      WHERE b.vn >= a.vn + {min_b_gap} AND date_diff('day', a.md, b.md) / 365.25 BETWEEN 10 AND 15) WHERE rk = 1""")
     c.execute(f"""CREATE OR REPLACE TEMP TABLE w AS
-      SELECT h.*, n.md mdb, n.ploc nplo, n.loc nloc, (h.ploc = 'CENTER' AND h.loc = 'OFFSET') at_move, (n.ploc = 'CENTER' AND n.loc = 'OFFSET') next_move
+      SELECT h.*, n.INVYR invb, n.md mdb, n.ploc nplo, n.loc nloc, (h.ploc = 'CENTER' AND h.loc = 'OFFSET') at_move, (n.ploc = 'CENTER' AND n.loc = 'OFFSET') next_move
       FROM h JOIN vv n ON n.STATECD = h.STATECD AND n.UNITCD = h.UNITCD AND n.COUNTYCD = h.COUNTYCD AND n.PLOT = h.PLOT AND n.vn = h.vn + 1""")
 
 
@@ -449,9 +449,9 @@ def run(db, out):
             acc[g]["calibration"] = T[g].assign(b=pd.cut(T[g].p, [0, .1, .25, .5, .75, 1])).groupby("b", observed=True).agg(p=("p", "mean"), t=("true", "mean"), n=("p", "size")).round(3).values.tolist()
     print(json.dumps(rows, indent=0)); print(json.dumps(acc, indent=0))
     # silent moves: nothing keeps its number, hide everything from A
-    sil = c.execute(f"SELECT {PK}, MEASDATE FROM procedural_breaks WHERE break_kind = 'unrecorded'").df()
+    sil = c.execute(f"SELECT {PK}, INVYR FROM procedural_breaks WHERE break_kind = 'unrecorded'").df()
     c.register("_s", sil); windows(c, 1)
-    sq = f"SELECT w.* FROM w JOIN _s s ON s.STATECD = w.STATECD AND s.UNITCD = w.UNITCD AND s.COUNTYCD = w.COUNTYCD AND s.PLOT = w.PLOT AND s.MEASDATE = w.mdb"
+    sq = f"SELECT w.* FROM w JOIN _s s ON s.STATECD = w.STATECD AND s.UNITCD = w.UNITCD AND s.COUNTYCD = w.COUNTYCD AND s.PLOT = w.PLOT AND s.INVYR = w.invb"
     S = {"silent": cohort(c, sq), "normal": cohort(c, group_sql("normal")), "after": cohort(c, group_sql("after"))}
     SX = {}
     for g, a in S.items():

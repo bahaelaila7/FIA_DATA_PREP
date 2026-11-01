@@ -502,7 +502,7 @@ def expansion(exists, tpa_tree):
     return np.where(np.asarray(exists, bool), np.asarray(tpa_tree, float), 0.0)
 
 @torch.no_grad()
-def stand_totals(model, seq, n_draws=50, K=100, by=('statecd', 'unitcd', 'countycd', 'plot', 'subp', 'measdate'), group_cols=()):
+def stand_totals(model, seq, n_draws=50, K=100, by=('statecd', 'unitcd', 'countycd', 'plot', 'subp', 'invyr'), group_cols=()):
     """Stand totals per visit from completed lineages (export step, not part of the model). For each posterior draw (sample_lineages)
     every tree-visit gets its expansion (see `expansion`); TPA and basal area (ft2/ac = 0.005454 DIA^2 x expansion) are summed per
     `by` (+ `group_cols`) and summarised over draws (mean, 10 / 90 %). Saplings (DIA below the design's subplot-level threshold, thr_subp)
@@ -547,7 +547,7 @@ def bench_sizes(seq: pd.DataFrame, limit=None, interval: bool = True) -> pd.Data
     t = pd.DataFrame({'thr': g.thr_in.first(), 'tmi': g.thr_micro.first(), 'tsu': g.thr_subp.first(), 'dia0': g.dia.first(), 'n': g.size(), 'nh': g._h.sum()})
     t['nvis'] = t.n - t.nh; t['lim'] = t.tsu if limit is None else float(limit)
     ok = t[(t.thr <= t.tmi + 1e-9) & (t.dia0 < t.lim) & (t.n >= 3) & (t.nh >= 1) & (t.nvis >= 1)].reset_index()[K_]
-    b = seq.merge(ok, on=K_, how='inner').merge(r[K_ + ['measdate', '_h']], on=K_ + ['measdate'], how='left')
+    b = seq.merge(ok, on=K_, how='inner').merge(r[K_ + ['invyr', '_h']], on=K_ + ['invyr'], how='left')
     b['hidden'] = b._h == 1
     # originally clean FALSE pre slots (truth FALSE for establishment scoring), computed with the ORIGINAL microplot semantics
     first = b[b.slot_kind == 'real'].groupby(K_).measdate.min().rename('_d0')
@@ -570,19 +570,19 @@ def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
     real = s[s.slot_kind == 'real']
     rk = real.groupby(K_).cumcount().rename('_rk')
     s = s.join(rk)
-    dead_j = (pd.to_datetime(s.measdate) == pd.to_datetime(s.dead_md)) & (s.terminal_fate != 'censored_moved')
+    dead_j = (s.invyr == s.dead_invyr) & (s.terminal_fate != 'censored_moved')
     nreal = real.groupby(K_).size().rename('_nr'); s = s.join(nreal, on=K_)
     alive_j = (s.slot_kind == 'real') & (s._rk >= 2)
     gone_j = dead_j & (s._nr >= 2)
-    inst = s[alive_j | gone_j][K_ + ['measdate']].copy(); inst['_truth'] = np.where(alive_j[alive_j | gone_j], 1.0, 0.0)
+    inst = s[alive_j | gone_j][K_ + ['invyr']].copy(); inst['_truth'] = np.where(alive_j[alive_j | gone_j], 1.0, 0.0)
     inst['_i'] = inst.groupby(K_).cumcount()
     out = []
     for i, part in inst.groupby('_i'):
-        b = s.merge(part.rename(columns={'measdate': '_j'}), on=K_, how='inner')
-        at = b.measdate == b._j
-        b['hidden'] = (b.measdate >= b._j) & (b.slot_kind == 'real')                                 # the tree's own records from j on
+        b = s.merge(part.rename(columns={'invyr': '_j'}), on=K_, how='inner')
+        at = b.invyr == b._j
+        b['hidden'] = (b.invyr >= b._j) & (b.slot_kind == 'real')                                 # the tree's own records from j on
         b['truth_cut'] = np.where(np.isin(b.terminal_fate, CUT_FATES) | (b.dead_agent == 80), 1.0, 0.0)
-        b['end_hidden'] = True; b['terminal_fate'] = 'censored_procedural'; b['dead_md'] = pd.NaT; b['dead_agent'] = np.nan; b['s0_md'] = pd.NaT
+        b['end_hidden'] = True; b['terminal_fate'] = 'censored_procedural'; b['dead_invyr'] = np.nan; b['dead_md'] = pd.NaT; b['dead_agent'] = np.nan; b['s0_md'] = pd.NaT
         b['truth_E'] = np.where(at, b._truth, np.nan); b['truth_cut'] = np.where(at & (b._truth == 0), b.truth_cut, np.nan)
         b['tree'] = b.tree * 16 + int(i)
         out.append(b.drop(columns=['_rk', '_nr', '_truth', '_i']))

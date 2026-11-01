@@ -185,7 +185,7 @@ The following hold in all four counties:
 - 0 dead/cut records lost (the null-TPA ones are kept);
 - 0 phantoms on nonforest subplot-visits;
 - 0 sapling-debut phantoms across a re-tally;
-- CN and tree × MEASDATE unique;
+- CN and tree × INVYR unique;
 - slim schema: old columns identical, appended columns only (`curated_trees` +23, cohort
   tables +`procedural_break`).
 
@@ -871,7 +871,8 @@ years; some plots are remeasured more than once within the same calendar year
 (different INVYR, typically 1 year apart).
 
 **MEASDATE = `MAKE_DATE(MEASYEAR, MEASMON, MEASDAY)`** — the exact calendar date
-of a remeasurement. MEASDATE is unique per `(plot, INVYR)`.
+of a remeasurement: a timestamp for ordering, intervals and modelling, never a key (D69). A visit
+is identified by `(plot, INVYR)` even where two visits share a date.
 
 ### Rules enforced throughout this pipeline
 

@@ -42,12 +42,12 @@ def _interp_case(nonforest_v2: bool = False, censor: bool = False, dead_at_v2: b
     import build_tree_trajectories as bt
     key = dict(STATECD=99, UNITCD=1, COUNTYCD=1, PLOT=1, SUBP=1)
     live = pl.DataFrame([
-        {**key, "TREE": 1, "MEASDATE": D1, "sim_year": 0, "age_calc": 20, "STATUSCD": 1,
+        {**key, "TREE": 1, "INVYR": D1.year, "MEASDATE": D1, "sim_year": 0, "age_calc": 20, "STATUSCD": 1,
          "intro_type": None, "dia": 6.0, "ht": 40.0, "cr": 30.0, "agb": 100.0, "ba": 1.0},
-        {**key, "TREE": 1, "MEASDATE": D3, "sim_year": 10, "age_calc": 30, "STATUSCD": 1,
+        {**key, "TREE": 1, "INVYR": D3.year, "MEASDATE": D3, "sim_year": 10, "age_calc": 30, "STATUSCD": 1,
          "intro_type": None, "dia": 8.0, "ht": 50.0, "cr": 30.0, "agb": 200.0, "ba": 2.0},
     ], schema_overrides={"intro_type": pl.Utf8, "sim_year": pl.Int32, "age_calc": pl.Int32})
-    visits = pl.DataFrame([{**key, "MEASDATE": d, "forest_subpcond_prop": fp, "forest_micrcond_prop": fp}
+    visits = pl.DataFrame([{**key, "INVYR": d.year, "MEASDATE": d, "forest_subpcond_prop": fp, "forest_micrcond_prop": fp}
                            for d, fp in ((D1, 1.0), (D2, 0.0 if nonforest_v2 else 1.0), (D3, 1.0))])
     ev = []
     if censor:

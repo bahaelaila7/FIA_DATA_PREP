@@ -341,13 +341,13 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
     )
 
     g = gaps.sort("MEASDATE")
-    g = g.join_asof(prev_src.sort("MEASDATE"), on="MEASDATE", by=TREE_ID,
+    g = g.join_asof(prev_src.sort("MEASDATE"), on="MEASDATE", by=TREE_ID,   # date-ok: nearest in time
                     strategy="backward")
     g = g.join_asof(
         nxt_src.sort("MEASDATE").rename({"dia": "next_dia", "ht": "next_ht",
                                          "cr": "next_cr", "agb": "next_agb",
                                          "ba": "next_ba"}),
-        on="MEASDATE", by=TREE_ID, strategy="forward")
+        on="MEASDATE", by=TREE_ID, strategy="forward")   # date-ok: nearest in time
 
     # curation-fix 2026-10-26: never interpolate across a censoring (STATUSCD=0 with
     # RECONCILECD 5/6/8/9 between the bracketing records): the tree was out of the sample.
@@ -590,7 +590,7 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     # live BA per (subplot, visit) — denominator is the visit immediately before the cut
     live_ba = (
         full.filter(pl.col("STATUSCD") == 1)
-        .group_by(SUBPLOT_ID + ["INVYR", "MEASDATE"])
+        .group_by(SUBPLOT_ID + ["INVYR", "MEASDATE"])   # date-ok: INVYR is in the key, the date is carried
         .agg(pl.col("ba").sum().alias("live_ba"))
     )
     denom = (

@@ -35,48 +35,48 @@ def load54(db: str) -> pl.DataFrame:
     K = "statecd, unitcd, countycd, plot, subp, tree"
     q = f"""
     WITH real AS (SELECT * FROM tree_trajectories WHERE intro_type = 'real'),
-    csy AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, MEASDATE measdate,
+    csy AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, INVYR invyr, MEASDATE measdate,
                    forest_subpcond_prop fsp, forest_micrcond_prop fmp FROM clean_subplot_years),
-    pv AS (SELECT statecd, unitcd, countycd, plot, measdate FROM csy GROUP BY ALL HAVING max(fsp) > 0),
+    pv AS (SELECT statecd, unitcd, countycd, plot, invyr, measdate FROM csy GROUP BY ALL HAVING max(fsp) > 0),
     span AS (SELECT statecd, unitcd, countycd, plot, subp, min(measdate) s0, max(measdate) s1 FROM csy WHERE fsp > 0 GROUP BY ALL),
-    sv AS (SELECT sp.statecd, sp.unitcd, sp.countycd, sp.plot, sp.subp, pv.measdate, csy.fsp, csy.fmp FROM span sp
+    sv AS (SELECT sp.statecd, sp.unitcd, sp.countycd, sp.plot, sp.subp, pv.invyr, pv.measdate, csy.fsp, csy.fmp FROM span sp
            JOIN pv USING (statecd, unitcd, countycd, plot)
-           LEFT JOIN csy USING (statecd, unitcd, countycd, plot, subp, measdate) WHERE pv.measdate BETWEEN sp.s0 AND sp.s1),
+           LEFT JOIN csy USING (statecd, unitcd, countycd, plot, subp, invyr) WHERE pv.measdate BETWEEN sp.s0 AND sp.s1),
     ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, STATUSCD statuscd,
                   CCLCD cclcd, RECONCILECD rcd, AGENTCD agentcd, INVYR invyr, TREECLCD treeclcd, ACTUALHT actualht,
                   unitcd_raw, countycd_raw, plot_raw FROM curated_trees),
-    dm AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.measdate,
+    dm AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.invyr,
                   ft.DAMAGE_AGENT_CD1 dmg1, ft.DAMAGE_AGENT_CD2 dmg2, ft.DAMAGE_AGENT_CD3 dmg3 FROM ct
            JOIN raw.TREE ft ON ft.STATECD = ct.statecd AND ft.UNITCD = ct.unitcd_raw AND ft.COUNTYCD = ct.countycd_raw AND ft.PLOT = ct.plot_raw
                 AND ft.INVYR = ct.invyr AND ft.SUBP = ct.subp AND ft.TREE = ct.tree % 100000 WHERE ct.statuscd = 1),   -- as-recorded key; curated TREE = raw number + 100000 k after a reuse split
-    tr AS (SELECT {K}, min(measdate) d0, max(measdate) d1, arg_min(condid, measdate) condid0,
+    tr AS (SELECT {K}, min(measdate) d0, max(measdate) d1, min(invyr) y0, arg_min(condid, measdate) condid0,
                   arg_min(species_symbol, measdate) species_symbol, arg_min(spgrpcd, measdate) spgrpcd, arg_min(major_spgrpcd, measdate) major_spgrpcd,
                   arg_min(sftwd_hrdwd, measdate) sftwd_hrdwd, arg_min(epa_l3, measdate) epa_l3, arg_min(epa_l4, measdate) epa_l4,
                   arg_min(land_use, measdate) land_use, arg_max(terminal_fate, measdate) terminal_fate,
                   arg_max(spcd, measdate) spcd, bool_or(coalesce(spcd_changed, false)) sp_revised
            FROM real GROUP BY ALL),
     rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING ({K})
-           WHERE ct.measdate = tr.d0 AND ct.statuscd = 1),
-    dr AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
+           WHERE ct.invyr = tr.y0 AND ct.statuscd = 1),
+    dr AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.invyr) dead_invyr, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
            FROM ct JOIN tr USING ({K}) WHERE ct.statuscd = 2 AND ct.measdate > tr.d1 GROUP BY ALL),
     s0 AS (SELECT e.STATECD statecd, e.UNITCD unitcd, e.COUNTYCD countycd, e.PLOT plot, e.SUBP subp, e.TREE tree,
                   min(e.MEASDATE) s0_md, arg_min(e.RC, e.MEASDATE) s0_rc
            FROM tree_status0_events e JOIN tr ON tr.statecd = e.STATECD AND tr.unitcd = e.UNITCD AND tr.countycd = e.COUNTYCD
                 AND tr.plot = e.PLOT AND tr.subp = e.SUBP AND tr.tree = e.TREE AND e.MEASDATE > tr.d1 GROUP BY ALL),
-    fr AS (SELECT tr.*, sv.measdate, sv.fsp, sv.fmp FROM tr JOIN sv USING (statecd, unitcd, countycd, plot, subp)
+    fr AS (SELECT tr.*, sv.invyr, sv.measdate, sv.fsp, sv.fmp FROM tr JOIN sv USING (statecd, unitcd, countycd, plot, subp)
            UNION ALL
-           SELECT tr.*, r.measdate, NULL, NULL FROM tr JOIN real r USING ({K})
+           SELECT tr.*, r.invyr, r.measdate, NULL, NULL FROM tr JOIN real r USING ({K})
            WHERE NOT EXISTS (SELECT 1 FROM sv WHERE sv.statecd = r.statecd AND sv.unitcd = r.unitcd AND sv.countycd = r.countycd
-                             AND sv.plot = r.plot AND sv.subp = r.subp AND sv.measdate = r.measdate)),
-    sub AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, sum(ba) sub_ba, sum(tpa) sub_tpa FROM real GROUP BY ALL),
-    bc AS (SELECT b.STATECD statecd, b.UNITCD unitcd, b.COUNTYCD countycd, b.PLOT plot, b.SUBP subp, b.MEASDATE measdate,
+                             AND sv.plot = r.plot AND sv.subp = r.subp AND sv.invyr = r.invyr)),
+    sub AS (SELECT statecd, unitcd, countycd, plot, subp, invyr, sum(ba) sub_ba, sum(tpa) sub_tpa FROM real GROUP BY ALL),
+    bc AS (SELECT b.STATECD statecd, b.UNITCD unitcd, b.COUNTYCD countycd, b.PLOT plot, b.SUBP subp, b.INVYR invyr,
                   b.COND_STATUS_CD cs, coalesce(b.SUBPCOND_PROP, 0) sp, b.SICOND, b.SLOPE, b.ASPECT, b.FORTYPCD, b.SITECLCD, b.STDORGCD,
                   cd.PHYSCLCD, cd.LIVE_CANOPY_CVR_PCT canopy, [b.TRTCD1, b.TRTCD2, b.TRTCD3] trt, [b.DSTRBCD1, b.DSTRBCD2, b.DSTRBCD3] dst
            FROM base_subplot_cond b LEFT JOIN COND cd ON cd.STATECD = b.STATECD AND cd.UNITCD = b.UNITCD AND cd.COUNTYCD = b.COUNTYCD
                 AND cd.PLOT = b.PLOT AND cd.INVYR = b.INVYR AND cd.CONDID = b.CONDID),
     bw AS (SELECT *, CASE WHEN sum(CASE WHEN cs = 1 THEN sp ELSE 0 END) OVER w > 0 THEN (CASE WHEN cs = 1 THEN sp ELSE 0 END) ELSE sp END wt
-           FROM bc WINDOW w AS (PARTITION BY statecd, unitcd, countycd, plot, subp, measdate)),
-    sa AS (SELECT statecd, unitcd, countycd, plot, subp, measdate,
+           FROM bc WINDOW w AS (PARTITION BY statecd, unitcd, countycd, plot, subp, invyr)),
+    sa AS (SELECT statecd, unitcd, countycd, plot, subp, invyr,
                   sum(wt * SICOND) FILTER (WHERE SICOND IS NOT NULL) / nullif(sum(wt) FILTER (WHERE SICOND IS NOT NULL), 0) sicond,
                   sum(wt * SLOPE) FILTER (WHERE SLOPE IS NOT NULL) / nullif(sum(wt) FILTER (WHERE SLOPE IS NOT NULL), 0) slope,
                   CASE WHEN sum(wt) FILTER (WHERE ASPECT IS NOT NULL) > 0 THEN
@@ -88,16 +88,15 @@ def load54(db: str) -> pl.DataFrame:
                   {", ".join(f"sum(wt * (len(list_filter(trt, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) trt_s{c}" for c in (10, 20, 30, 40, 50))},
                   {", ".join(f"sum(wt * (len(list_filter(dst, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) dst_s{c}" for c in (10, 20, 30, 40, 50, 60, 70, 80, 90))}
            FROM bw GROUP BY ALL),
-    pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, make_date(MEASYEAR::INT, MEASMON::INT, MEASDAY::INT) md,
-                  any_value(DESIGNCD) designcd FROM PLOT GROUP BY ALL)
-    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate, pc.designcd,
+    pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, INVYR invyr, DESIGNCD designcd FROM PLOT)
+    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr, f.measdate, pc.designcd,
            CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' WHEN f.measdate <= f.d1 THEN 'gap' ELSE 'post' END slot_kind,
            CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
            t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
            f.species_symbol, f.spcd, f.sp_revised, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use,
            CASE WHEN t.tree IS NOT NULL THEN ct.treeclcd END treeclcd, CASE WHEN t.tree IS NOT NULL THEN ct.actualht END actualht,
            dm.dmg1, dm.dmg2, dm.dmg3,
-           rc.rcd0, f.terminal_fate, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc,
+           rc.rcd0, f.terminal_fate, dr.dead_invyr, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc,
            f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, NULL::INT cond_status,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
            sa.sicond, sa.siteclcd, sa.physclcd, sa.slope, sa.aspect, sa.fortypcd, sa.canopy_pct, sa.stdorgcd,
@@ -105,15 +104,15 @@ def load54(db: str) -> pl.DataFrame:
            sa.trt_s10, sa.trt_s20, sa.trt_s30, sa.trt_s40, sa.trt_s50,
            sa.dst_s10, sa.dst_s20, sa.dst_s30, sa.dst_s40, sa.dst_s50, sa.dst_s60, sa.dst_s70, sa.dst_s80, sa.dst_s90
     FROM fr f
-    LEFT JOIN real t USING ({K}, measdate)
-    LEFT JOIN ct USING ({K}, measdate)
+    LEFT JOIN real t USING ({K}, invyr)
+    LEFT JOIN ct USING ({K}, invyr)
     LEFT JOIN dm ON dm.statecd = f.statecd AND dm.unitcd = f.unitcd AND dm.countycd = f.countycd AND dm.plot = f.plot AND dm.subp = f.subp
-         AND dm.tree = f.tree AND dm.measdate = f.measdate AND t.tree IS NOT NULL
+         AND dm.tree = f.tree AND dm.invyr = f.invyr AND t.tree IS NOT NULL
     LEFT JOIN rc USING ({K}) LEFT JOIN dr USING ({K}) LEFT JOIN s0 USING ({K})
-    LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
-    LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.md = f.measdate
-    LEFT JOIN sa USING (statecd, unitcd, countycd, plot, subp, measdate)
-    ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate"""
+    LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, invyr)
+    LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.invyr = f.invyr
+    LEFT JOIN sa USING (statecd, unitcd, countycd, plot, subp, invyr)
+    ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr"""
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
 
@@ -149,11 +148,11 @@ def add_neighbours(df: pl.DataFrame) -> pl.DataFrame:
            .with_columns(((pl.col('measdate') - pl.col('_t0')).dt.total_days() / 365.25).alias('_dt'))
            .filter((pl.col('dia') >= pl.col('nb_thr')) & (pl.col('_d0') >= pl.col('nb_thr')) & (pl.col('_dt') > 0.5))
            .with_columns(((pl.col('dia').log() - pl.col('_d0').log()) / pl.col('_dt')).clip(-0.05, 0.5).alias('_inc'))
-           .select(k + ['measdate', '_inc']))
-    out = df.join(r, on=k + ['measdate'], how='left')
+           .select(k + ['invyr', '_inc']))
+    out = df.join(r, on=k + ['invyr'], how='left')
     for g, nm in ((sk, 'sub'), (pk, 'plt')):
-        a = r.group_by(g + ['measdate']).agg(pl.col('_inc').sum().alias('_s'), pl.len().alias('_n'))
-        out = out.join(a, on=g + ['measdate'], how='left').with_columns(
+        a = r.group_by(g + ['invyr']).agg(pl.col('_inc').sum().alias('_s'), pl.len().alias('_n'))
+        out = out.join(a, on=g + ['invyr'], how='left').with_columns(
             pl.col('_s').fill_null(0.0), pl.col('_n').fill_null(0)).with_columns(
             (pl.col('_n') - pl.col('_inc').is_not_null().cast(pl.Int64)).alias(f'nb_n_{nm}'),
             (pl.col('_s') - pl.col('_inc').fill_null(0.0)).alias('_s2')).with_columns(
@@ -171,13 +170,14 @@ def add_climate(df: pl.DataFrame, prism: str) -> pl.DataFrame:
                  CAST(CAST(vpdmax_mean AS VARCHAR) AS DOUBLE) vp FROM p.EPA_L4_yearly""")
     c.execute("CREATE TEMP TABLE nrm AS SELECT l4, avg(tm) tm_n, avg(pp) pp_n, avg(vp) vp_n FROM y WHERE yr BETWEEN 1991 AND 2020 GROUP BY l4")
     ymax = c.execute("SELECT max(yr) FROM y").fetchone()[0]
-    sl = d.select(*k, 'measdate', pl.col('epa_l4').alias('l4'), pl.col('_ys').clip(upper_bound=ymax).alias('ys'), pl.col('_ye').clip(upper_bound=ymax).alias('ye'))
+    sl = d.select(*k, 'invyr', pl.col('epa_l4').alias('l4'), pl.col('_ys').clip(upper_bound=ymax).alias('ys'), pl.col('_ye').clip(upper_bound=ymax).alias('ye'))
     c.register('sl', sl.to_arrow())
-    cl = pl.from_arrow(c.execute(f"""SELECT {', '.join('sl.' + x for x in k)}, sl.measdate, avg(y.tm) - n.tm_n tm_anom, avg(y.pp) / n.pp_n - 1 pp_anom, avg(y.vp) - n.vp_n vp_anom,
-                                   n.tm_n, n.pp_n, n.vp_n
-                                   FROM sl JOIN y ON y.l4 = sl.l4 AND y.yr BETWEEN least(sl.ys, sl.ye) AND sl.ye JOIN nrm n ON n.l4 = sl.l4
-                                   GROUP BY ALL""").arrow())
-    return df.join(cl, on=k + ['measdate'], how='left')
+    cl = pl.from_arrow(c.execute(f"""WITH a AS (SELECT {', '.join('sl.' + x for x in k)}, sl.invyr, sl.l4, avg(y.tm) tm, avg(y.pp) pp, avg(y.vp) vp
+                                     FROM sl JOIN y ON y.l4 = sl.l4 AND y.yr BETWEEN least(sl.ys, sl.ye) AND sl.ye GROUP BY ALL)
+                                   SELECT {', '.join('a.' + x for x in k)}, a.invyr, a.tm - n.tm_n tm_anom, a.pp / n.pp_n - 1 pp_anom, a.vp - n.vp_n vp_anom,
+                                          n.tm_n, n.pp_n, n.vp_n
+                                   FROM a JOIN nrm n ON n.l4 = a.l4""").arrow())
+    return df.join(cl, on=k + ['invyr'], how='left')
 
 def resplit_r2(split: str, key: str) -> str:
     """D50 fresh split: the old TEST is retired (-> train); the new TEST = old-train plots with crc32(key|r2) % 100 < 22; VAL unchanged."""

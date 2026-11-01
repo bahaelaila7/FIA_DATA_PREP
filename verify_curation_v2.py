@@ -390,7 +390,7 @@ check("1e reference trees absent from curated", r == 0, f"({r})")
 # raw subplot-visit forest proportions (scaffold: annual, PLOT_STATUS<3, SUBP<=4, SUBP_STATUS<>3)
 con.execute(f"""
 CREATE TEMP TABLE rv AS
-SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, SU.SUBP,
+SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, SU.SUBP, P.INVYR,
        MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS md,
        COALESCE(SUM(CASE WHEN C.COND_STATUS_CD=1 THEN SC.SUBPCOND_PROP END),0) AS fsub,
        COALESCE(SUM(CASE WHEN C.COND_STATUS_CD=1 THEN SC.MICRCOND_PROP END),0) AS fmic
@@ -411,7 +411,7 @@ for _t in ("curated_cohorts_landis", "curated_cohorts_landis_stdorg", "tree_traj
 # raw RC8 closure breaks (plot, date) and whether they closed saplings
 con.execute(f"""
 CREATE TEMP TABLE rb AS
-SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT,
+SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR ry,
        MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS bd,
        bool_or(T.PREVDIA < 5) AS sap_closed
 FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y'
@@ -434,10 +434,10 @@ CREATE TEMP TABLE pv AS
 SELECT P.CN PLT_CN, P.STATECD,P.UNITCD,P.COUNTYCD,P.PLOT,P.INVYR,P.MANUAL,P.PLOT_STATUS_CD ps,
        MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md
 FROM f.PLOT P JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y' WHERE {scope('P')};
-CREATE TEMP TABLE pv2 AS SELECT *, lead(PLT_CN) OVER w ncn, lead(md) OVER w nmd, lead(MANUAL) OVER w nman, lead(ps) OVER w nps
-FROM pv WINDOW w AS (PARTITION BY STATECD,UNITCD,COUNTYCD,PLOT ORDER BY md);
+CREATE TEMP TABLE pv2 AS SELECT *, lead(PLT_CN) OVER w ncn, lead(INVYR) OVER w ny, lead(md) OVER w nmd, lead(MANUAL) OVER w nman, lead(ps) OVER w nps
+FROM pv WINDOW w AS (PARTITION BY STATECD,UNITCD,COUNTYCD,PLOT ORDER BY INVYR);
 CREATE TEMP TABLE us AS
-SELECT T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE, CAST(T.CN AS VARCHAR) pcn, v.MANUAL, v.nman, v.nmd, (T2.CN IS NULL) unrec
+SELECT T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE, CAST(T.CN AS VARCHAR) pcn, v.MANUAL, v.nman, v.ny, v.nmd, (T2.CN IS NULL) unrec
 FROM f.TREE T JOIN pv2 v ON v.PLT_CN=T.PLT_CN JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
 JOIN f.SUBPLOT SN ON SN.PLT_CN=v.ncn AND SN.SUBP=T.SUBP AND SN.SUBP_STATUS_CD=1
 LEFT JOIN f.TREE T2 ON T2.PLT_CN=v.ncn AND T2.SUBP=T.SUBP AND T2.TREE=T.TREE
@@ -446,14 +446,14 @@ WHERE T.STATUSCD=1 AND T.DIA<5 AND T.TPA_UNADJ>0 AND T.SUBP<=4 AND C.COND_STATUS
 con.execute("""
 CREATE TEMP TABLE ub AS
 WITH tr AS (SELECT STATECD, MANUAL, nman FROM us GROUP BY ALL HAVING count(*) >= 20 AND avg(unrec::INT) >= 0.5),
-pvv AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, nmd, any_value(MANUAL) MANUAL, any_value(nman) nman,
-               count(*) n, count(*) FILTER (WHERE unrec) nu FROM us GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, nmd)
-SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, nmd AS bd FROM pvv
+pvv AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, ny, nmd, any_value(MANUAL) MANUAL, any_value(nman) nman,
+               count(*) n, count(*) FILTER (WHERE unrec) nu FROM us GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, ny, nmd)
+SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, ny, nmd AS bd FROM pvv
 WHERE (nu >= 3 AND nu >= 0.5 * n)
    OR (nu >= 1 AND EXISTS (SELECT 1 FROM tr WHERE tr.STATECD = pvv.STATECD AND tr.MANUAL IS NOT DISTINCT FROM pvv.MANUAL
                            AND tr.nman IS NOT DISTINCT FROM pvv.nman))
    OR (nu >= 1 AND EXISTS (SELECT 1 FROM rb WHERE rb.STATECD = pvv.STATECD AND rb.UNITCD = pvv.UNITCD
-                           AND rb.COUNTYCD = pvv.COUNTYCD AND rb.PLOT = pvv.PLOT AND rb.bd = pvv.nmd))""")
+                           AND rb.COUNTYCD = pvv.COUNTYCD AND rb.PLOT = pvv.PLOT AND rb.ry = pvv.ny))""")
 _ub = con.execute("""SELECT (SELECT count(*) FROM ub),
     (SELECT count(*) FROM (SELECT STATECD,UNITCD,COUNTYCD,PLOT,MEASDATE FROM new.procedural_breaks
                            WHERE break_kind='unrecorded' OR n_unrecorded_saplings > 0
@@ -589,11 +589,11 @@ check_n("(n15) E30: clean_subplot_years = the raw subplot-visit scaffold (keys a
 # scaffold visit / 365.25), sim_year_i = max(raw_i, sim_year_{i-1} + 1) = i + cummax_{j<=i}(raw_j - j)
 con.execute("""
 CREATE TEMP TABLE sy AS
-WITH v AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, md measdate,
+WITH v AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, INVYR invyr, md measdate,
                   CAST(ROUND(datediff('day', min(md) OVER w, md) / 365.25) AS INTEGER) raw,
                   CAST(row_number() OVER w - 1 AS INTEGER) i
            FROM rv WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP ORDER BY md))
-SELECT statecd, unitcd, countycd, plot, subp, measdate,
+SELECT statecd, unitcd, countycd, plot, subp, invyr, measdate,
        CAST(i + max(raw - i) OVER (PARTITION BY statecd, unitcd, countycd, plot, subp ORDER BY measdate
                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS INTEGER) sim_year
 FROM v""")
@@ -601,7 +601,7 @@ for _t, _db in (("curated_cohorts_landis", "new"), ("curated_cohorts_landis_stdo
         ((("curated_cohorts_landis_simB", "newsimb"),) if a.simb_db else ()):
     r = con.execute(f"""SELECT count(*), count(*) FILTER (WHERE s.sim_year IS NULL),
                                count(*) FILTER (WHERE s.sim_year IS DISTINCT FROM c.sim_year)
-        FROM {_db}.{_t} c LEFT JOIN sy s USING (statecd, unitcd, countycd, plot, subp, measdate)
+        FROM {_db}.{_t} c LEFT JOIN sy s USING (statecd, unitcd, countycd, plot, subp, invyr)
         WHERE {scope('c', 'statecd', 'countycd')}""").fetchone()
     check_n(f"(n16) E7: {_t}: sim_year = the D18 rule re-derived from raw MEASDATEs", r[2] == 0, r[0],
             f"({r[2]:,} of {r[0]:,} rows differ; {r[1]:,} rows on a visit absent from the raw scaffold)")
@@ -610,11 +610,11 @@ for _t, _db in (("curated_cohorts_landis", "new"), ("curated_cohorts_landis_stdo
 r = con.execute(f"""
 WITH t AS (SELECT statecd, unitcd, countycd, plot, subp, tree, count(DISTINCT sim_year - age_calc) nb
            FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')} GROUP BY ALL),
-d AS (SELECT statecd, unitcd, countycd, plot, subp, tree, arg_min(age_calc, measdate) a0, min(measdate) md0
+d AS (SELECT statecd, unitcd, countycd, plot, subp, tree, arg_min(age_calc, invyr) a0, min(invyr) y0
       FROM new.tree_trajectories WHERE intro_type = 'real' AND {scope('', 'statecd', 'countycd')} GROUP BY ALL)
 SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM t WHERE nb > 1),
        (SELECT count(*) FROM d JOIN new.curated_trees c ON c.STATECD=d.statecd AND c.UNITCD=d.unitcd AND c.COUNTYCD=d.countycd
-           AND c.PLOT=d.plot AND c.SUBP=d.subp AND c.TREE=d.tree AND c.MEASDATE=d.md0
+           AND c.PLOT=d.plot AND c.SUBP=d.subp AND c.TREE=d.tree AND c.INVYR=d.y0
         WHERE c.estimated_age IS NOT NULL AND CAST(ROUND(c.estimated_age) AS INTEGER) <> d.a0)""").fetchone()
 check_n("(n16) E7: tree_trajectories: one birth year per tree and debut age_calc = round(estimated_age)",
         r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} trees; {r[1]} with > 1 birth year; {r[2]} debut ages differ)")
@@ -632,11 +632,11 @@ check_n("(n17) E9: curated_trees STATUSCD / SPCD / DIA / TPA_UNADJ / DRYBIO_AG e
         r[1] == 0 and r[2] == 0 and r[3] == 0, r[0], f"({r[0]:,} records; CN not in raw {r[1]}; status/species/DIA differ {r[2]}; TPA/biomass differ {r[3]})")
 # trajectories: a REAL row is one curated record; drybio_g = DRYBIO_AG * 453.592 (per tree), tpa = TPA_UNADJ
 con.execute(f"""CREATE TEMP TABLE trr AS
-SELECT t.statecd, t.unitcd, t.countycd, t.plot, t.subp, t.tree, t.measdate, t.species_symbol, t.age_calc, t.dia, t.drybio_g, t.tpa,
+SELECT t.statecd, t.unitcd, t.countycd, t.plot, t.subp, t.tree, t.invyr, t.measdate, t.species_symbol, t.age_calc, t.dia, t.drybio_g, t.tpa,
        r.STATUSCD rs, r.DIA rdia, r.DRYBIO_AG * {LB_G} rbio, r.TPA_UNADJ rtpa, c.estimated_age
 FROM new.tree_trajectories t
 LEFT JOIN new.curated_trees c ON c.STATECD=t.statecd AND c.UNITCD=t.unitcd AND c.COUNTYCD=t.countycd AND c.PLOT=t.plot
-     AND c.SUBP=t.subp AND c.TREE=t.tree AND c.MEASDATE=t.measdate
+     AND c.SUBP=t.subp AND c.TREE=t.tree AND c.INVYR=t.invyr
 LEFT JOIN rt r ON r.cn = CAST(c.CN AS VARCHAR)
 WHERE t.intro_type = 'real' AND {scope('t', 'statecd', 'countycd')}""")
 r = con.execute("""SELECT count(*), count(*) FILTER (WHERE rs IS NULL),
@@ -645,27 +645,27 @@ r = con.execute("""SELECT count(*), count(*) FILTER (WHERE rs IS NULL),
 check_n("(n17) E9: tree_trajectories real live rows: drybio_g = raw DRYBIO_AG x 453.592, tpa = raw TPA_UNADJ, dia = raw DIA",
         r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} real rows; no raw record {r[1]}; value differs {r[2]})")
 # Sim A / _stdorg real rows: one row per live aged tree record, agb = DRYBIO_AG * TPA_UNADJ * 453.592 / 4046.86
-# (g/m2); compared per cohort key (subplot, species, measdate, age_calc): row count and AGB sum
-con.execute(f"""CREATE TEMP TABLE exp_a AS SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc,
+# (g/m2); compared per cohort key (subplot, species, invyr, age_calc): row count and AGB sum
+con.execute(f"""CREATE TEMP TABLE exp_a AS SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc,
        count(*) n, sum(rbio * rtpa / {M2_AC}) agb FROM trr
     WHERE rs = 1 AND rbio IS NOT NULL AND rtpa IS NOT NULL AND estimated_age IS NOT NULL GROUP BY ALL""")
 for _t in ("curated_cohorts_landis", "curated_cohorts_landis_stdorg"):
-    r = con.execute(f"""WITH p AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc, count(*) n, sum(agb) agb
+    r = con.execute(f"""WITH p AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc, count(*) n, sum(agb) agb
                                    FROM new.{_t} WHERE intro_type IS NULL AND {scope('', 'statecd', 'countycd')} GROUP BY ALL)
         SELECT count(*), count(*) FILTER (WHERE p.n IS NULL), count(*) FILTER (WHERE e.n IS NULL),
                count(*) FILTER (WHERE p.n <> e.n OR abs(p.agb - e.agb) > 1e-6 * e.agb + 1e-6)
-        FROM p FULL JOIN exp_a e USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)""").fetchone()
+        FROM p FULL JOIN exp_a e USING (statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc)""").fetchone()
     check_n(f"(n17) E9: {_t} real rows = raw DRYBIO_AG x TPA_UNADJ (g/m2) per cohort key (both directions)",
             r[1] == 0 and r[2] == 0 and r[3] == 0, r[0], f"({r[0]:,} keys; raw-only {r[1]}, product-only {r[2]}, count/AGB differ {r[3]})")
 if a.simb_db:
     r = con.execute(f"""
-    WITH e AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc, sum(rbio * rtpa / {M2_AC}) agb
+    WITH e AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc, sum(rbio * rtpa / {M2_AC}) agb
                FROM trr WHERE rs = 1 AND rdia >= 5 AND rbio IS NOT NULL AND rtpa IS NOT NULL AND estimated_age IS NOT NULL GROUP BY ALL),
-    p AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc, count(*) n, sum(agb) agb
+    p AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc, count(*) n, sum(agb) agb
           FROM newsimb.curated_cohorts_landis_simB WHERE {scope('', 'statecd', 'countycd')} GROUP BY ALL)
     SELECT count(*), count(*) FILTER (WHERE p.agb IS NULL), count(*) FILTER (WHERE e.agb IS NULL),
            count(*) FILTER (WHERE p.n > 1 OR abs(p.agb - e.agb) > 1e-6 * e.agb + 1e-6)
-    FROM p FULL JOIN e USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)""").fetchone()
+    FROM p FULL JOIN e USING (statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc)""").fetchone()
     check_n("(n17) E9: Sim B rows = raw DRYBIO_AG x TPA_UNADJ of the real live >= 5 in members (one row per cohort key, both directions)",
             r[1] == 0 and r[2] == 0 and r[3] == 0, r[0], f"({r[0]:,} keys; raw-only {r[1]}, product-only {r[2]}, duplicate/AGB differ {r[3]})")
 
@@ -835,18 +835,18 @@ CREATE TEMP TABLE us2 AS
 WITH u AS (SELECT us.*, COALESCE(ct.TREE, us.TREE) ctree
            FROM us LEFT JOIN new.curated_trees ct ON CAST(ct.CN AS VARCHAR) = us.pcn)
 SELECT u.*, (e.TREE IS NOT NULL AND e.pu) AS censored_unrec, COALESCE(e.pu, FALSE) AS censored_pu
-FROM u LEFT JOIN (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,MEASDATE, bool_or(reason = 'procedural_unrecorded') pu
+FROM u LEFT JOIN (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE,INVYR, bool_or(reason = 'procedural_unrecorded') pu
                    FROM new.tree_censor_events
                    WHERE reason = 'procedural_unrecorded' GROUP BY ALL) e
   ON e.STATECD=u.STATECD AND e.UNITCD=u.UNITCD AND e.COUNTYCD=u.COUNTYCD AND e.PLOT=u.PLOT
- AND e.SUBP=u.SUBP AND e.TREE=u.ctree AND e.MEASDATE=u.nmd""")
+ AND e.SUBP=u.SUBP AND e.TREE=u.ctree AND e.INVYR=u.ny""")
 # r7 E10: the 'procedural_unrecorded' censoring events re-derived (an unrecorded sapling at a
 # raw re-tally plot-visit, ub) equal the pipeline's, in both directions
 r = con.execute("""
-WITH e AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,ctree TREE,nmd MEASDATE FROM us2
+WITH e AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,ctree TREE,ny INVYR FROM us2
            WHERE unrec AND EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=us2.STATECD AND ub.UNITCD=us2.UNITCD
-                 AND ub.COUNTYCD=us2.COUNTYCD AND ub.PLOT=us2.PLOT AND ub.bd=us2.nmd)),
-p AS (SELECT DISTINCT c.STATECD,c.UNITCD,c.COUNTYCD,c.PLOT,c.SUBP,c.TREE,c.MEASDATE FROM new.tree_censor_events c
+                 AND ub.COUNTYCD=us2.COUNTYCD AND ub.PLOT=us2.PLOT AND ub.ny=us2.ny)),
+p AS (SELECT DISTINCT c.STATECD,c.UNITCD,c.COUNTYCD,c.PLOT,c.SUBP,c.TREE,c.INVYR FROM new.tree_censor_events c
       WHERE c.reason = 'procedural_unrecorded')
 SELECT (SELECT count(*) FROM e), (SELECT count(*) FROM (SELECT * FROM e EXCEPT SELECT * FROM p)),
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM e))""").fetchone()
@@ -936,7 +936,7 @@ r = con.execute("""SELECT count(*) FILTER (WHERE tt.intro_type = 'real'), count(
   (SELECT count(*) FROM new.curated_trees WHERE misrecorded_death)
   FROM new.tree_trajectories tt JOIN new.curated_trees t
   ON t.STATECD=tt.statecd AND t.UNITCD=tt.unitcd AND t.COUNTYCD=tt.countycd AND t.PLOT=tt.plot AND t.SUBP=tt.subp
- AND t.TREE=tt.tree AND t.MEASDATE=tt.measdate AND t.STATUSCD IN (2,3) WHERE t.misrecorded_death""").fetchone()
+ AND t.TREE=tt.tree AND t.INVYR=tt.invyr AND t.STATUSCD IN (2,3) WHERE t.misrecorded_death""").fetchone()
 check("(c1) R4: a misrecorded death is never a REAL trajectory slot (the tree continues)", r[0] == 0,
       f"({r[0]}; {r[1]} of {r[2]} such visits are now gap-interpolated live slots)")
 # r7 E12: the raw class of every dead/cut record, with the harvest_inferred rule re-derived: a
@@ -975,11 +975,11 @@ FROM rawcls d JOIN new.curated_trees t ON CAST(t.CN AS VARCHAR) = d.cn""").fetch
 check("(c2) rerecord_dead = re-derived (PREV_STATUS_CD 2, or a dead/cut record after the tree's first; both directions)",
       r[1] == 0 and r[2] == 0, f"({r[0]:,} re-records ({r[3]:,} by PREV_STATUS_CD 2); {r[1]} unflagged, {r[2]} extra)")
 r = con.execute(f"""
-WITH ev AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,MEASDATE, sum(n_harvested + n_disturbance_dead) e
+WITH ev AS (SELECT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,INVYR, sum(n_harvested + n_disturbance_dead) e
             FROM new.curated_cohorts WHERE {scope()} GROUP BY ALL HAVING sum(n_harvested + n_disturbance_dead) > 0),
-fd AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,MEASDATE FROM new.curated_trees
+fd AS (SELECT DISTINCT STATECD,UNITCD,COUNTYCD,PLOT,SUBP,INVYR FROM new.curated_trees
        WHERE STATUSCD IN (2,3) AND NOT rerecord_dead AND NOT COALESCE(misrecorded_death, FALSE) AND {scope()})   -- r7 F-9
-SELECT count(*), sum(e) FROM ev ANTI JOIN fd USING (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,MEASDATE)""").fetchone()
+SELECT count(*), sum(e) FROM ev ANTI JOIN fd USING (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,INVYR)""").fetchone()
 check("(c2) no cohort harvest/disturbance event at a subplot-visit whose dead records are all re-records",
       (r[0] or 0) == 0, f"({r[0]} subplot-visits, {r[1]} events)")
 # r7 D41: the two former subp_has_dstrb checks (first non-re-record dead record; raw attribution
@@ -987,7 +987,7 @@ check("(c2) no cohort harvest/disturbance event at a subplot-visit whose dead re
 n_rr = con.execute("""
 SELECT count(*) FROM new.tree_trajectories tt JOIN new.curated_trees t
   ON t.STATECD=tt.statecd AND t.UNITCD=tt.unitcd AND t.COUNTYCD=tt.countycd AND t.PLOT=tt.plot AND t.SUBP=tt.subp
- AND t.TREE=tt.tree AND t.MEASDATE=tt.measdate
+ AND t.TREE=tt.tree AND t.INVYR=tt.invyr
 WHERE t.rerecord_dead""").fetchone()[0]
 check("(c2) re-records are never trajectory slots", n_rr == 0, f"({n_rr})")
 
@@ -1087,40 +1087,40 @@ if a.simb_db:
     # > 0, and with no survivor it is a FULL removal (D42, drop 1.0).
     con.execute("""
     CREATE TEMP TABLE mydrop AS
-    WITH ax AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, lead(measdate) OVER w nmd, lead(sim_year) OVER w nsy
-                FROM sy WINDOW w AS (PARTITION BY statecd, unitcd, countycd, plot, subp ORDER BY measdate)),
-    mem AS (SELECT t.*, t.rbio * t.rtpa w, x.nmd, x.nsy FROM trr t JOIN ax x USING (statecd, unitcd, countycd, plot, subp, measdate)
+    WITH ax AS (SELECT statecd, unitcd, countycd, plot, subp, invyr, lead(invyr) OVER w niy, lead(measdate) OVER w nmd, lead(sim_year) OVER w nsy
+                FROM sy WINDOW w AS (PARTITION BY statecd, unitcd, countycd, plot, subp ORDER BY invyr)),
+    mem AS (SELECT t.*, t.rbio * t.rtpa w, x.niy, x.nmd, x.nsy FROM trr t JOIN ax x USING (statecd, unitcd, countycd, plot, subp, invyr)
             WHERE t.rs = 1 AND t.rdia >= 5 AND t.rbio IS NOT NULL AND t.rtpa IS NOT NULL AND x.nmd IS NOT NULL),
-    st AS (SELECT m.statecd, m.unitcd, m.countycd, m.plot, m.subp, m.species_symbol, m.nmd, m.nsy,
-                  m.measdate, m.tree, m.w w_prev, (SELECT s.sim_year FROM sy s WHERE s.statecd = m.statecd AND s.unitcd = m.unitcd
-                      AND s.countycd = m.countycd AND s.plot = m.plot AND s.subp = m.subp AND s.measdate = m.measdate) - m.age_calc nb,
+    st AS (SELECT m.statecd, m.unitcd, m.countycd, m.plot, m.subp, m.species_symbol, m.niy, m.nsy,
+                  m.invyr, m.tree, m.w w_prev, (SELECT s.sim_year FROM sy s WHERE s.statecd = m.statecd AND s.unitcd = m.unitcd
+                      AND s.countycd = m.countycd AND s.plot = m.plot AND s.subp = m.subp AND s.invyr = m.invyr) - m.age_calc nb,
                   c.w w_cur, (c.tree IS NULL AND (g.tree IS NOT NULL OR s5.tree IS NOT NULL)) excl,
                   (c.tree IS NULL AND EXISTS (SELECT 1 FROM myev e WHERE e.STATECD = m.statecd AND e.UNITCD = m.unitcd AND e.COUNTYCD = m.countycd
                         AND e.PLOT = m.plot AND e.SUBP = m.subp AND e.TREE = m.tree AND e.ev_md = m.nmd)) removed
            FROM mem m
            LEFT JOIN (SELECT *, rbio * rtpa w FROM trr WHERE rs = 1 AND rdia >= 5) c
              ON c.statecd = m.statecd AND c.unitcd = m.unitcd AND c.countycd = m.countycd AND c.plot = m.plot AND c.subp = m.subp
-            AND c.tree = m.tree AND c.measdate = m.nmd
+            AND c.tree = m.tree AND c.invyr = m.niy
            LEFT JOIN (SELECT * FROM trr WHERE rs = 1 AND (rdia < 5 OR rdia IS NULL)) s5
              ON s5.statecd = m.statecd AND s5.unitcd = m.unitcd AND s5.countycd = m.countycd AND s5.plot = m.plot AND s5.subp = m.subp
-            AND s5.tree = m.tree AND s5.measdate = m.nmd
+            AND s5.tree = m.tree AND s5.invyr = m.niy
            LEFT JOIN new.tree_trajectories g ON g.intro_type = 'gap_interpolated' AND g.statecd = m.statecd AND g.unitcd = m.unitcd
-            AND g.countycd = m.countycd AND g.plot = m.plot AND g.subp = m.subp AND g.tree = m.tree AND g.measdate = m.nmd),
-    co AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, nmd, any_value(nsy) nsy, nb,
+            AND g.countycd = m.countycd AND g.plot = m.plot AND g.subp = m.subp AND g.tree = m.tree AND g.invyr = m.niy),
+    co AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, niy, any_value(nsy) nsy, nb,
                   sum(w_prev) FILTER (WHERE w_cur IS NOT NULL) sp, sum(w_cur) FILTER (WHERE w_cur IS NOT NULL) sc,
                   count(*) FILTER (WHERE w_cur IS NOT NULL) n_surv, count(*) FILTER (WHERE removed AND NOT excl) n_dist,
                   sum(w_prev) FILTER (WHERE removed AND NOT excl) wrem
-           FROM st GROUP BY statecd, unitcd, countycd, plot, subp, species_symbol, nmd, nb)
-    SELECT statecd, unitcd, countycd, plot, subp, species_symbol, nmd measdate, CAST(nsy - nb AS INTEGER) age_calc,
+           FROM st GROUP BY statecd, unitcd, countycd, plot, subp, species_symbol, niy, nb)
+    SELECT statecd, unitcd, countycd, plot, subp, species_symbol, niy invyr, CAST(nsy - nb AS INTEGER) age_calc,
            wrem * CASE WHEN sp > 0 THEN least(greatest(sc / sp, 0.5), 3.0) ELSE 1.0 END dropped, n_dist, n_surv,
            wrem * CASE WHEN sp > 0 THEN least(greatest(sc / sp, 0.5), 3.0) ELSE 1.0 END + COALESCE(sc, 0) would_be,
            (n_surv = 0) full_removal,
            -- a no-survivor cohort-visit at which another tree of the cohort key is alive in ANY form
            -- (a member below 5 in / as a gap slot, an ingrowth tree, a phantom): D42 does not say whether
            -- that is a full removal (there may be a Sim B row) — reported, not compared
-           (n_surv = 0 AND EXISTS (SELECT 1 FROM new.tree_trajectories z LEFT JOIN trr r USING (statecd, unitcd, countycd, plot, subp, tree, measdate)
+           (n_surv = 0 AND EXISTS (SELECT 1 FROM new.tree_trajectories z LEFT JOIN trr r USING (statecd, unitcd, countycd, plot, subp, tree, invyr)
                 WHERE z.statecd = co.statecd AND z.unitcd = co.unitcd AND z.countycd = co.countycd AND z.plot = co.plot AND z.subp = co.subp
-                  AND z.species_symbol = co.species_symbol AND z.measdate = co.nmd AND z.sim_year - z.age_calc = co.nb
+                  AND z.species_symbol = co.species_symbol AND z.invyr = co.niy AND z.sim_year - z.age_calc = co.nb
                   AND (z.intro_type IN ('phantom_backfill', 'gap_interpolated') OR r.rs = 1))) amb
     FROM co WHERE n_dist > 0 AND wrem > 0""")
     _cdcols = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE database_name='newsimb' "
@@ -1129,14 +1129,14 @@ if a.simb_db:
     if "full_removal" not in _cdcols:
         check("(n22) D42: cohort_disturbance carries full_removal", False, "(column missing)")
     r = con.execute(f"""
-    WITH d AS (SELECT *, CAST(measdate AS DATE) md FROM newsimb.cohort_disturbance WHERE {scope('', 'statecd', 'countycd')}),
+    WITH d AS (SELECT * FROM newsimb.cohort_disturbance WHERE {scope('', 'statecd', 'countycd')}),
     j AS (SELECT m.*, d.dropped d_dropped, d.would_be d_would_be, d.n_disturbed d_nd, d.n_survivors d_ns, {_fr} d_full,
                  d.disturbance_drop_pct d_drop, d.statecd d_st
           FROM (SELECT * FROM mydrop WHERE NOT amb) m FULL JOIN (SELECT d.* FROM d ANTI JOIN (SELECT * FROM mydrop WHERE amb) x
                  ON d.statecd = x.statecd AND d.unitcd = x.unitcd AND d.countycd = x.countycd AND d.plot = x.plot AND d.subp = x.subp
-                AND d.species_symbol = x.species_symbol AND d.md = x.measdate AND d.age_calc = x.age_calc) d
+                AND d.species_symbol = x.species_symbol AND d.invyr = x.invyr AND d.age_calc = x.age_calc) d
             ON d.statecd = m.statecd AND d.unitcd = m.unitcd AND d.countycd = m.countycd AND d.plot = m.plot
-           AND d.subp = m.subp AND d.species_symbol = m.species_symbol AND d.md = m.measdate AND d.age_calc = m.age_calc)
+           AND d.subp = m.subp AND d.species_symbol = m.species_symbol AND d.invyr = m.invyr AND d.age_calc = m.age_calc)
     SELECT count(*) FILTER (WHERE statecd IS NOT NULL), count(*) FILTER (WHERE d_st IS NOT NULL),
            count(*) FILTER (WHERE d_st IS NULL), count(*) FILTER (WHERE statecd IS NULL),
            count(*) FILTER (WHERE statecd IS NOT NULL AND d_st IS NOT NULL AND (abs(dropped - d_dropped) > 1e-6 * dropped + 1e-5
@@ -1149,22 +1149,22 @@ if a.simb_db:
             f"values differ {r[4]:,})")
     _amb = con.execute("""SELECT count(*), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM newsimb.cohort_disturbance d
         WHERE d.statecd = m.statecd AND d.unitcd = m.unitcd AND d.countycd = m.countycd AND d.plot = m.plot AND d.subp = m.subp
-          AND d.species_symbol = m.species_symbol AND CAST(d.measdate AS DATE) = m.measdate AND d.age_calc = m.age_calc))
+          AND d.species_symbol = m.species_symbol AND d.invyr = m.invyr AND d.age_calc = m.age_calc))
         FROM mydrop m WHERE amb""").fetchone()
     info("(n22) D42 open case: no surviving member, but another tree of the cohort key alive at the visit",
          f"({_amb[0]:,} cohort-visits; {_amb[1]:,} of them have a cohort_disturbance row) — not compared")
     if r[2] or r[3] or r[4]:
         show("(n22) first drop differences", f"""
-        WITH d AS (SELECT *, CAST(measdate AS DATE) md FROM newsimb.cohort_disturbance WHERE {scope('', 'statecd', 'countycd')})
-        (SELECT 'missing' k, m.statecd, m.countycd, m.plot, m.subp, m.species_symbol, m.measdate, m.age_calc, round(m.dropped, 1) dropped,
+        WITH d AS (SELECT * FROM newsimb.cohort_disturbance WHERE {scope('', 'statecd', 'countycd')})
+        (SELECT 'missing' k, m.statecd, m.countycd, m.plot, m.subp, m.species_symbol, m.invyr, m.age_calc, round(m.dropped, 1) dropped,
                 NULL::DOUBLE p_dropped, m.n_dist, m.n_surv FROM mydrop m ANTI JOIN d ON d.statecd = m.statecd AND d.unitcd = m.unitcd
            AND d.countycd = m.countycd AND d.plot = m.plot AND d.subp = m.subp AND d.species_symbol = m.species_symbol
-           AND d.md = m.measdate AND d.age_calc = m.age_calc ORDER BY ALL LIMIT 5)
+           AND d.invyr = m.invyr AND d.age_calc = m.age_calc ORDER BY ALL LIMIT 5)
         UNION ALL
-        (SELECT 'extra', d.statecd, d.countycd, d.plot, d.subp, d.species_symbol, d.md, d.age_calc, NULL, round(d.dropped, 1),
+        (SELECT 'extra', d.statecd, d.countycd, d.plot, d.subp, d.species_symbol, d.invyr, d.age_calc, NULL, round(d.dropped, 1),
                 d.n_disturbed, d.n_survivors FROM d ANTI JOIN mydrop m ON d.statecd = m.statecd AND d.unitcd = m.unitcd
            AND d.countycd = m.countycd AND d.plot = m.plot AND d.subp = m.subp AND d.species_symbol = m.species_symbol
-           AND d.md = m.measdate AND d.age_calc = m.age_calc ORDER BY ALL LIMIT 5)""")
+           AND d.invyr = m.invyr AND d.age_calc = m.age_calc ORDER BY ALL LIMIT 5)""")
     # the stored drop (D31 / D42): partial = (dropped / 4046.8564224) / (agb + dropped / 4046.8564224) with agb the
     # Sim B row (verified against raw above); a full removal has no Sim B row and drop 1.0. The Sim B
     # attached drop equals it on every row, and no Sim B row carries a drop the re-derivation lacks.
@@ -1175,16 +1175,16 @@ if a.simb_db:
                  -- since agb / (1 - 1.0) cannot be inverted
                  CASE WHEN b.agb IS NULL THEN 1.0 ELSE (m.dropped / 4046.8564224) / (b.agb + m.dropped / 4046.8564224) END e_drop
           FROM (SELECT * FROM mydrop WHERE NOT amb) m
-          LEFT JOIN b USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)
+          LEFT JOIN b USING (statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc)
           LEFT JOIN newsimb.cohort_disturbance d ON d.statecd = m.statecd AND d.unitcd = m.unitcd AND d.countycd = m.countycd
-           AND d.plot = m.plot AND d.subp = m.subp AND d.species_symbol = m.species_symbol AND CAST(d.measdate AS DATE) = m.measdate
+           AND d.plot = m.plot AND d.subp = m.subp AND d.species_symbol = m.species_symbol AND d.invyr = m.invyr
            AND d.age_calc = m.age_calc)
     SELECT count(*), count(*) FILTER (WHERE NOT full_removal AND agb IS NULL), count(*) FILTER (WHERE full_removal AND agb IS NULL AND d_drop <> 1.0),
            count(*) FILTER (WHERE abs(d_drop - e_drop) > 1e-7 OR d_drop IS NULL),
            count(*) FILTER (WHERE agb IS NOT NULL AND (abs(b_drop - e_drop) > 1e-7 OR b_drop IS NULL)),
            (SELECT count(*) FROM b WHERE disturbance_drop_pct > 0 AND NOT EXISTS (SELECT 1 FROM mydrop m WHERE m.statecd = b.statecd
               AND m.unitcd = b.unitcd AND m.countycd = b.countycd AND m.plot = b.plot AND m.subp = b.subp AND m.species_symbol = b.species_symbol
-              AND m.measdate = b.measdate AND m.age_calc = b.age_calc))
+              AND m.invyr = b.invyr AND m.age_calc = b.age_calc))
     FROM j""").fetchone()
     check_n("(n8) F7-9: the stored and attached drops = Pan's formula on the RE-DERIVED dropped biomass and the Sim B AGB "
             "(full removals without a Sim B row: 1.0)", all(x == 0 for x in r[1:]), r[0],
@@ -1229,13 +1229,13 @@ SELECT (SELECT count(*) FROM e), (SELECT count(*) FROM (SELECT * FROM e EXCEPT S
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM e))""").fetchone()
 check_n("(n23) procedural_breaks = re-derived (RC8 closures, silent re-tallies; both directions)",
         r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} re-derived plot-visits; missing {r[1]}, extra {r[2]})")
-con.execute(f"""CREATE TEMP TABLE pbx AS SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, bd measdate FROM rb
-                UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM ub""")
+con.execute(f"""CREATE TEMP TABLE pbx AS SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, ry invyr FROM rb
+                UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, ny FROM ub""")
 for _t, _db in _TABS:
     if _t == "tree_trajectories":
         continue
     r = con.execute(f"""SELECT count(*), count(*) FILTER (WHERE c.procedural_break IS DISTINCT FROM (x.plot IS NOT NULL))
-        FROM {_db}.{_t} c LEFT JOIN pbx x USING (statecd, unitcd, countycd, plot, measdate) WHERE {scope('c', 'statecd', 'countycd')}""").fetchone()
+        FROM {_db}.{_t} c LEFT JOIN pbx x USING (statecd, unitcd, countycd, plot, invyr) WHERE {scope('c', 'statecd', 'countycd')}""").fetchone()
     check_n(f"(n23) E23: {_t}: procedural_break = the row's visit is a re-derived procedural break", r[1] == 0, r[0],
             f"({r[1]:,} of {r[0]:,} rows differ)")
 # cycle (D44 C F3): a row carries its OWN visit's CYCLE (synthetic rows: their visit's, or NULL — never
@@ -1246,19 +1246,19 @@ for _t, _db in _TABS:
     _mf = "intro_type IS NULL" if _t.startswith("curated_cohorts_landis") and not _t.endswith("simB") else "TRUE"
     r = con.execute(f"""
     WITH c AS (SELECT * FROM {_db}.{_t} WHERE {scope('', 'statecd', 'countycd')}),
-    pm AS (SELECT statecd, unitcd, countycd, plot, count(DISTINCT measdate) n FROM c WHERE {_mf} GROUP BY ALL),
-    sm AS (SELECT statecd, unitcd, countycd, plot, subp, count(DISTINCT measdate) n FROM c WHERE {_mf} GROUP BY ALL)
+    pm AS (SELECT statecd, unitcd, countycd, plot, count(DISTINCT invyr) n FROM c WHERE {_mf} GROUP BY ALL),
+    sm AS (SELECT statecd, unitcd, countycd, plot, subp, count(DISTINCT invyr) n FROM c WHERE {_mf} GROUP BY ALL)
     SELECT count(*),
            count(*) FILTER (WHERE c.cycle IS DISTINCT FROM v.CYCLE AND NOT (c.cycle IS NULL AND COALESCE(c.intro_type, 'real') <> 'real')),
            count(*) FILTER (WHERE c.plot_meas_num IS DISTINCT FROM pm.n), count(*) FILTER (WHERE c.subp_meas_num IS DISTINCT FROM sm.n)
-    FROM c LEFT JOIN pvis v USING (statecd, unitcd, countycd, plot, measdate)
+    FROM c LEFT JOIN pvis v USING (statecd, unitcd, countycd, plot, invyr)
     LEFT JOIN pm USING (statecd, unitcd, countycd, plot) LEFT JOIN sm USING (statecd, unitcd, countycd, plot, subp)""").fetchone()
     check_n(f"(n23) E23 / D44: {_t}: cycle = the row's own visit CYCLE; plot_meas_num / subp_meas_num = distinct visits",
             r[1] == 0 and r[2] == 0 and r[3] == 0, r[0], f"({r[0]:,} rows; cycle differs {r[1]:,}; plot_meas_num {r[2]:,}; subp_meas_num {r[3]:,})")
 # synthetic trajectory rows carry their own visit's condition (D44 C F3): condid NULL or a condition of that visit
 r = con.execute(f"""SELECT count(*), count(*) FILTER (WHERE t.condid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM f.COND C
                          WHERE CAST(C.PLT_CN AS VARCHAR) = v.cn AND C.CONDID = t.condid))
-    FROM new.tree_trajectories t JOIN pvis v USING (statecd, unitcd, countycd, plot, measdate)
+    FROM new.tree_trajectories t JOIN pvis v USING (statecd, unitcd, countycd, plot, invyr)
     WHERE t.intro_type IN ('phantom_backfill', 'gap_interpolated') AND {scope('t', 'statecd', 'countycd')}""").fetchone()
 if r[0]:
     check("(n23) D44 C F3: synthetic trajectory rows carry a CONDID of their own visit (or NULL)", r[1] == 0, f"({r[1]:,} of {r[0]:,})")
@@ -1289,33 +1289,33 @@ check("(n23) E23 / D40 M-9: age_domain values and rules (null off-model; natural
 # cohort age metadata (I4 / D10 / D11), REAL rows: per cohort key the member counts and AGB shares
 # re-derived from the members' curated age_domain / age_source (Sim A: one row per tree record)
 con.execute(f"""CREATE TEMP TABLE memx AS
-SELECT t.statecd, t.unitcd, t.countycd, t.plot, t.subp, t.species_symbol, t.measdate, t.age_calc, t.rdia,
+SELECT t.statecd, t.unitcd, t.countycd, t.plot, t.subp, t.species_symbol, t.invyr, t.age_calc, t.rdia,
        t.rbio * t.rtpa / {M2_AC} agb, c.age_source src,
        -- D11 / D46: "natural model ages" = natural-stratum model ages, natural out_of_support (M-9) included
        (c.age_source = 'model' AND (c.age_domain = 'natural_treeage_scale' OR (c.age_domain = 'out_of_support' AND c.age_stratum = 'natural'))) is_nat,
        COALESCE(c.age_domain LIKE 'known_bias_%', FALSE) is_kb
 FROM trr t JOIN new.curated_trees c ON c.STATECD=t.statecd AND c.UNITCD=t.unitcd AND c.COUNTYCD=t.countycd AND c.PLOT=t.plot
-     AND c.SUBP=t.subp AND c.TREE=t.tree AND c.MEASDATE=t.measdate
+     AND c.SUBP=t.subp AND c.TREE=t.tree AND c.INVYR=t.invyr
 WHERE t.rs = 1 AND t.rbio IS NOT NULL AND t.rtpa IS NOT NULL AND t.estimated_age IS NOT NULL""")
 for _t, _db, _flt in (("curated_cohorts_landis", "new", "TRUE"), ("curated_cohorts_landis_stdorg", "new", "TRUE")) + \
         ((("curated_cohorts_landis_simB", "newsimb", "rdia >= 5"),) if a.simb_db else ()):
     r = con.execute(f"""
-    WITH e AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc, sum(is_nat::INT) nn, sum(is_kb::INT) nk,
+    WITH e AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc, sum(is_nat::INT) nn, sum(is_kb::INT) nk,
                       sum(agb) FILTER (WHERE is_nat) / sum(agb) sn, sum(agb) FILTER (WHERE is_kb) / sum(agb) sk FROM memx WHERE {_flt} GROUP BY ALL),
-    sa AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc, src, sum(agb) w FROM memx WHERE {_flt} GROUP BY ALL),
-    mx AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc, max(w) wmax FROM sa GROUP BY ALL),
-    p AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc, sum(n_trees_natural_treeage_scale) nn,
+    sa AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc, src, sum(agb) w FROM memx WHERE {_flt} GROUP BY ALL),
+    mx AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc, max(w) wmax FROM sa GROUP BY ALL),
+    p AS (SELECT statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc, sum(n_trees_natural_treeage_scale) nn,
                  sum(n_trees_known_bias) nk, sum(agb * share_natural_treeage_scale) / sum(agb) sn, sum(agb * share_known_bias) / sum(agb) sk,
                  list(DISTINCT age_source_major) maj
           FROM {_db}.{_t} WHERE intro_type IS NULL AND {scope('', 'statecd', 'countycd')} GROUP BY ALL)
     SELECT count(*), count(*) FILTER (WHERE p.nn <> e.nn OR p.nk <> e.nk OR abs(COALESCE(p.sn, 0) - COALESCE(e.sn, 0)) > 1e-6
                                        OR abs(COALESCE(p.sk, 0) - COALESCE(e.sk, 0)) > 1e-6),
            count(*) FILTER (WHERE EXISTS (SELECT 1 FROM UNNEST(p.maj) u(m) WHERE NOT EXISTS (SELECT 1 FROM sa JOIN mx USING
-                  (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc) WHERE sa.statecd = p.statecd AND sa.unitcd = p.unitcd
+                  (statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc) WHERE sa.statecd = p.statecd AND sa.unitcd = p.unitcd
                   AND sa.countycd = p.countycd AND sa.plot = p.plot AND sa.subp = p.subp AND sa.species_symbol = p.species_symbol
-                  AND sa.measdate = p.measdate AND sa.age_calc = p.age_calc AND sa.src IS NOT DISTINCT FROM u.m
+                  AND sa.invyr = p.invyr AND sa.age_calc = p.age_calc AND sa.src IS NOT DISTINCT FROM u.m
                   AND (sa.w >= mx.wmax * (1 - 1e-9) OR {'FALSE' if _t.endswith('simB') else 'TRUE'}))))
-    FROM p JOIN e USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)""").fetchone()
+    FROM p JOIN e USING (statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc)""").fetchone()
     check_n(f"(n23) E23 / D10: {_t}: real-row age metadata (n_trees / AGB shares natural_treeage_scale and known_bias, "
             "age_source_major) = re-derived from the members", r[1] == 0 and r[2] == 0, r[0],
             f"({r[0]:,} cohort keys; counts / shares differ {r[1]:,}; age_source_major not a dominant member source {r[2]:,})")
@@ -1373,7 +1373,7 @@ else:
 # all_live_withdrawn_rc7 on its curated records and in the cohort tables' visit metadata
 con.execute(f"""
 CREATE TEMP TABLE wdv AS
-WITH lt AS (SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT,
+WITH lt AS (SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR,
                    MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md,
                    (rc7.d7 IS NOT NULL AND MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) < rc7.d7) pre
             FROM f.TREE T JOIN f.PLOT P ON P.CN = T.PLT_CN JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
@@ -1384,13 +1384,13 @@ WITH lt AS (SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT,
             WHERE T.STATUSCD = 1 AND T.TPA_UNADJ > 0 AND T.SUBP <= 4 AND C.COND_STATUS_CD = 1
               AND P.PLOT_STATUS_CD < 3 AND COALESCE(SU.SUBP_STATUS_CD, -1) <> 3 AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
               AND T.SPCD IN (SELECT SPCD FROM f.REF_SPECIES) AND {scope('T')})
-SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, md measdate, count(*) n FROM lt GROUP BY ALL HAVING bool_and(pre)""")
+SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, INVYR invyr, count(*) n FROM lt GROUP BY ALL HAVING bool_and(pre)""")
 _nwd = con.execute("SELECT count(*) FROM wdv").fetchone()[0]
 if "all_live_withdrawn_rc7" in _ctc:
     r = con.execute(f"""SELECT count(*), count(*) FILTER (WHERE COALESCE(c.all_live_withdrawn_rc7, FALSE) <> (w.plot IS NOT NULL)),
-                               count(DISTINCT (c.STATECD, c.UNITCD, c.COUNTYCD, c.PLOT, c.MEASDATE)) FILTER (WHERE c.all_live_withdrawn_rc7)
+                               count(DISTINCT (c.STATECD, c.UNITCD, c.COUNTYCD, c.PLOT, c.INVYR)) FILTER (WHERE c.all_live_withdrawn_rc7)
         FROM new.curated_trees c LEFT JOIN wdv w ON w.statecd = c.STATECD AND w.unitcd = c.UNITCD AND w.countycd = c.COUNTYCD
-         AND w.plot = c.PLOT AND w.measdate = c.MEASDATE WHERE {scope('c')}""").fetchone()
+         AND w.plot = c.PLOT AND w.invyr = c.INVYR WHERE {scope('c')}""").fetchone()
     check("(n24) D39: curated_trees all_live_withdrawn_rc7 = re-derived (every live tally record of the visit precedes an RC7 record)",
           r[1] == 0, f"({_nwd} re-derived visits; {r[2]} flagged visits in curated_trees; {r[1]:,} records differ)")
 else:
@@ -1401,7 +1401,7 @@ for _t, _db in _TABS:
         check(f"(n24) D39: {_t} carries all_live_withdrawn_rc7 (visit metadata)", False, "(column missing)")
         continue
     r = con.execute(f"""SELECT count(*), count(*) FILTER (WHERE COALESCE(c.all_live_withdrawn_rc7, FALSE) <> (w.plot IS NOT NULL))
-        FROM {_db}.{_t} c LEFT JOIN wdv w USING (statecd, unitcd, countycd, plot, measdate) WHERE {scope('c', 'statecd', 'countycd')}""").fetchone()
+        FROM {_db}.{_t} c LEFT JOIN wdv w USING (statecd, unitcd, countycd, plot, invyr) WHERE {scope('c', 'statecd', 'countycd')}""").fetchone()
     check_n(f"(n24) D39: {_t}: all_live_withdrawn_rc7 = the row's visit is re-derived withdrawn", r[1] == 0, r[0], f"({r[1]:,} of {r[0]:,} rows differ)")
 
 # ---- r7 D43: no PLOT / COND row of a visit outside the curated product ---------------------------
@@ -1665,22 +1665,22 @@ if a.simb_db:
     # sapling-only cohort, absent from Sim B by design
     r = con.execute(f"""
     WITH d AS (SELECT * FROM newsimb.cohort_disturbance WHERE {scope('', 'statecd', 'countycd')}),
-    m AS (SELECT d.* FROM d ANTI JOIN newsimb.curated_cohorts_landis_simB c USING (statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc)),
-    tr AS (SELECT DISTINCT statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc FROM new.tree_trajectories
+    m AS (SELECT d.* FROM d ANTI JOIN newsimb.curated_cohorts_landis_simB c USING (statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc)),
+    tr AS (SELECT DISTINCT statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc FROM new.tree_trajectories
            WHERE intro_type='real' AND dia >= 5)
     SELECT (SELECT count(*) FROM d), (SELECT count(*) FROM m),
-           (SELECT count(*) FROM m SEMI JOIN tr USING (statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc))""").fetchone()
+           (SELECT count(*) FROM m SEMI JOIN tr USING (statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc))""").fetchone()
     check("(l) M1: every disturbance drop of a cohort with a >= 5 in member matches Sim B exactly", r[2] == 0,
           f"({r[1]:,}/{r[0]:,} drops unmatched: {r[2]} misaligned, the rest sapling-only cohorts absent from Sim B)")
     n_b = con.execute(f"""
-    WITH tr AS (SELECT DISTINCT statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc FROM new.tree_trajectories
+    WITH tr AS (SELECT DISTINCT statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc FROM new.tree_trajectories
                 WHERE intro_type='real' AND dia >= 5)
-    SELECT count(*) FROM newsimb.curated_cohorts_landis_simB c ANTI JOIN tr USING (statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc)
+    SELECT count(*) FROM newsimb.curated_cohorts_landis_simB c ANTI JOIN tr USING (statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc)
     WHERE {scope('c', 'statecd', 'countycd')}""").fetchone()[0]
-    check("(l) M1: every Sim B cohort row sits on the trajectory time axis (same measdate, age_calc)", n_b == 0, f"({n_b})")
+    check("(l) M1: every Sim B cohort row sits on the trajectory time axis (same invyr, age_calc)", n_b == 0, f"({n_b})")
 for t, db in (("curated_cohorts_landis", "new"), ("tree_trajectories", "new")) + ((("curated_cohorts_landis_simB", "newsimb"),) if a.simb_db else ()):
     n = con.execute(f"""SELECT count(*) FROM (SELECT statecd,unitcd,countycd,plot,subp,sim_year FROM {db}.{t}
-                       WHERE {scope('', 'statecd', 'countycd')} GROUP BY ALL HAVING count(DISTINCT measdate) > 1)""").fetchone()[0]
+                       WHERE {scope('', 'statecd', 'countycd')} GROUP BY ALL HAVING count(DISTINCT invyr) > 1)""").fetchone()[0]
     check(f"(l) M2: {t}: sim_year strictly increasing per subplot (no shared sim_year)", n == 0, f"({n})")
 show("(l) M3: tree-number reuse split (trees / records on a split key)", f"""
 SELECT STATECD, count(DISTINCT (STATECD,UNITCD,COUNTYCD,PLOT,SUBP,TREE)) trees, count(*) records,
@@ -1706,26 +1706,26 @@ TRK = "statecd,unitcd,countycd,plot,subp"
 # n1 (M-1): ONE sim_year axis per subplot, shared by Sim A, Sim B and the trajectories, 0 at the
 # subplot's first scaffold visit (clean_subplot_years)
 r = con.execute(f"""
-WITH a AS (SELECT DISTINCT {TRK},measdate,sim_year FROM new.curated_cohorts_landis WHERE {scope('', 'statecd', 'countycd')}),
-t AS (SELECT DISTINCT {TRK},measdate,sim_year FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')}),
-f0 AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, min(MEASDATE) md0
+WITH a AS (SELECT DISTINCT {TRK},invyr,sim_year FROM new.curated_cohorts_landis WHERE {scope('', 'statecd', 'countycd')}),
+t AS (SELECT DISTINCT {TRK},invyr,sim_year FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')}),
+f0 AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, min(INVYR) y0
        FROM new.clean_subplot_years GROUP BY ALL)
-SELECT (SELECT count(*) FROM a JOIN t USING ({TRK},measdate) WHERE a.sim_year <> t.sim_year),
-       (SELECT count(*) FROM a JOIN t USING ({TRK},measdate)),
+SELECT (SELECT count(*) FROM a JOIN t USING ({TRK},invyr) WHERE a.sim_year <> t.sim_year),
+       (SELECT count(*) FROM a JOIN t USING ({TRK},invyr)),
        (SELECT count(*) FROM (SELECT * FROM a UNION ALL SELECT * FROM t) x JOIN f0 USING ({TRK})
-         WHERE x.measdate = f0.md0 AND x.sim_year <> 0),
+         WHERE x.invyr = f0.y0 AND x.sim_year <> 0),
        (SELECT min(sim_year) FROM (SELECT sim_year FROM a UNION ALL SELECT sim_year FROM t))""").fetchone()
 check("(n1) M-1: Sim A and trajectories share sim_year on every shared subplot-visit", r[0] == 0, f"({r[0]} of {r[1]:,} differ)")
 check("(n1) M-1: sim_year = 0 at the subplot's first scaffold visit, never negative", r[2] == 0 and (r[3] or 0) >= 0,
       f"({r[2]} rows at the first visit with sim_year <> 0; min sim_year {r[3]})")
 if a.simb_db:
     r = con.execute(f"""
-    WITH a AS (SELECT DISTINCT {TRK},measdate,sim_year FROM new.curated_cohorts_landis WHERE {scope('', 'statecd', 'countycd')}),
-    b AS (SELECT DISTINCT {TRK},measdate,sim_year FROM newsimb.curated_cohorts_landis_simB WHERE {scope('', 'statecd', 'countycd')}),
-    t AS (SELECT DISTINCT {TRK},measdate,sim_year FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')})
-    SELECT (SELECT count(*) FROM a JOIN b USING ({TRK},measdate) WHERE a.sim_year <> b.sim_year),
-           (SELECT count(*) FROM a JOIN b USING ({TRK},measdate)),
-           (SELECT count(*) FROM b JOIN t USING ({TRK},measdate) WHERE b.sim_year <> t.sim_year)""").fetchone()
+    WITH a AS (SELECT DISTINCT {TRK},invyr,sim_year FROM new.curated_cohorts_landis WHERE {scope('', 'statecd', 'countycd')}),
+    b AS (SELECT DISTINCT {TRK},invyr,sim_year FROM newsimb.curated_cohorts_landis_simB WHERE {scope('', 'statecd', 'countycd')}),
+    t AS (SELECT DISTINCT {TRK},invyr,sim_year FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')})
+    SELECT (SELECT count(*) FROM a JOIN b USING ({TRK},invyr) WHERE a.sim_year <> b.sim_year),
+           (SELECT count(*) FROM a JOIN b USING ({TRK},invyr)),
+           (SELECT count(*) FROM b JOIN t USING ({TRK},invyr) WHERE b.sim_year <> t.sim_year)""").fetchone()
     check("(n1) M-1: Sim B shares sim_year with Sim A and the trajectories on every shared subplot-visit",
           r[0] == 0 and r[2] == 0, f"(vs Sim A {r[0]} of {r[1]:,}; vs trajectories {r[2]})")
     # n2 (I-1): every Sim B drop > 0 is backed by a REAL >= 5 in member of that cohort (same subplot,
@@ -1733,25 +1733,25 @@ if a.simb_db:
     # first Sim B row (r7: the fate / event / magnitude of the removal is re-derived in n22 / n8)
     con.execute(f"""
     CREATE TEMP TABLE simb_drop AS
-    WITH d AS (SELECT {TRK}, species_symbol, measdate, sim_year, sim_year - age_calc AS b
+    WITH d AS (SELECT {TRK}, species_symbol, invyr, sim_year, sim_year - age_calc AS b
                FROM newsimb.curated_cohorts_landis_simB WHERE disturbance_drop_pct > 0 AND {scope('', 'statecd', 'countycd')}),
-    vis AS (SELECT DISTINCT {TRK}, measdate FROM new.tree_trajectories),
-    pv AS (SELECT {TRK}, measdate, lag(measdate) OVER (PARTITION BY {TRK} ORDER BY measdate) pmd FROM vis),
-    mem AS (SELECT {TRK}, tree, species_symbol, measdate, sim_year - age_calc AS b FROM new.tree_trajectories
+    vis AS (SELECT DISTINCT {TRK}, invyr FROM new.tree_trajectories),
+    pv AS (SELECT {TRK}, invyr, lag(invyr) OVER (PARTITION BY {TRK} ORDER BY invyr) pmd FROM vis),
+    mem AS (SELECT {TRK}, tree, species_symbol, invyr, sim_year - age_calc AS b FROM new.tree_trajectories
             WHERE intro_type = 'real' AND dia >= 5),
-    lv AS (SELECT tt.statecd, tt.unitcd, tt.countycd, tt.plot, tt.subp, tt.tree, tt.measdate FROM new.tree_trajectories tt
+    lv AS (SELECT tt.statecd, tt.unitcd, tt.countycd, tt.plot, tt.subp, tt.tree, tt.invyr FROM new.tree_trajectories tt
            LEFT JOIN new.curated_trees ct ON ct.STATECD=tt.statecd AND ct.UNITCD=tt.unitcd AND ct.COUNTYCD=tt.countycd
-            AND ct.PLOT=tt.plot AND ct.SUBP=tt.subp AND ct.TREE=tt.tree AND ct.MEASDATE=tt.measdate
+            AND ct.PLOT=tt.plot AND ct.SUBP=tt.subp AND ct.TREE=tt.tree AND ct.INVYR=tt.invyr
            WHERE tt.intro_type = 'gap_interpolated' OR (tt.intro_type = 'real' AND ct.STATUSCD = 1))   -- alive slots only
     SELECT d.*,
       EXISTS (SELECT 1 FROM mem m WHERE m.statecd=d.statecd AND m.unitcd=d.unitcd AND m.countycd=d.countycd AND m.plot=d.plot
-              AND m.subp=d.subp AND m.species_symbol=d.species_symbol AND m.b=d.b AND m.measdate=p.pmd
+              AND m.subp=d.subp AND m.species_symbol=d.species_symbol AND m.b=d.b AND m.invyr=p.pmd
               AND NOT EXISTS (SELECT 1 FROM lv WHERE lv.statecd=m.statecd AND lv.unitcd=m.unitcd AND lv.countycd=m.countycd
-                              AND lv.plot=m.plot AND lv.subp=m.subp AND lv.tree=m.tree AND lv.measdate=d.measdate)) AS has_removed,
+                              AND lv.plot=m.plot AND lv.subp=m.subp AND lv.tree=m.tree AND lv.invyr=d.invyr)) AS has_removed,
       NOT EXISTS (SELECT 1 FROM newsimb.curated_cohorts_landis_simB c WHERE c.statecd=d.statecd AND c.unitcd=d.unitcd
               AND c.countycd=d.countycd AND c.plot=d.plot AND c.subp=d.subp AND c.species_symbol=d.species_symbol
-              AND c.sim_year - c.age_calc = d.b AND c.measdate < d.measdate) AS is_first
-    FROM d LEFT JOIN pv p USING ({TRK}, measdate)""")
+              AND c.sim_year - c.age_calc = d.b AND c.invyr < d.invyr) AS is_first
+    FROM d LEFT JOIN pv p USING ({TRK}, invyr)""")
     r = con.execute("""SELECT count(*), count(*) FILTER (WHERE NOT has_removed), count(*) FILTER (WHERE is_first)
                        FROM simb_drop""").fetchone()
     # r6 D25: removals only (the damaged-alive branch is gone)
@@ -1766,12 +1766,12 @@ if a.simb_db:
                                            > 1e-5 * (d.dropped / 4046.8564224) + 1e-6),
            max(abs((c.agb / (1 - c.disturbance_drop_pct) - c.agb) / NULLIF(d.dropped / 4046.8564224, 0) - 1))
     FROM newsimb.curated_cohorts_landis_simB c JOIN newsimb.cohort_disturbance d
-      USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)
+      USING (statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc)
     WHERE c.disturbance_drop_pct > 0 AND {scope('c', 'statecd', 'countycd')}""").fetchone()
     check("(n8) R6: Pan's formula agb/(1-drop) - agb reconstructs the dropped biomass on every Sim B drop row",
           r[1] == 0, f"({r[1]} of {r[0]:,} rows off by > 1e-5; max rel err {0 if r[2] is None else r[2]:.2e})")
     r = con.execute(f"""SELECT count(*) FROM newsimb.curated_cohorts_landis_simB c
-        LEFT JOIN newsimb.cohort_disturbance d USING (statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc)
+        LEFT JOIN newsimb.cohort_disturbance d USING (statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc)
         WHERE c.disturbance_drop_pct > 0 AND (d.disturbance_drop_pct IS NULL OR d.disturbance_drop_pct <> c.disturbance_drop_pct)
           AND {scope('c', 'statecd', 'countycd')}""").fetchone()[0]
     check("(n8) R6: the attached drop equals cohort_disturbance's on every drop row", r == 0, f"({r})")
@@ -1805,6 +1805,14 @@ SELECT count(*), count(*) FILTER (WHERE EXISTS (SELECT 1 FROM zdead z WHERE z.ST
        AND z.COUNTYCD=br.countycd AND z.PLOT=br.plot AND z.SUBP=br.subp AND z.TREE=br.tree AND z.zmd > br.p AND z.zmd <= br.n)) FROM br""").fetchone()
 if r[0]:
     check("(n3) E18: no gap-interpolated slot at / across a dead or cut record of the tree", r[1] == 0, f"({r[1]} of {r[0]:,} gap slots)")
+# D69: a visit is (plot, INVYR); its date is a timestamp. One date per visit, dates follow INVYR, no tree twice in a visit
+r = con.execute(f"""WITH v AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, count(DISTINCT MEASDATE) nd, min(MEASDATE) d0, max(MEASDATE) d1
+                               FROM new.curated_trees WHERE {scope()} GROUP BY ALL),
+        o AS (SELECT *, lag(d1) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY INVYR) pd FROM v)
+    SELECT count(*), count(*) FILTER (WHERE nd <> 1), count(*) FILTER (WHERE pd > d0) FROM o""").fetchone()
+check("(D69) every visit has one date, and dates follow INVYR", r[1] == 0 and r[2] == 0, f"({r[0]:,} visits; {r[1]} with several dates, {r[2]} reversals)")
+r = con.execute("""SELECT count(*) - count(DISTINCT (statecd, unitcd, countycd, plot, subp, tree, invyr)) FROM new.tree_trajectories""").fetchone()
+check("(D69) tree x invyr unique in tree_trajectories", r[0] == 0, f"({r[0]} duplicates)")
 # n9 (R5, D27): synthetic fixtures for the interpolation (incl. the nonforest / censoring rules)
 # and the timber-only drop branch — code paths the R4 data never reaches
 import sys as _sys

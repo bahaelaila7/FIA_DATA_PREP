@@ -1028,7 +1028,7 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
     # one phantom per target slot; representative = smallest surviving member (deterministic)
     rep = (surv.pipe(pick, slot_key, ["MEASDATE", "TREE"])
            .select(ckey + ["TREE", "prior_invyr", "prior_measdate", "prior_age", "prior_sim_year"]))
-    sources = (surv.group_by(slot_key + ["prior_measdate"])   # one date per visit
+    sources = (surv.group_by(slot_key + ["prior_measdate"])   # date-ok: prior_invyr is in the key, the date is carried
                .agg(pl.col("MEASDATE").sort_by(["MEASDATE", "TREE"]).first().alias("src_measdate"),
                     pl.col("age_calc").sort_by(["MEASDATE", "TREE"]).first().alias("src_age_calc"),
                     pl.col("TREE").n_unique().cast(pl.UInt32).alias("n_members"),
