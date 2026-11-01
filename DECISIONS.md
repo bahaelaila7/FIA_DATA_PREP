@@ -1572,3 +1572,18 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - Candidates: stays `ignore` at first; later a soft mixture over candidates plus no-graduate.
   - No tree is renumbered.
   - Item 2 of D65 keeps the subplot-level 5-in limit before the move; only the microplot-level evidence goes.
+
+**D65 amendment 2 (2026-11-01; user: think harder). Closure records are three different things, and curation has been wrong about one of them since r1.** Every RC8 closure at a move, with PREV_STATUS_CD 1 (89,460; the guide's AGENTCD text covers trees "dead or removed"):
+
+| Closure | Records | Evidence |
+|---|---|---|
+| Alive | 60,585 | DIA, HT, ACTUALHT, TPA_UNADJ, TREECLCD, DIACHECK; no AGENTCD |
+| Dead or cut | 26,445 | AGENTCD and MORTYR; no size |
+| Unknown | 2,430 | neither (GA and KY moving to MANUAL 4.0, MS, FL) |
+
+- **Agents:** 80 silvicultural 11,918; 60 vegetation 9,899; 20 disease 1,571; 70 unknown 982; 30 fire 857; 50 weather 842; 40 animal 210; 10 insect 166. MORTYR is 0–10 yr before the visit, median 2.
+- **Curation bug:** `CENSOR_REASON` maps every STATUSCD 0 + RC 8 to censoring, so all 26,445 end as `censored_procedural`: no death, no agent, no cut event, no disturbance. That is 21 % on top of the 125,816 dead sapling records in curated_trees.
+- **Withdrawn:** "size-less closures behave like deaths" (they record it), the soft-gone proposal, and the claim that a closure means nothing happened to the tree. The 19,450-tree estimate is replaced by these counts.
+- **Why this holds together:** the old list was fully re-visited at the move. Live share there 68.4 % (60,585 + 8,085 continuing) vs 69.0 % at normal visits; recorded dead or cut 26.5 % plus 5.3 % unknown vs 29.7 %. Trees ≥ 5 in stayed on the subplot, which is why no closure is ≥ 5 in.
+- **Graduation constraint:** applies to the alive and unknown closures only. Alive with no compatible debut: 37,272 of 58,340 with a later visit (64 %).
+- **Proposed fix (not applied):** curation turns a closure with AGENTCD into a dead or cut record with the agent and MORTYR (80 → `silvicultural_death`), and a sized closure into a real last record, then censored. Disturbance, drops and cut events follow; verifier (c1) re-derives it from raw. Needs a chain rerun and a NIMIWAE rebuild.
