@@ -41,7 +41,7 @@ def prepare(c):
       FROM PLOT""")
     c.execute(f"""CREATE OR REPLACE TEMP TABLE vv AS
       SELECT *, row_number() OVER w - 1 vn, lag(loc) OVER w ploc, max(CASE WHEN loc = 'CENTER' THEN 1 ELSE 0 END) OVER (PARTITION BY {PK}) ever_center
-      FROM v WINDOW w AS (PARTITION BY {PK} ORDER BY md, INVYR)""")
+      FROM v WINDOW w AS (PARTITION BY {PK} ORDER BY md)""")
     c.execute(f"""CREATE OR REPLACE TEMP TABLE t AS
       SELECT r.STATECD, r.UNITCD, r.COUNTYCD, r.PLOT, r.INVYR, r.SUBP, r.TREE, r.SPCD, r.DIA, r.HT, r.STATUSCD st, r.RECONCILECD rc,
              r.PREV_STATUS_CD ps, r.TPA_UNADJ tpa, r.AGENTCD agent, vv.vn, vv.md

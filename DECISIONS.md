@@ -1758,3 +1758,10 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
   - no links at all: 30 of 56 resets, 296 records change eligibility; final ages change only in GA (mean 0.42 yr, max 11);
   - TREE.PREVCOND links: 52 of 56 resets, no new ones, 31 records change eligibility; final ages identical in all three.
 - **Proposed:** natural previous visit and previous status; key changes found from tree evidence (27 of 29 accepted links, no false match); condition links from TREE.PREVCOND; CNs kept only for TreeMap and for TreeAge at load, and in the verifier as an independent check. Needs a full chain and verifier.
+
+## D68 — INVYR is an id, not a time; annual dates (user, 2026-11-01)
+- **Rule:** INVYR identifies a visit; ordering and intervals use MEASYEAR, MEASMON, MEASDAY only. Lint L5 rejects ordering or date comparison on INVYR.
+- **Sites fixed:** `lineage_break_visits` and verifier n19 ordered by (MEASYEAR, INVYR); the retally detector, verifier and audit used INVYR as a date tie-break; the verifier's era tables binned on INVYR; plot location used it as a tie-break.
+- **Effect:** none on annual ordering in R4: 155,416 consecutive annual pairs, 0 with date and INVYR order reversed, 0 on the same date, 42 in the same calendar year. MEASYEAR differs from INVYR on 80,117 of 209,100 annual visits. County row-order test still identical; the verifier's changed lines have not been rerun.
+- **Dates (R4):** annual 209,100 visits: none lacks a year, month or day. Periodic 167,637: 7,507 lack year and month (4.5 %), 165,886 lack the day (99 %). All states: annual 92 of 1,256,461 lack a date. The guide says these fields "may be blank (null) for periodic inventory"; it does not rank their accuracy.
+- **D67 caveat:** its all-visit comparison ordered by (MEASYEAR, INVYR) and covers periodic visits without dates, so those counts are rough. Annual counts stand. Its 27-of-29 tree search compared INVYR for "earlier"; to be redone with dates when implemented.

@@ -181,7 +181,7 @@ def build_plot_canon_map(con, max_iter: int = 50) -> int:
     # D28: one location per plot = its most recent annual visit (chains with a remapped visit)
     con.execute("""CREATE OR REPLACE TEMP TABLE plot_loc_visit AS
         WITH rc AS (SELECT r.root FROM _canon_root r JOIN plot_canon_map m ON m.vid = r.vid GROUP BY 1),
-        last AS (SELECT r.root, arg_max(a.vid, struct_pack(m := a.md, y := a.INVYR)) lvid FROM _canon_root r JOIN rc USING (root)
+        last AS (SELECT r.root, arg_max(a.vid, a.md) lvid FROM _canon_root r JOIN rc USING (root)
                  JOIN _canon_ap a ON a.vid = r.vid GROUP BY 1)
         SELECT a.CN, a.vid, o.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
                l.UNITCD AS LOC_UNITCD, l.COUNTYCD AS LOC_COUNTYCD, l.PLOT AS LOC_PLOT, l.LAT, l.LON, l.ELEV,

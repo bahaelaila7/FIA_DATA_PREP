@@ -27,7 +27,7 @@ def natural_visit_id(a: str) -> str:
 
 def write_raw_schema(con, states):
     st = ",".join(map(str, states))
-    bad = con.execute(f"SELECT count(*) FROM fia.main.PLOT WHERE STATECD IN ({st}) AND (PLOT >= 100000 OR UNITCD >= 100 OR COUNTYCD >= 1000 OR INVYR >= 10000)").fetchone()[0]
+    bad = con.execute(f"SELECT count(*) FROM fia.main.PLOT WHERE STATECD IN ({st}) AND (PLOT >= 100000 OR UNITCD >= 100 OR COUNTYCD >= 1000 OR INVYR >= 10000)").fetchone()[0]   # invyr-ok: an id range check
     if bad:
         sys.exit(f"{bad} plots do not fit natural_visit_id")
     con.execute("CREATE SCHEMA raw")

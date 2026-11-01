@@ -704,7 +704,7 @@ def visit_attributes(con, states: list[int] | None = None) -> pl.DataFrame:
     return con.execute(f"""
         WITH v AS (
             SELECT b.STATECD, b.UNITCD, b.COUNTYCD, b.PLOT, b.SUBP, b.MEASDATE,
-                   min(b.INVYR) AS INVYR, max(b.CYCLE) AS CYCLE,
+                   min(b.INVYR) AS INVYR, max(b.CYCLE) AS CYCLE,   -- invyr-ok: one value per visit
                    count(DISTINCT b.CONDID) FILTER (WHERE b.COND_STATUS_CD = 1) AS _nf,
                    min(b.CONDID) FILTER (WHERE b.COND_STATUS_CD = 1) AS _cid
             FROM base_subplot_cond b WHERE TRUE {ws} GROUP BY ALL)

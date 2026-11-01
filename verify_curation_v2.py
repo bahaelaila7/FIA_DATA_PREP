@@ -435,7 +435,7 @@ SELECT P.CN PLT_CN, P.STATECD,P.UNITCD,P.COUNTYCD,P.PLOT,P.INVYR,P.MANUAL,P.PLOT
        MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md
 FROM f.PLOT P JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y' WHERE {scope('P')};
 CREATE TEMP TABLE pv2 AS SELECT *, lead(PLT_CN) OVER w ncn, lead(md) OVER w nmd, lead(MANUAL) OVER w nman, lead(ps) OVER w nps
-FROM pv WINDOW w AS (PARTITION BY STATECD,UNITCD,COUNTYCD,PLOT ORDER BY md, INVYR);
+FROM pv WINDOW w AS (PARTITION BY STATECD,UNITCD,COUNTYCD,PLOT ORDER BY md);
 CREATE TEMP TABLE us AS
 SELECT T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE, CAST(T.CN AS VARCHAR) pcn, v.MANUAL, v.nman, v.nmd, (T2.CN IS NULL) unrec
 FROM f.TREE T JOIN pv2 v ON v.PLT_CN=T.PLT_CN JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
@@ -715,7 +715,7 @@ vb AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM (
          SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.KINDCD, P.DESIGNCD,
                 lag(P.DESIGNCD) OVER w pd, row_number() OVER w k
          FROM f.PLOT P JOIN f.SURVEY SV ON SV.CN = P.SRV_CN AND SV.ANN_INVENTORY = 'Y'
-         WINDOW w AS (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY P.MEASYEAR, P.INVYR))
+         WINDOW w AS (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY MAKE_DATE(CAST(P.MEASYEAR AS INTEGER), COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15))))
        WHERE k > 1 AND (KINDCD IN (1, 3) OR DESIGNCD IS DISTINCT FROM pd)),
 q AS (SELECT r.*, lag(cn) OVER w qcn, lag(st) OVER w qst, lag(sp) OVER w qsp, lag(dia) OVER w qdia, lag(md) OVER w qmd
       FROM r WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree ORDER BY md, cn)),
@@ -1520,13 +1520,13 @@ SELECT count(*) FROM new.curated_trees c JOIN t USING (STATECD,UNITCD,COUNTYCD,P
 WHERE c.age_from_estage IS NULL""").fetchone()[0]
 check("(i) every record of a tree with a valid TreeAge record carries the propagated estage", r == 0, f"({r})")
 show("(i) share of live >= 5 in records whose final age source is the model, by INVYR era (a10)", f"""
-SELECT CASE WHEN INVYR <= 1998 THEN 'a <=1998' WHEN INVYR <= 2009 THEN 'b 1999-2009'
-            WHEN INVYR <= 2016 THEN 'c 2010-2016' ELSE 'd 2017+' END era, count(*) n,
+SELECT CASE WHEN year(MEASDATE) <= 1998 THEN 'a <=1998' WHEN year(MEASDATE) <= 2009 THEN 'b 1999-2009'
+            WHEN year(MEASDATE) <= 2016 THEN 'c 2010-2016' ELSE 'd 2017+' END era, count(*) n,
        round(avg((age_source='model')::INT),3) share_model, round(avg((estage_raw IS NOT NULL)::INT),3) share_has_treeage
 FROM new.curated_trees WHERE STATUSCD=1 AND DIA>=5 AND {scope()} GROUP BY 1 ORDER BY 1""")
 show("(i) model - mapped-estage gap on records that have both, by era x DIA class (median yr)", f"""
-SELECT CASE WHEN INVYR <= 1998 THEN 'a <=1998' WHEN INVYR <= 2009 THEN 'b 1999-2009'
-            WHEN INVYR <= 2016 THEN 'c 2010-2016' ELSE 'd 2017+' END era,
+SELECT CASE WHEN year(MEASDATE) <= 1998 THEN 'a <=1998' WHEN year(MEASDATE) <= 2009 THEN 'b 1999-2009'
+            WHEN year(MEASDATE) <= 2016 THEN 'c 2010-2016' ELSE 'd 2017+' END era,
        CASE WHEN DIA<10 THEN 'a 5-10' WHEN DIA<15 THEN 'b 10-15' ELSE 'c 15+' END dia_cls, count(*) n,
        round(median(age_from_model - age_from_estage),1) med_gap
 FROM new.curated_trees WHERE STATUSCD=1 AND DIA>=5 AND age_from_model IS NOT NULL AND age_from_estage IS NOT NULL

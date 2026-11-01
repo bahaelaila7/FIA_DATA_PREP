@@ -28,6 +28,9 @@ def scan(path, name, findings):
             findings.append(f"L4 {name}:{i}: {ln.strip()[:110]}")
         if re.search(r"\.(first|last)\(\)\.alias", s) and "sort_by" not in s:
             findings.append(f"L4 {name}:{i}: {ln.strip()[:110]}")
+        # D68: INVYR identifies a visit, it is not a time: no ordering or date comparison on it
+        if "invyr-ok" not in ln and re.search(r"ORDER BY[^\"]*\bINVYR\b|\bINVYR\s*(<|>|<=|>=)\s*\w|\w\s*(<|>|<=|>=)\s*[a-z.]*INVYR\b|order_by=\"INVYR|(min|max)\(\w*\.?INVYR\)", s):
+            findings.append(f"L5 {name}:{i}: {ln.strip()[:110]}")
         # COND_ID (plot key + CONDID) is a condition only together with its visit
         if re.search(r"(over|group_by|shift|partition_by)\(\s*(COND_ID|cond_id_cols)\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
             findings.append(f"L2 {name}:{i}: {ln.strip()[:110]}")
