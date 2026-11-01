@@ -1476,3 +1476,13 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Code:** nimiwae_prep.load54 (nearest-record CONDID CTE removed; cond_status deprecated, NULL); nimiwae56.build reads the shares (legacy frames unchanged). The D53 `load` keeps the old logic (legacy, unused).
 - **Data rebuilt as d54d.** KY check: same 363,138 slots; null shares SICOND 25 %, canopy 53 % (older inventories), others < 0.3 %.
 - **All models so far predate am. 5–7:** retrain on d54d.
+
+## D59 — FIA Truth: one pipeline and DB per region, natural ids primary (user, 2026-11-01; plan approved in auto mode)
+- **Request:** consolidate curation into a single source of curated truth for every downstream module; never assume a local id carries over between visits.
+- **User decisions:** all consumers move; one DB per region; new schema with Pan's loaders updated; A1 (species-matched STDAGE in planted conditions); A2 (AGENTCD 80 relabelled `silvicultural_death`).
+- **Identity (user, after bahaelaila7/FIA_DATA_PREP#1): do not trust CN keys; rely on natural ids.** This replaces the approved plan's CN-keyed design. Measured in CURATION_FIADB_AUDIT.md §Identifier audit.
+  - Options: (a) CN primary (the plan as first written); (b) natural ids primary, CN never joined on; (c) both required on every join. **Chosen (b)**, with CN-vs-natural disagreements quarantined.
+  - Visit = (STATECD, UNITCD, COUNTYCD, PLOT, INVYR); subplot + SUBP; condition + CONDID (scoped to the visit, never compared across visits); tree + SUBP, TREE.
+  - Tree across visits: (plot, SUBP, TREE) under an unchanged DESIGNCD (guide §3.1.10), split where a number is reused after an end.
+  - Conditions across visits: SUBP_COND_CHNG_MTRX, resolved to natural keys on both ends (its PREV_PLT_CN is validated against the plot's natural predecessor), or subplot-level evidence.
+  - Plot key changes: explicit `plot_renumber` table, evidence-checked. 34 annual links here.
