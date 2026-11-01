@@ -74,7 +74,7 @@ PURITY_FRAC        = 0.80   # dominant-species live-BA share ≥ this → "pure"
 
 COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
 # visit-level attributes a synthetic (phantom / gap) row takes from ITS OWN visit (r7 C F3)
-VISIT_ATTRS = ["CYCLE", "INVYR", "CONDID", "owngrpcd", "fortypcd", "physclcd", "reservcd", "cond_stdorgcd"]
+VISIT_ATTRS = ["CYCLE", "CONDID", "owngrpcd", "fortypcd", "physclcd", "reservcd", "cond_stdorgcd"]
 
 
 # =============================================================================
@@ -167,11 +167,11 @@ def load_tree_history(con, states: list[int] | None = None) -> pl.DataFrame:
 
 
 def subplot_visit_scaffold(con, states: list[int] | None = None) -> pl.DataFrame:
-    """All clean subplot visits (SUBPLOT_ID + MEASDATE) — the visit grid a tree
-    could have been tallied at."""
+    """All clean subplot visits (SUBPLOT_ID + INVYR, with MEASDATE as their timestamp) — the
+    visit grid a tree could have been tallied at."""
     where_state = f"WHERE STATECD IN ({','.join(map(str, states))})" if states else ""
     return con.execute(f"""
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE,
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR, MEASDATE,
                MAX(forest_subpcond_prop) AS forest_subpcond_prop,
                MAX(forest_micrcond_prop) AS forest_micrcond_prop
         FROM clean_subplot_years {where_state} GROUP BY ALL
@@ -197,9 +197,9 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
     # r3 M2: the SAME strict per-subplot axis as compute_sim_year_ages (sim_year_map)
     subp_first = live.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_first_measdate"))
     visit_sim = (
-        sim_year_map(pl.concat([live.select(SUBPLOT_ID + ["MEASDATE"]),
-                                visits.select(SUBPLOT_ID + ["MEASDATE"])]), subp_first)
-        .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"})
+        sim_year_map(pl.concat([live.select(SUBPLOT_ID + ["INVYR", "MEASDATE"]),
+                                visits.select(SUBPLOT_ID + ["INVYR", "MEASDATE"])]), subp_first)
+        .rename({"INVYR": "prior_invyr", "MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"})
     )
 
     tree_debut = live.pipe(pick, TREE_ID, ["MEASDATE"], "first")
@@ -215,13 +215,13 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
     # break, or for >=5in subplot ingrowth where the microplot represents the sapling class
     # rule (c) is a stand-expansion (TPA) double-count rule: not applied to per-tree,
     # unexpanded drybio_g trajectories (audit M3)
-    prior = apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"], rule_c=False)
+    prior = apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_invyr"], rule_c=False)
     existing = (
-        live.select(TREE_ID + ["MEASDATE"]).unique()
-        .rename({"MEASDATE": "prior_measdate"}).with_columns(pl.lit(True).alias("_e"))
+        live.select(TREE_ID + ["INVYR"]).unique()
+        .rename({"INVYR": "prior_invyr"}).with_columns(pl.lit(True).alias("_e"))
     )
     missing = (
-        prior.join(existing, on=TREE_ID + ["prior_measdate"], how="left")
+        prior.join(existing, on=TREE_ID + ["prior_invyr"], how="left")
         .filter(pl.col("_e").is_null()).drop("_e").unique()
     )
     n = missing.height
@@ -252,8 +252,8 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
     report_phantom_floor(missing, "prior_agb", MIN_BACKFILL_DRYBIO_G, "g/tree", "backfill")
     missing = missing.drop("_no_rate")
     synthetic = (
-        missing.drop(["MEASDATE", "age_calc", "agb", "sim_year"])
-        .rename({"prior_measdate": "MEASDATE", "prior_age": "age_calc",
+        missing.drop(["INVYR", "MEASDATE", "age_calc", "agb", "sim_year"])
+        .rename({"prior_invyr": "INVYR", "prior_measdate": "MEASDATE", "prior_age": "age_calc",
                  "prior_sim_year": "sim_year", "prior_agb": "agb"})
         .with_columns(pl.lit("phantom_backfill").cast(pl.Utf8).alias("intro_type"))
         # pre-debut size is unmeasured (only biomass is modelled) — don't carry the
@@ -308,7 +308,7 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
     # r3: sim_year of ANY scaffold visit on the strict axis (a gap visit may have no live row
     # of any tree — it used to get a null sim_year / age_calc)
     sy_map = sim_year_map(
-        pl.concat([live.select(SUBPLOT_ID + ["MEASDATE"]), visits.select(SUBPLOT_ID + ["MEASDATE"])]),
+        pl.concat([live.select(SUBPLOT_ID + ["INVYR", "MEASDATE"]), visits.select(SUBPLOT_ID + ["INVYR", "MEASDATE"])]),
         real.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_first_measdate")))
 
     # candidate gap slots: subplot visits between first & last real record
@@ -316,13 +316,13 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
         bounds.join(visits, on=SUBPLOT_ID, how="left")
         .filter((pl.col("MEASDATE") > pl.col("_first")) &
                 (pl.col("MEASDATE") < pl.col("_last")))
-        .select(TREE_ID + ["MEASDATE"])
+        .select(TREE_ID + ["INVYR", "MEASDATE"])
     )
     # drop slots that already exist (real OR phantom)
-    existing = live.select(TREE_ID + ["MEASDATE"]).unique().with_columns(
+    existing = live.select(TREE_ID + ["INVYR"]).unique().with_columns(
         pl.lit(True).alias("_e"))
     gaps = (
-        cand.join(existing, on=TREE_ID + ["MEASDATE"], how="left")
+        cand.join(existing, on=TREE_ID + ["INVYR"], how="left")
         .filter(pl.col("_e").is_null()).drop("_e")
     )
     n_gaps = gaps.height
@@ -332,7 +332,7 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
             pl.lit(False).alias("was_missed_reintroduced"))
 
     # bracketing real records via asof joins (per tree, on MEASDATE)
-    prev_src = real.with_columns(pl.col("MEASDATE").alias("prev_measdate"))
+    prev_src = real.drop("INVYR").with_columns(pl.col("MEASDATE").alias("prev_measdate"))   # the slot keeps its own INVYR
     nxt_cols = {"MEASDATE": "next_measdate", "dia": "next_dia", "ht": "next_ht",
                 "cr": "next_cr", "agb": "next_agb", "ba": "next_ba"}
     nxt_src = (
@@ -356,13 +356,13 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
     # censor histories are handled (audit M8).
     n_g0 = g.height
     if censor_events is not None and censor_events.height:
-        spans = (g.select(TREE_ID + ["MEASDATE", "prev_measdate", "next_measdate"])
+        spans = (g.select(TREE_ID + ["INVYR", "prev_measdate", "next_measdate"])
                  .join(censor_events, on=TREE_ID, how="inner")
                  .filter((pl.col("_cdate") > pl.col("prev_measdate")) &
                          (pl.col("_cdate") <= pl.col("next_measdate")))
-                 .select(TREE_ID + ["MEASDATE"]).unique()
+                 .select(TREE_ID + ["INVYR"]).unique()
                  .with_columns(pl.lit(True).alias("_span")))
-        g = g.join(spans, on=TREE_ID + ["MEASDATE"], how="left").filter(
+        g = g.join(spans, on=TREE_ID + ["INVYR"], how="left").filter(
             pl.col("_span").is_null()).drop("_span")
     if n_g0 != g.height:
         print(f"[interp] {n_g0 - g.height:,} gap slots NOT filled (span a censoring interval)")
@@ -373,11 +373,11 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
         n_g1 = g.height
         nf = (visits.filter((pl.col("forest_subpcond_prop").fill_null(0) + pl.col("forest_micrcond_prop").fill_null(0)) <= 0)
               .select(SUBPLOT_ID + [pl.col("MEASDATE").alias("_nfd")]))
-        spans = (g.select(TREE_ID + ["MEASDATE", "prev_measdate", "next_measdate"])
+        spans = (g.select(TREE_ID + ["INVYR", "prev_measdate", "next_measdate"])
                  .join(nf, on=SUBPLOT_ID, how="inner")
                  .filter((pl.col("_nfd") > pl.col("prev_measdate")) & (pl.col("_nfd") < pl.col("next_measdate")))
-                 .select(TREE_ID + ["MEASDATE"]).unique().with_columns(pl.lit(True).alias("_span")))
-        g = g.join(spans, on=TREE_ID + ["MEASDATE"], how="left").filter(pl.col("_span").is_null()).drop("_span")
+                 .select(TREE_ID + ["INVYR"]).unique().with_columns(pl.lit(True).alias("_span")))
+        g = g.join(spans, on=TREE_ID + ["INVYR"], how="left").filter(pl.col("_span").is_null()).drop("_span")
         print(f"[interp] {n_g1 - g.height:,} gap slots NOT filled (at / across a nonforest visit)")
     n_gaps = g.height
     if n_gaps == 0:
@@ -402,7 +402,7 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
                    pl.col("sim_year").alias("_dsy")])
     g = (
         g.drop("sim_year")
-        .join(sy_map, on=SUBPLOT_ID + ["MEASDATE"], how="left")
+        .join(sy_map.drop("MEASDATE"), on=SUBPLOT_ID + ["INVYR"], how="left")
         .join(debut, on=TREE_ID, how="left")
         .with_columns(
             (pl.col("_dage") + pl.col("sim_year") - pl.col("_dsy")).alias("age_calc"))
@@ -561,13 +561,13 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
                     & ~pl.col("rerecord_dead").fill_null(False)
                     & ~pl.col("first_record_dead").fill_null(False))
         .pipe(pick, TREE_ID, ["MEASDATE"], "first")
-        .select(TREE_ID + ["MEASDATE"])
-        .rename({"MEASDATE": "cut_measdate"})
+        .select(TREE_ID + ["INVYR", "MEASDATE"])
+        .rename({"INVYR": "cut_invyr", "MEASDATE": "cut_measdate"})
     )
     if cut_rows.height == 0:
         print("[cut] no harvest records")
         return pl.DataFrame(schema={
-            **{c: pl.Int64 for c in SUBPLOT_ID}, "cut_measdate": pl.Date,
+            **{c: pl.Int64 for c in SUBPLOT_ID}, "cut_invyr": pl.Int64, "cut_measdate": pl.Date,
             "cut_event_type": pl.Utf8, "cut_pct_ba_removed": pl.Float64,
             "cut_mean_age": pl.Float64})
 
@@ -582,7 +582,7 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     cut = cut_rows.join(last_alive, on=TREE_ID, how="left")
 
     removed = (
-        cut.group_by(SUBPLOT_ID + ["cut_measdate"])
+        cut.group_by(SUBPLOT_ID + ["cut_invyr", "cut_measdate"])
         .agg(pl.col("_precut_ba").sum().alias("removed_ba"),
              pl.col("_precut_age").mean().alias("cut_mean_age"))
     )
@@ -590,17 +590,17 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     # live BA per (subplot, visit) — denominator is the visit immediately before the cut
     live_ba = (
         full.filter(pl.col("STATUSCD") == 1)
-        .group_by(SUBPLOT_ID + ["MEASDATE"])
+        .group_by(SUBPLOT_ID + ["INVYR", "MEASDATE"])
         .agg(pl.col("ba").sum().alias("live_ba"))
     )
     denom = (
         removed.join(live_ba, on=SUBPLOT_ID, how="left")
         .filter(pl.col("MEASDATE") < pl.col("cut_measdate"))
-        .group_by(SUBPLOT_ID + ["cut_measdate"]).agg(pl.col("live_ba").sort_by("MEASDATE").last().alias("precut_live_ba"))
+        .group_by(SUBPLOT_ID + ["cut_invyr"]).agg(pl.col("live_ba").sort_by("MEASDATE").last().alias("precut_live_ba"))
     )
 
     ev = (
-        removed.join(denom, on=SUBPLOT_ID + ["cut_measdate"], how="left")
+        removed.join(denom, on=SUBPLOT_ID + ["cut_invyr"], how="left")
         .with_columns(
             pl.when(pl.col("precut_live_ba").is_not_null() & (pl.col("precut_live_ba") > 0))
             .then((pl.col("removed_ba") / pl.col("precut_live_ba")).clip(0.0, 1.0))
@@ -615,7 +615,7 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
             .otherwise(pl.lit("commercial_thin"))
             .alias("cut_event_type")
         )
-        .select(SUBPLOT_ID + ["cut_measdate", "cut_event_type",
+        .select(SUBPLOT_ID + ["cut_invyr", "cut_measdate", "cut_event_type",
                               "cut_pct_ba_removed", "cut_mean_age"])
         # r2 M2: float sums depend on thread summation order — round for determinism
         .with_columns(pl.col("cut_pct_ba_removed").round(9), pl.col("cut_mean_age").round(9))
@@ -654,10 +654,10 @@ def derive_land_use(full: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     # dominant-species live-BA share per subplot (peak purity across visits)
     sp_ba = (
         full.filter(pl.col("STATUSCD") == 1)
-        .group_by(SUBPLOT_ID + ["MEASDATE", "spcd"]).agg(pl.col("ba").sum().alias("sp_ba"))
+        .group_by(SUBPLOT_ID + ["INVYR", "spcd"]).agg(pl.col("ba").sum().alias("sp_ba"))
     )
     purity = (
-        sp_ba.group_by(SUBPLOT_ID + ["MEASDATE"])
+        sp_ba.group_by(SUBPLOT_ID + ["INVYR"])
         .agg((pl.col("sp_ba").max() / pl.col("sp_ba").sum()).alias("_top_share"))
         .group_by(SUBPLOT_ID).agg(pl.col("_top_share").max().round(9).alias("dominant_species_frac"))
     )
@@ -695,7 +695,7 @@ def derive_land_use(full: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
 # =============================================================================
 
 def visit_attributes(con, states: list[int] | None = None) -> pl.DataFrame:
-    """Per subplot visit (SUBPLOT_ID + MEASDATE): its INVYR and CYCLE, and its condition when the
+    """Per subplot visit (SUBPLOT_ID + INVYR): its CYCLE, and its condition when the
     subplot has exactly ONE forest condition (COND_STATUS_CD 1) there (else NULL: the tree's
     condition at an unobserved slot is unknown), with that condition's COND stratifiers."""
     ws = f"AND b.STATECD IN ({','.join(map(str, states))})" if states else ""
@@ -703,13 +703,11 @@ def visit_attributes(con, states: list[int] | None = None) -> pl.DataFrame:
         f"SELECT DISTINCT STATECD FROM base_subplot_cond b WHERE TRUE {ws} ORDER BY 1").fetchall()) or "NULL"
     return con.execute(f"""
         WITH v AS (
-            SELECT b.STATECD, b.UNITCD, b.COUNTYCD, b.PLOT, b.SUBP, b.MEASDATE,
-                   min(b.INVYR) AS INVYR, max(b.CYCLE) AS CYCLE,   -- invyr-ok: one value per visit
+            SELECT b.STATECD, b.UNITCD, b.COUNTYCD, b.PLOT, b.SUBP, b.INVYR, max(b.CYCLE) AS CYCLE,
                    count(DISTINCT b.CONDID) FILTER (WHERE b.COND_STATUS_CD = 1) AS _nf,
                    min(b.CONDID) FILTER (WHERE b.COND_STATUS_CD = 1) AS _cid
             FROM base_subplot_cond b WHERE TRUE {ws} GROUP BY ALL)
-        SELECT v.STATECD, v.UNITCD, v.COUNTYCD, v.PLOT, v.SUBP, v.MEASDATE,
-               v.INVYR::INTEGER AS _v_INVYR, v.CYCLE AS _v_CYCLE,
+        SELECT v.STATECD, v.UNITCD, v.COUNTYCD, v.PLOT, v.SUBP, v.INVYR, v.CYCLE AS _v_CYCLE,
                CASE WHEN v._nf = 1 THEN v._cid END AS _v_CONDID,
                c.OWNGRPCD AS _v_owngrpcd, c.FORTYPCD AS _v_fortypcd, c.PHYSCLCD AS _v_physclcd,
                c.RESERVCD AS _v_reservcd, c.STDORGCD AS _v_cond_stdorgcd
@@ -726,7 +724,8 @@ def restamp_synthetic_rows(body: pl.DataFrame, vattr: pl.DataFrame) -> pl.DataFr
     debut = (body.filter(pl.col("intro_type") == "real").pipe(pick, TREE_ID, ["MEASDATE"], "first")
              .select(TREE_ID + [pl.col("MEASDATE").alias("_d_md"), pl.col("estimated_age").alias("_d_age")]))
     syn = pl.col("intro_type") != "real"
-    body = body.join(vattr, on=SUBPLOT_ID + ["MEASDATE"], how="left").join(debut, on=TREE_ID, how="left")
+    vattr = vattr.with_columns(pl.col("INVYR").cast(body.schema["INVYR"]))
+    body = body.join(vattr, on=SUBPLOT_ID + ["INVYR"], how="left").join(debut, on=TREE_ID, how="left")
     body = body.with_columns(
         [pl.when(syn).then(pl.col(f"_v_{c}").cast(body.schema[c])).otherwise(pl.col(c)).alias(c) for c in VISIT_ATTRS]
         + [pl.when(syn).then(pl.col("_d_age") + (pl.col("MEASDATE") - pl.col("_d_md")).dt.total_days() / 365.25)
@@ -760,6 +759,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     lu     = derive_land_use(full, events)
 
     # trajectory body (live + phantom + interpolated)
+    visits = visits.with_columns(pl.col("INVYR").cast(full.schema["INVYR"]))
     body = build_live_body(full, visits, load_backfill_context(con))
     import dbconn
     dbconn.require_tables(con, "tree_censor_events")
@@ -785,13 +785,13 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
 
     # attach tree-level terminal fate; flag the last body slot as terminal
     body = body.join(fate, on=TREE_ID, how="left")
-    last_slot = body.group_by(TREE_ID).agg(pl.col("MEASDATE").max().alias("_last_slot"))
+    last_slot = body.group_by(TREE_ID).agg(pl.col("INVYR").max().alias("_last_slot"))
     body = body.join(last_slot, on=TREE_ID, how="left").with_columns(
-        (pl.col("MEASDATE") == pl.col("_last_slot")).alias("is_terminal")).drop("_last_slot")
+        (pl.col("INVYR") == pl.col("_last_slot")).alias("is_terminal")).drop("_last_slot")
 
-    # attach per-row subplot cut-event (event landing on this measdate/subplot; r7 C F11)
-    ev_join = events.rename({"cut_measdate": "MEASDATE"})
-    body = body.join(ev_join, on=SUBPLOT_ID + ["MEASDATE"], how="left")
+    # attach per-row subplot cut-event (event landing on this subplot visit; r7 C F11)
+    ev_join = events.drop("cut_measdate").rename({"cut_invyr": "INVYR"}).with_columns(pl.col("INVYR").cast(body.schema["INVYR"]))
+    body = body.join(ev_join, on=SUBPLOT_ID + ["INVYR"], how="left")
 
     # attach land_use_4way + components per subplot (r7)
     body = body.join(lu.select(SUBPLOT_ID + [
@@ -811,10 +811,10 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
                 .with_columns(pl.col("subp_has_dstrb").fill_null(False)))
 
     # plot / subplot measurement counts
-    plot_n = (body.select(PLOT_KEY + ["MEASDATE"]).unique()
-              .group_by(PLOT_KEY).agg(pl.col("MEASDATE").n_unique().alias("plot_meas_num")))
-    subp_n = (body.select(SUBPLOT_ID + ["MEASDATE"]).unique()
-              .group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").n_unique().alias("subp_meas_num")))
+    plot_n = (body.select(PLOT_KEY + ["INVYR"]).unique()
+              .group_by(PLOT_KEY).agg(pl.col("INVYR").n_unique().alias("plot_meas_num")))
+    subp_n = (body.select(SUBPLOT_ID + ["INVYR"]).unique()
+              .group_by(SUBPLOT_ID).agg(pl.col("INVYR").n_unique().alias("subp_meas_num")))
     body = body.join(plot_n, on=PLOT_KEY, how="left").join(subp_n, on=SUBPLOT_ID, how="left")
 
     # trajectory_complete: a slot exists at every subplot VISIT between the
@@ -822,12 +822,12 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     span = body.group_by(TREE_ID).agg(
         pl.col("MEASDATE").min().alias("_bmin"),
         pl.col("MEASDATE").max().alias("_bmax"),
-        pl.col("MEASDATE").n_unique().alias("_nslots"))
+        pl.col("INVYR").n_unique().alias("_nslots"))
     vis_in = (
         span.join(visits, on=SUBPLOT_ID, how="left")
         .filter((pl.col("MEASDATE") >= pl.col("_bmin")) &
                 (pl.col("MEASDATE") <= pl.col("_bmax")))
-        .group_by(TREE_ID).agg(pl.col("MEASDATE").n_unique().alias("_nvisits"))
+        .group_by(TREE_ID).agg(pl.col("INVYR").n_unique().alias("_nvisits"))
     )
     span = (
         span.join(vis_in, on=TREE_ID, how="left")
@@ -842,7 +842,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
 
     out = body.rename({
         "STATECD": "statecd", "UNITCD": "unitcd", "COUNTYCD": "countycd",
-        "PLOT": "plot", "SUBP": "subp", "TREE": "tree", "MEASDATE": "measdate",
+        "PLOT": "plot", "SUBP": "subp", "TREE": "tree", "INVYR": "invyr", "MEASDATE": "measdate",
         "CONDID": "condid", "CYCLE": "cycle", "agb": "drybio_g",
     }).select([
         "plt_cn", "statecd", "unitcd", "countycd", "plot", "subp", "tree",
@@ -861,7 +861,8 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
         "subp_has_dstrb", "plot_meas_num", "subp_meas_num",
         "reconcile_new", "censor_reason",                  # curation-fix 2026-10-26
         "land_use_4way",                                   # r7 C F10 (land_use is 2-way)
-    ]).sort(["statecd", "unitcd", "countycd", "plot", "subp", "tree", "measdate"])
+        "invyr",                                           # D69: the visit's natural id, appended
+    ]).sort(["statecd", "unitcd", "countycd", "plot", "subp", "tree", "invyr"])
 
     # summary
     n_trees = out.select(["statecd", "unitcd", "countycd", "plot", "subp", "tree"]).unique().height

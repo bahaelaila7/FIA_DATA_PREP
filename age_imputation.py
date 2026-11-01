@@ -529,7 +529,7 @@ def build_training_set(con, est) -> pl.DataFrame:
     on each fold's training rows. Outliers are scored but not trained on."""
     cols = ", ".join(TRAIN_COLS + ["estage_raw", "spgrpcd_resolved", "cond_fldszcd", "cond_stdszcd",
                                    "cond_stdorgcd", "age_from_totage", "age_stratum",
-                                   "SUBP", "TREE", "MEASDATE"])
+                                   "SUBP", "TREE", "INVYR", "MEASDATE"])
     df = attach_modeling_context(con, con.execute(f"SELECT {cols} FROM curated_trees").pl())
     df = df.filter((pl.col("STATUSCD") == 1) & pl.col("DIA").is_not_null() & pl.col("DIA").is_not_nan())
     df = df.with_columns(
@@ -805,7 +805,7 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
     # raw prediction instead of the in-sample one, so the recalibration map (fitted on OOF
     # predictions) is applied to predictions of the same kind
     ok = kept & np.isfinite(raw_oof)
-    oof_tab = (train.filter(pl.Series(ok)).select(TREE_ID + ["MEASDATE"])
+    oof_tab = (train.filter(pl.Series(ok)).select(TREE_ID + ["INVYR"])
                .with_columns(pl.Series("_raw_oof", raw_oof[ok])))
     return model, enc, support, (recal, oof_tab)
 
@@ -890,8 +890,8 @@ def apply_age_model(df: pl.DataFrame,
     if isinstance(recal, tuple):
         recal, oof_tab = recal
     if oof_tab is not None and oof_tab.height:   # r5 M-6: cross-fitted predictions for training rows
-        o = (alive_w_dia.select(TREE_ID + ["MEASDATE"]).with_row_index("_i")   # order-ok: a position in this frame's own prediction array
-             .join(oof_tab, on=TREE_ID + ["MEASDATE"], how="inner"))
+        o = (alive_w_dia.select(TREE_ID + ["INVYR"]).with_row_index("_i")   # order-ok: a position in this frame's own prediction array
+             .join(oof_tab, on=TREE_ID + ["INVYR"], how="inner"))
         if o.height:
             raw[o["_i"].to_numpy()] = o["_raw_oof"].to_numpy()
         print(f"         model ages: {o.height:,} of {alive_w_dia.height:,} live rows use their cross-fitted "

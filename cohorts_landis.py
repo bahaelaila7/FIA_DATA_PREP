@@ -118,7 +118,7 @@ def load_base_data(con) -> pl.DataFrame:
         SELECT
             t.STATECD, t.UNITCD, t.COUNTYCD, t.PLOT, t.SUBP, t.TREE,
             t.spcd_resolved                        AS SPCD,   -- curation-fix: resolved species
-            t.MEASDATE,
+            t.INVYR, t.MEASDATE,
             t.DIA::DOUBLE                          AS dia,
             t.TPA_UNADJ::DOUBLE                    AS tpa,
             t.reconcile_new::INTEGER               AS reconcile_new,
@@ -198,8 +198,8 @@ def disturbance_death_expr() -> pl.Expr:
 
 
 def disturbance_events(con, states=None) -> pl.DataFrame:
-    """r7 D41 / D38: one row per tree with a disturbance REMOVAL event (TREE_ID + event_measdate,
-    event_kind, first_record_dead). The event is
+    """r7 D41 / D38: one row per tree with a disturbance REMOVAL event (TREE_ID + event_invyr, its
+    event_measdate, event_kind, first_record_dead). The event is
       * 'cut' / 'disturbance_death': the tree's FIRST dead / cut record (misrecorded deaths, D26,
         are not records of death; a first record that is a re-record, PREV_STATUS_CD = 2, is not
         an event: the death preceded the record's interval), with tree_fate silvicultural_death /
@@ -220,31 +220,32 @@ def disturbance_events(con, states=None) -> pl.DataFrame:
     harv = ", ".join(f"'{f}'" for f in HARVEST_FATES)
     return con.execute(f"""
         WITH fd AS (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE, tree_fate,
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, INVYR, MEASDATE, tree_fate,
                    COALESCE(rerecord_dead, FALSE) AS _rerec,
                    COALESCE(first_record_dead, FALSE) AS first_record_dead,
                    {disturbance_death_sql()} AS _dist
             FROM curated_trees
             WHERE STATUSCD IN (2, 3) AND NOT COALESCE(misrecorded_death, FALSE) {ws}
             QUALIFY row_number() OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
-                                       ORDER BY MEASDATE) = 1),
+                                       ORDER BY INVYR) = 1),
         ev_dead AS (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS event_measdate,
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, INVYR AS event_invyr, MEASDATE AS event_measdate,
                    CASE WHEN tree_fate IN ({harv}) THEN 'cut' ELSE 'disturbance_death' END AS event_kind,
                    first_record_dead
             FROM fd
             WHERE NOT _rerec AND (tree_fate IN ({harv}) OR (tree_fate = 'dead' AND _dist))),
         dis AS (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, max(MEASDATE) AS _last
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, max(INVYR) AS _last
             FROM curated_trees
             WHERE final_tree_fate = 'disappeared_inferred_removal' AND NOT COALESCE(misrecorded_death, FALSE) {ws}
             GROUP BY ALL),
         ev_dis AS (
-            SELECT d.STATECD, d.UNITCD, d.COUNTYCD, d.PLOT, d.SUBP, d.TREE, min(v.MEASDATE) AS event_measdate,
+            SELECT d.STATECD, d.UNITCD, d.COUNTYCD, d.PLOT, d.SUBP, d.TREE, min(v.INVYR) AS event_invyr,
+                   min(v.MEASDATE) AS event_measdate,
                    'inferred_removal' AS event_kind, FALSE AS first_record_dead
             FROM dis d JOIN clean_subplot_years v
               ON v.STATECD = d.STATECD AND v.UNITCD = d.UNITCD AND v.COUNTYCD = d.COUNTYCD
-             AND v.PLOT = d.PLOT AND v.SUBP = d.SUBP AND v.MEASDATE > d._last
+             AND v.PLOT = d.PLOT AND v.SUBP = d.SUBP AND v.INVYR > d._last
             GROUP BY ALL)
         SELECT * FROM ev_dead UNION ALL SELECT * FROM ev_dis
         ORDER BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
@@ -296,10 +297,10 @@ def build_plot_meas_num(df: pl.DataFrame) -> pl.DataFrame:
     Julia filter 'plot_meas_num > 1' selects only longitudinal plots.
     """
     return (
-        df.select(PLOT_KEY + ["MEASDATE"])
+        df.select(PLOT_KEY + ["INVYR"])
         .unique()
         .group_by(PLOT_KEY)
-        .agg(pl.col("MEASDATE").n_unique().alias("plot_meas_num"))
+        .agg(pl.col("INVYR").n_unique().alias("plot_meas_num"))
     )
 
 
@@ -310,10 +311,10 @@ def build_subp_meas_num(df: pl.DataFrame) -> pl.DataFrame:
     the plot if it was intermittently skipped.
     """
     return (
-        df.select(SUBPLOT_ID + ["MEASDATE"])
+        df.select(SUBPLOT_ID + ["INVYR"])
         .unique()
         .group_by(SUBPLOT_ID)
-        .agg(pl.col("MEASDATE").n_unique().alias("subp_meas_num"))
+        .agg(pl.col("INVYR").n_unique().alias("subp_meas_num"))
     )
 
 
@@ -424,18 +425,18 @@ def sim_year_map(visits: pl.DataFrame, anchors: pl.DataFrame | None = None) -> p
       sim_year_i = max(raw_i, sim_year_{i-1} + 1) over the visits in date order
                  = i + cummax_j<=i (raw_j - j)
     Two visits that round to the same year (e.g. 0.4 yr apart) therefore get consecutive
-    sim_years and ages advance between them. `visits`: SUBPLOT_ID + MEASDATE (the full
+    sim_years and ages advance between them. `visits`: SUBPLOT_ID + INVYR + MEASDATE (the full
     scaffold when available, so phantom and real rows share the axis); `anchors`: SUBPLOT_ID +
-    _first_measdate. Returns SUBPLOT_ID + MEASDATE + sim_year.
+    _first_measdate. Returns SUBPLOT_ID + INVYR + MEASDATE + sim_year.
     """
-    v = (visits.select(SUBPLOT_ID + ["MEASDATE"]).unique()
+    v = (visits.select(SUBPLOT_ID + ["INVYR", "MEASDATE"]).unique()
          .with_columns(pl.col("MEASDATE").min().over(SUBPLOT_ID).alias("_first_measdate"))
          .with_columns(((pl.col("MEASDATE") - pl.col("_first_measdate")).dt.total_days() / 365.25)
                        .round(0).cast(pl.Int32).alias("_raw"))
          .with_columns((pl.col("MEASDATE").rank("ordinal").over(SUBPLOT_ID).cast(pl.Int32) - 1).alias("_i")))
     return (v.with_columns((pl.col("_i") + (pl.col("_raw") - pl.col("_i")).cum_max().over(SUBPLOT_ID, order_by="MEASDATE"))
                            .cast(pl.Int32).alias("sim_year"))
-             .select(SUBPLOT_ID + ["MEASDATE", "sim_year"]))
+             .select(SUBPLOT_ID + ["INVYR", "MEASDATE", "sim_year"]))
 
 
 def compute_sim_year_ages(df: pl.DataFrame, visits: pl.DataFrame | None = None) -> pl.DataFrame:
@@ -455,11 +456,11 @@ def compute_sim_year_ages(df: pl.DataFrame, visits: pl.DataFrame | None = None) 
         df.group_by(SUBPLOT_ID)
         .agg(pl.col("MEASDATE").min().alias("_first_measdate"))
     )
-    allv = df.select(SUBPLOT_ID + ["MEASDATE"])
+    allv = df.select(SUBPLOT_ID + ["INVYR", "MEASDATE"])
     if visits is not None:
-        allv = pl.concat([allv, visits.select(SUBPLOT_ID + ["MEASDATE"])])
+        allv = pl.concat([allv, visits.select(SUBPLOT_ID + ["INVYR", "MEASDATE"]).with_columns(pl.col("INVYR").cast(df.schema["INVYR"]))])
     smap = sim_year_map(allv, first_meas)
-    df = df.drop([c for c in ("sim_year",) if c in df.columns]).join(smap, on=SUBPLOT_ID + ["MEASDATE"], how="left")
+    df = df.drop([c for c in ("sim_year",) if c in df.columns]).join(smap.drop("MEASDATE"), on=SUBPLOT_ID + ["INVYR"], how="left")
 
     # Per-tree debut: rounded age and sim_year at first measurement
     debut = (
@@ -611,9 +612,9 @@ def print_mid_measurement_gaps(df: pl.DataFrame) -> None:
             pl.col("MEASDATE").max().alias("last_measdate"),
         )
     )
-    subp_visits  = df.select(SUBPLOT_ID + ["MEASDATE"]).unique()
+    subp_visits  = df.select(SUBPLOT_ID + ["INVYR", "MEASDATE"]).unique()
     existing     = (
-        df.select(TREE_ID + ["MEASDATE"]).unique()
+        df.select(TREE_ID + ["INVYR"]).unique()
         .with_columns(pl.lit(True).alias("_exists"))
     )
     gaps = (
@@ -623,7 +624,7 @@ def print_mid_measurement_gaps(df: pl.DataFrame) -> None:
             (pl.col("MEASDATE") > pl.col("first_measdate")) &
             (pl.col("MEASDATE") < pl.col("last_measdate"))
         )
-        .join(existing, on=TREE_ID + ["MEASDATE"], how="left")
+        .join(existing, on=TREE_ID + ["INVYR"], how="left")
         .filter(pl.col("_exists").is_null())
     )
     n_slots = gaps.height
@@ -681,7 +682,7 @@ def load_backfill_context(con) -> dict:
         FROM procedural_breaks GROUP BY ALL
     """).pl()
     visit = con.execute("""
-        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE AS prior_measdate,
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR AS prior_invyr, MEASDATE AS prior_measdate,
                MAX(COALESCE(forest_micrcond_prop, 0)) AS _micro_prop,
                MAX(COALESCE(forest_subpcond_prop, 0) + COALESCE(forest_micrcond_prop, 0)) AS _forest_prop
         FROM clean_subplot_years GROUP BY ALL
@@ -756,14 +757,15 @@ def scaffold_visits(df: pl.DataFrame, ctx) -> pl.DataFrame:
     (sim_year_map anchored at the subplot's first scaffold visit). Without ctx:
     df's own visits."""
     if ctx is None:
-        return (df.select(SUBPLOT_ID + ["MEASDATE", "sim_year"]).unique()
-                .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"}))
+        return (df.select(SUBPLOT_ID + ["INVYR", "MEASDATE", "sim_year"]).unique()
+                .rename({"INVYR": "prior_invyr", "MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"}))
     real = df.filter(pl.col("intro_type").is_null()) if "intro_type" in df.columns else df
     first = real.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_first_measdate"))
-    allv = pl.concat([real.select(SUBPLOT_ID + ["MEASDATE"]),
-                      ctx["visit"].select(SUBPLOT_ID + [pl.col("prior_measdate").alias("MEASDATE")])])
+    allv = pl.concat([real.select(SUBPLOT_ID + ["INVYR", "MEASDATE"]),
+                      ctx["visit"].select(SUBPLOT_ID + [pl.col("prior_invyr").alias("INVYR").cast(real.schema["INVYR"]),
+                                                        pl.col("prior_measdate").alias("MEASDATE")])])
     return (sim_year_map(allv, first)
-            .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"}))
+            .rename({"INVYR": "prior_invyr", "MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"}))
 
 
 def nonforest_for(is_sap: pl.Expr, fill: bool = False) -> pl.Expr:
@@ -778,12 +780,12 @@ def nonforest_for(is_sap: pl.Expr, fill: bool = False) -> pl.Expr:
 
 def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) -> pl.DataFrame:
     """Drop candidate phantom slots per the rules above. `prior` carries SUBPLOT_ID, the
-    debut MEASDATE (D), prior_measdate and the BF_FLAGS; `key` identifies a slot and
-    key minus prior_measdate identifies the source tree (the owner)."""
+    debut MEASDATE (D), prior_invyr, prior_measdate and the BF_FLAGS; `key` identifies a slot and
+    key minus prior_invyr identifies the source tree (the owner). Dates decide time, ids decide identity."""
     if ctx is None:
         return prior
     breaks, visit = ctx["breaks"], ctx["visit"]
-    owner = [k for k in key if k != "prior_measdate"]
+    owner = [k for k in key if k != "prior_invyr"]
     n0 = prior.height
     prior = prior.filter(~pl.col("_bf_none"))
     n_none = n0 - prior.height
@@ -813,12 +815,12 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
                  .filter(pl.col("_last_dd").is_null() | (pl.col("prior_measdate") > pl.col("_last_dd")))
                  .drop("_last_dd"))
         n_z = n2z - prior.height
-    prior = prior.join(visit, on=SUBPLOT_ID + ["prior_measdate"], how="left")
+    prior = prior.join(visit.drop("prior_measdate"), on=SUBPLOT_ID + ["prior_invyr"], how="left")
 
     # (b) plot-level procedural break in (p, D]: the SAPLING part only for sapling re-tally
     # breaks (closed RC8 saplings, or unrecorded saplings: r2 M9), the RC8-entry part for
     # RC8 closure breaks
-    cand = prior.select(list(dict.fromkeys(key + ["MEASDATE", "_bf_sap", "_bf_rc8"]))).unique()
+    cand = prior.select(list(dict.fromkeys(key + ["prior_measdate", "MEASDATE", "_bf_sap", "_bf_rc8"]))).unique()
     crossed = (
         cand.join(breaks, on=PLOT_KEY, how="inner")
         .filter((pl.col("break_date") > pl.col("prior_measdate")) &
@@ -863,7 +865,7 @@ def tree_prior_candidates(df: pl.DataFrame, ctx, rule_c: bool = True) -> pl.Data
         )
         .filter(pl.col("prior_age") >= 1)
     )
-    return apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_measdate"], rule_c=rule_c)
+    return apply_backfill_blocks(prior, ctx, TREE_ID + ["prior_invyr"], rule_c=rule_c)
 
 
 def report_phantom_floor(missing: pl.DataFrame, col: str, floor: float, unit: str, tag: str) -> None:
@@ -912,8 +914,8 @@ def _phantom_agb(missing: pl.DataFrame, df: pl.DataFrame, tag: str) -> pl.DataFr
 def _to_synthetic(missing: pl.DataFrame) -> pl.DataFrame:
     return (
         missing
-        .drop(["MEASDATE", "age_calc", "agb", "sim_year"])
-        .rename({"prior_measdate": "MEASDATE", "prior_age": "age_calc",
+        .drop(["INVYR", "MEASDATE", "age_calc", "agb", "sim_year"])
+        .rename({"prior_invyr": "INVYR", "prior_measdate": "MEASDATE", "prior_age": "age_calc",
                  "prior_sim_year": "sim_year", "prior_agb": "agb"})
         .with_columns(pl.lit("phantom_backfill").cast(pl.Utf8).alias("intro_type"))
     )
@@ -930,11 +932,10 @@ def backfill_phantom_trees(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
     if "intro_type" not in df.columns:
         df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
     prior = tree_prior_candidates(df, ctx)
-    existing = (df.select(TREE_ID + ["MEASDATE"]).unique()
-                .rename({"MEASDATE": "prior_measdate"}).with_columns(pl.lit(True).alias("_exists")))
-    missing = (prior.join(existing, on=TREE_ID + ["prior_measdate"], how="left")
-               .filter(pl.col("_exists").is_null()).drop("_exists")
-               .sort(TREE_ID + ["prior_measdate"]))
+    existing = (df.select(TREE_ID + ["INVYR"]).unique()
+                .rename({"INVYR": "prior_invyr"}).with_columns(pl.lit(True).alias("_exists")))
+    missing = (prior.join(existing, on=TREE_ID + ["prior_invyr"], how="left")
+               .filter(pl.col("_exists").is_null()).drop("_exists"))
     n_plots = missing.select(PLOT_KEY).unique().height if missing.height else 0
     print(f"[backfill trees] {missing.height:,} missing tree-slots across {n_plots:,} plots")
     if missing.height == 0:
@@ -942,7 +943,7 @@ def backfill_phantom_trees(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
     global PHANTOM_TREE_SOURCES
     PHANTOM_TREE_SOURCES = missing.select(
         TREE_ID + ["prior_measdate", pl.col("MEASDATE").alias("debut_measdate"),
-                   "species_symbol", "prior_age"])
+                   "species_symbol", "prior_age", "prior_invyr"])
     synthetic = _to_synthetic(_phantom_agb(missing, df, "backfill trees"))
     print(f"[backfill trees] generated {synthetic.height:,} synthetic rows")
     return pl.concat([df, synthetic.select(df.columns)], how="vertical")
@@ -963,24 +964,24 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
     Returns (df, sources) where sources = phantom_cohort_sources (one row per created slot
     with its surviving member tree ids).
     """
-    ckey = SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]
+    ckey = SUBPLOT_ID + ["species_symbol", "INVYR", "age_calc"]
     if "intro_type" not in df.columns:
         df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("intro_type"))
     empty_src = pl.DataFrame(schema={**{k: pl.Int64 for k in SUBPLOT_ID}, "species_symbol": pl.Utf8,
                                      "src_measdate": pl.Date, "src_age_calc": pl.Int32,
                                      "prior_measdate": pl.Date, "prior_age": pl.Int32,
-                                     "n_members": pl.UInt32, "member_trees": pl.Utf8})
+                                     "n_members": pl.UInt32, "member_trees": pl.Utf8, "prior_invyr": pl.Int64})
     visits = scaffold_visits(df, ctx)
-    slots = (df.select(ckey + ["sim_year"]).unique()
+    slots = (df.select(ckey + ["MEASDATE", "sim_year"]).unique()
              .join(visits, on=SUBPLOT_ID, how="inner")
              .filter(pl.col("prior_measdate") < pl.col("MEASDATE"))
              .with_columns((pl.col("age_calc") + pl.col("prior_sim_year") - pl.col("sim_year"))
                            .cast(pl.Int32).alias("prior_age"))
              .filter(pl.col("prior_age") >= 1))
-    existing = (df.select(SUBPLOT_ID + ["species_symbol", "MEASDATE", "age_calc"]).unique()
-                .rename({"MEASDATE": "prior_measdate", "age_calc": "prior_age"})
+    existing = (df.select(SUBPLOT_ID + ["species_symbol", "INVYR", "age_calc"]).unique()
+                .rename({"INVYR": "prior_invyr", "age_calc": "prior_age"})
                 .with_columns(pl.lit(True).alias("_exists")))
-    slots = (slots.join(existing, on=SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"], how="left")
+    slots = (slots.join(existing, on=SUBPLOT_ID + ["species_symbol", "prior_invyr", "prior_age"], how="left")
              .filter(pl.col("_exists").is_null()).drop("_exists"))
     if slots.height == 0:
         print("[backfill cohorts] 0 additional cohort-slots")
@@ -992,27 +993,27 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
     members = (df.select(ckey + TREE_ID[-1:]).unique()      # TREE (SUBPLOT_ID already in ckey)
                .join(debut, on=TREE_ID, how="left"))
     cand = slots.join(members, on=ckey, how="inner")
-    allowed = (tree_prior_candidates(df, ctx).select(TREE_ID + ["prior_measdate"]).unique()
+    allowed = (tree_prior_candidates(df, ctx).select(TREE_ID + ["prior_invyr"]).unique()
                .with_columns(pl.lit(True).alias("_ok_pre")) if ctx is not None else
-               cand.select(TREE_ID + ["prior_measdate"]).unique().with_columns(pl.lit(True).alias("_ok_pre")))
-    cand = cand.join(allowed, on=TREE_ID + ["prior_measdate"], how="left")
+               cand.select(TREE_ID + ["prior_invyr"]).unique().with_columns(pl.lit(True).alias("_ok_pre")))
+    cand = cand.join(allowed, on=TREE_ID + ["prior_invyr"], how="left")
     if ctx is not None:
-        cen = (cand.select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
+        cen = (cand.select(TREE_ID + ["prior_invyr", "INVYR", "prior_measdate", "MEASDATE"]).unique()
                .join(ctx["censor"], on=TREE_ID, how="inner")
                .filter((pl.col("_cdate") > pl.col("prior_measdate")) & (pl.col("_cdate") <= pl.col("MEASDATE")))
-               .select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
+               .select(TREE_ID + ["prior_invyr", "INVYR"]).unique()
                .with_columns(pl.lit(True).alias("_cen")))
-        forest = ctx["visit"].select(SUBPLOT_ID + ["prior_measdate", "_forest_prop", "_micro_prop"])
+        forest = ctx["visit"].select(SUBPLOT_ID + ["prior_invyr", "_forest_prop", "_micro_prop"])
         sap = df.group_by(TREE_ID).agg(pl.col("_bf_sap").min()) if "_bf_sap" in df.columns \
             else df.select(TREE_ID).unique().with_columns(pl.lit(False).alias("_bf_sap"))
-        dd = (cand.select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
+        dd = (cand.select(TREE_ID + ["prior_invyr", "INVYR", "prior_measdate", "MEASDATE"]).unique()
               .join(ctx["dead"], on=TREE_ID, how="inner")
               .filter((pl.col("_dd") >= pl.col("prior_measdate")) & (pl.col("_dd") <= pl.col("MEASDATE")))
-              .select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
+              .select(TREE_ID + ["prior_invyr", "INVYR"]).unique()
               .with_columns(pl.lit(True).alias("_dead_between")))
-        cand = (cand.join(cen, on=TREE_ID + ["prior_measdate", "MEASDATE"], how="left")
-                .join(dd, on=TREE_ID + ["prior_measdate", "MEASDATE"], how="left")
-                .join(forest, on=SUBPLOT_ID + ["prior_measdate"], how="left")
+        cand = (cand.join(cen, on=TREE_ID + ["prior_invyr", "INVYR"], how="left")
+                .join(dd, on=TREE_ID + ["prior_invyr", "INVYR"], how="left")
+                .join(forest, on=SUBPLOT_ID + ["prior_invyr"], how="left")
                 .join(sap, on=TREE_ID, how="left"))
         # r7 C F4: a sapling member needs a forest MICROPLOT at p (same rule as (n))
         gap_ok = ((pl.col("prior_measdate") > pl.col("_D")) & pl.col("_cen").is_null()
@@ -1022,12 +1023,12 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
         gap_ok = pl.lit(True)
     surv = cand.filter(
         ((pl.col("prior_measdate") < pl.col("_D")) & pl.col("_ok_pre").fill_null(False)) | gap_ok)
-    n_cand_slots = slots.select(ckey + ["prior_measdate"]).unique().height
-    slot_key = SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"]
+    n_cand_slots = slots.select(ckey + ["prior_invyr"]).unique().height
+    slot_key = SUBPLOT_ID + ["species_symbol", "prior_invyr", "prior_age"]
     # one phantom per target slot; representative = smallest surviving member (deterministic)
     rep = (surv.pipe(pick, slot_key, ["MEASDATE", "TREE"])
-           .select(ckey + ["TREE", "prior_measdate", "prior_age", "prior_sim_year"]))
-    sources = (surv.group_by(slot_key)
+           .select(ckey + ["TREE", "prior_invyr", "prior_measdate", "prior_age", "prior_sim_year"]))
+    sources = (surv.group_by(slot_key + ["prior_measdate"])   # one date per visit
                .agg(pl.col("MEASDATE").sort_by(["MEASDATE", "TREE"]).first().alias("src_measdate"),
                     pl.col("age_calc").sort_by(["MEASDATE", "TREE"]).first().alias("src_age_calc"),
                     pl.col("TREE").n_unique().cast(pl.UInt32).alias("n_members"),
@@ -1046,8 +1047,8 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
 
 
 def set_visit_flag(con, table: str, col: str, visits_sql: str, what: str) -> None:
-    """Set a per-(plot, measdate) BOOL `col` on a cohort table: TRUE on rows whose plot visit is in
-    `visits_sql` (STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE). An existing column is replaced IN
+    """Set a per-(plot, invyr) BOOL `col` on a cohort table: TRUE on rows whose plot visit is in
+    `visits_sql` (STATECD, UNITCD, COUNTYCD, PLOT, INVYR). An existing column is replaced IN
     PLACE (its position kept, so step reruns never reorder the schema: r7 D F9); a new one is
     APPENDED as the last column, so readers of the old schema are unaffected."""
     import dbconn
@@ -1058,9 +1059,9 @@ def set_visit_flag(con, table: str, col: str, visits_sql: str, what: str) -> Non
         CREATE OR REPLACE TABLE {table} AS
         SELECT {sel}
         FROM {table} c
-        LEFT JOIN (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM ({visits_sql})) b
+        LEFT JOIN (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM ({visits_sql})) b
           ON b.STATECD=c.statecd AND b.UNITCD=c.unitcd AND b.COUNTYCD=c.countycd
-         AND b.PLOT=c.plot AND b.MEASDATE=c.measdate
+         AND b.PLOT=c.plot AND b.INVYR=c.invyr
     """)
     n = con.execute(f"SELECT count(*) FILTER (WHERE {col}), count(*) FROM {table}").fetchone()
     print(f"[{col}] {table}: {n[0]:,}/{n[1]:,} rows at {what}")
@@ -1085,9 +1086,9 @@ def add_rc7_withdrawn_flag(con, table: str) -> None:
     dbconn.require_tables(con, "curated_trees", table)
     if "all_live_withdrawn_rc7" not in dbconn.column_names(con, "curated_trees"):
         raise SystemExit("curated_trees lacks all_live_withdrawn_rc7 (r7 D39; rerun step 1)")
-    src = "SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM curated_trees WHERE all_live_withdrawn_rc7"
+    src = "SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM curated_trees WHERE all_live_withdrawn_rc7"
     if dbconn.table_exists(con, "rc7_withdrawn_visits"):   # step 1's visit list: also visits left with no record
-        src += " UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE FROM rc7_withdrawn_visits"
+        src += " UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM rc7_withdrawn_visits"
     set_visit_flag(con, table, "all_live_withdrawn_rc7", src,
                    "a visit whose live trees were all withdrawn (RC7)")
 
@@ -1156,13 +1157,14 @@ def check_cohort_continuity(df: pl.DataFrame, age_tol: int = 0) -> int:
     Uses lowercase column names (post-rename output of build_cohorts_landis).
     """
     subplot_id  = ["statecd", "unitcd", "countycd", "plot", "subp"]
-    cohort_key  = subplot_id + ["species_symbol", "measdate", "age_calc"]
+    cohort_key  = subplot_id + ["species_symbol", "invyr", "age_calc"]
 
-    # Per-subplot visit timeline sorted by measdate.
-    # sim_year is carried for arithmetic only — visits are identified by measdate.
+    # Per-subplot visit timeline in date order.
+    # sim_year is carried for arithmetic only — visits are identified by invyr.
     visits = (
-        df.select(subplot_id + ["measdate", "sim_year"]).unique()
+        df.select(subplot_id + ["invyr", "measdate", "sim_year"]).unique()
         .with_columns([
+            pl.col("invyr").shift(1).over(subplot_id, order_by="measdate").alias("prev_invyr"),
             pl.col("measdate").shift(1).over(subplot_id, order_by="measdate").alias("prev_measdate"),
             pl.col("sim_year").shift(1).over(subplot_id, order_by="measdate").alias("prev_sim_year"),
         ])
@@ -1170,7 +1172,7 @@ def check_cohort_continuity(df: pl.DataFrame, age_tol: int = 0) -> int:
 
     cohorts = (
         df.select(cohort_key + ["sim_year"]).unique()
-        .join(visits, on=subplot_id + ["measdate"], how="left")
+        .join(visits.drop("sim_year", "measdate"), on=subplot_id + ["invyr"], how="left")
         .with_columns(
             (pl.col("sim_year") - pl.col("prev_sim_year")).alias("sim_year_gap")
         )
@@ -1190,17 +1192,17 @@ def check_cohort_continuity(df: pl.DataFrame, age_tol: int = 0) -> int:
         )
     )
 
-    # All distinct (subplot, species, measdate, age) present in data — join by measdate only.
+    # All distinct (subplot, species, invyr, age) present in data — join by invyr only.
     prev_ages = (
-        df.select(subplot_id + ["species_symbol", "measdate", "age_calc"])
+        df.select(subplot_id + ["species_symbol", "invyr", "age_calc"])
         .unique()
-        .rename({"measdate": "prev_measdate", "age_calc": "prev_age_calc"})
+        .rename({"invyr": "prev_invyr", "age_calc": "prev_age_calc"})
     )
 
     cond3 = (
         needs_c3
         .join(prev_ages,
-              on=subplot_id + ["species_symbol", "prev_measdate"],
+              on=subplot_id + ["species_symbol", "prev_invyr"],
               how="left")
         .with_columns(
             (
@@ -1295,7 +1297,8 @@ def build_cohorts_landis(con, backfill_blocks: bool = True) -> pl.DataFrame:
 
     # Anchor age_calc to integer sim_year steps (eliminates floating-point drift)
     ctx = load_backfill_context(con) if backfill_blocks else None
-    scaffold = (ctx["visit"].select(SUBPLOT_ID + [pl.col("prior_measdate").alias("MEASDATE")])
+    scaffold = (ctx["visit"].select(SUBPLOT_ID + [pl.col("prior_invyr").alias("INVYR").cast(df.schema["INVYR"]),
+                                                  pl.col("prior_measdate").alias("MEASDATE")])
                 if ctx is not None else None)
     df = compute_sim_year_ages(df, scaffold)
 
@@ -1327,6 +1330,7 @@ def build_cohorts_landis(con, backfill_blocks: bool = True) -> pl.DataFrame:
         "COUNTYCD": "countycd",
         "PLOT":     "plot",
         "SUBP":     "subp",
+        "INVYR":    "invyr",
         "MEASDATE": "measdate",
     }).select([
         "plt_cn",
@@ -1338,6 +1342,7 @@ def build_cohorts_landis(con, backfill_blocks: bool = True) -> pl.DataFrame:
         "spgrpcd",
         "major_spgrpcd",
         "sftwd_hrdwd",
+        "invyr",
         "measdate",
         "sim_year",
         "age_calc",
@@ -1421,7 +1426,7 @@ if __name__ == "__main__":
     con.unregister("_src_view")
     tsrc = PHANTOM_TREE_SOURCES if PHANTOM_TREE_SOURCES is not None else pl.DataFrame(
         schema={**{k: pl.Int64 for k in TREE_ID}, "prior_measdate": pl.Date,
-                "debut_measdate": pl.Date, "species_symbol": pl.Utf8, "prior_age": pl.Int32})
+                "debut_measdate": pl.Date, "species_symbol": pl.Utf8, "prior_age": pl.Int32, "prior_invyr": pl.Int64})
     con.register("_tsrc_view", tsrc.to_arrow())
     con.execute("CREATE OR REPLACE TABLE phantom_tree_sources AS SELECT * FROM _tsrc_view")
     con.unregister("_tsrc_view")

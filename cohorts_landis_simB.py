@@ -39,7 +39,7 @@ OUT_COLS = ["plt_cn", "statecd", "unitcd", "countycd", "plot", "subp",
             "epa_l3", "epa_l4", "ecosubcd",
             "species_symbol", "spgrpcd", "major_spgrpcd", "sftwd_hrdwd",
             "measdate", "sim_year", "age_calc", "agb",
-            "subp_has_dstrb", "plot_meas_num", "subp_meas_num", "intro_type"]
+            "subp_has_dstrb", "plot_meas_num", "subp_meas_num", "intro_type", "invyr"]
 
 
 def build(con) -> pl.DataFrame:
@@ -48,9 +48,9 @@ def build(con) -> pl.DataFrame:
     df = c1.load_base_data(con)                       # one row per live tree×visit, carries 'dia'
     # r3 M1: the time axis (sim_year, age_calc) is computed on ALL live rows (saplings
     # included) over the full visit scaffold, BEFORE dropping saplings — the same axis as the
-    # Sim A table and tree_trajectories, so cohort_disturbance's (measdate, age_calc) keys
+    # Sim A table and tree_trajectories, so cohort_disturbance's (invyr, age_calc) keys
     # match exactly (re-basing it on the timber-only rows shifted ages by a year).
-    scaffold = con.execute("SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE "
+    scaffold = con.execute("SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR, MEASDATE "
                            "FROM clean_subplot_years").pl()
     df = c1.compute_sim_year_ages(df, scaffold)
     n0 = df.height
@@ -69,7 +69,7 @@ def build(con) -> pl.DataFrame:
         pl.concat_str([pl.col(c).cast(pl.Utf8) for c in c1.PLOT_KEY], separator="_").alias("plt_cn"))
 
     df = df.rename({"STATECD": "statecd", "UNITCD": "unitcd", "COUNTYCD": "countycd",
-                    "PLOT": "plot", "SUBP": "subp", "MEASDATE": "measdate"}).select(
+                    "PLOT": "plot", "SUBP": "subp", "INVYR": "invyr", "MEASDATE": "measdate"}).select(
         OUT_COLS + ["_age_source", "_age_domain", "_age_stratum"])   # D46: _age_stratum for IS_NATURAL_MODEL
 
     # Aggregate into cohorts: sum agb over trees sharing (subplot, species, age, visit).
@@ -95,7 +95,7 @@ def build(con) -> pl.DataFrame:
                           pl.col("share_known_bias").round(9))
             .join(src, on=grp, how="left", nulls_equal=True)
             .select(OUT_COLS + c1.AGE_META_COLS)
-            .sort(["statecd", "unitcd", "countycd", "plot", "subp", "species_symbol", "measdate", "age_calc"]))
+            .sort(["statecd", "unitcd", "countycd", "plot", "subp", "species_symbol", "invyr", "age_calc"]))
     print(f"[aggregate] {n_pre:,} tree-rows → {df.height:,} cohort-rows "
           f"({df.select(['statecd','unitcd','countycd','plot']).unique().height:,} plots, "
           f"{df['species_symbol'].n_unique():,} species)")
@@ -117,20 +117,20 @@ if __name__ == "__main__":
     con.unregister("_simB_view")
 
     # Attach land_use (STDORGCD 2-way: the shared c1.plot_land_use_sql rule, r7 D43 / D44: the
-    # curated visits' COND rows only, a LEFT join exactly as Sim A's) + cycle (per plot, measdate).
+    # curated visits' COND rows only, a LEFT join exactly as Sim A's) + cycle (per plot, invyr).
     con.execute(f"""
     CREATE OR REPLACE TABLE {TABLE} AS
     WITH stdorg AS ({c1.plot_land_use_sql(con)}),
     plot_cycle AS (
         SELECT STATECD AS statecd, UNITCD AS unitcd, COUNTYCD AS countycd, PLOT AS plot,
-               MEASDATE AS measdate, MAX(CYCLE) AS cycle
+               INVYR AS invyr, MAX(CYCLE) AS cycle
         FROM base_subplot_cond GROUP BY 1,2,3,4,5)
     SELECT c.* EXCLUDE (n_trees_natural_treeage_scale, share_natural_treeage_scale, age_source_major, n_trees_known_bias, share_known_bias),
            s.land_use, cy.cycle,
            c.n_trees_natural_treeage_scale, c.share_natural_treeage_scale, c.age_source_major, c.n_trees_known_bias, c.share_known_bias
     FROM {TABLE}_base c
     LEFT JOIN stdorg s USING (statecd, unitcd, countycd, plot)
-    LEFT JOIN plot_cycle cy USING (statecd, unitcd, countycd, plot, measdate)
+    LEFT JOIN plot_cycle cy USING (statecd, unitcd, countycd, plot, invyr)
     """)
     con.execute(f"DROP TABLE {TABLE}_base")
     con.commit()

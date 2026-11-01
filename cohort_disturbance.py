@@ -29,7 +29,7 @@ full_removal = FALSE. Optional cohort gate (APPLY_COHORT_GATE, off) is unchanged
 
 Biomass is area-weighted per tree as drybio_g*tpa (the lbs/acre->g/m2 constant cancels in the ratio).
 
-Output: table `cohort_disturbance` keyed (statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc),
+Output: table `cohort_disturbance` keyed (statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc),
 written ONLY by attach_disturbance_simB.py (timber-only Sim B drops, D31 semantics) into the Sim B DB.
 
 Usage (diagnostics only; r7 D44 / C F9: the old --write / --attach paths wrote the pre-D19 / pre-D31,
@@ -55,27 +55,27 @@ NATURAL_FATES = ["dead_natural"]   # diagnostics only: removals count from the D
 
 def load(con, states):
     """Trajectory rows + the tree's D41 removal event (cohorts_landis.disturbance_events):
-    removal_measdate = the event visit, removal_counted = the event counts for drops (not a
+    removal_invyr = the event visit, removal_counted = the event counts for drops (not a
     first_record_dead record, D38)."""
     import cohorts_landis as c1
     ws = f"AND tt.statecd IN ({','.join(map(str, states))})" if states else ""
     df = con.execute(f"""
         SELECT tt.statecd, tt.unitcd, tt.countycd, tt.plot, tt.subp, tt.tree,
-               tt.measdate, tt.sim_year, tt.age_calc, tt.species_symbol,
+               tt.invyr, tt.measdate, tt.sim_year, tt.age_calc, tt.species_symbol,
                tt.drybio_g, tt.tpa, tt.intro_type, tt.is_terminal, tt.dia,
                tt.terminal_fate, tt.death_cause,
                ct.STATUSCD AS statuscd
         FROM tree_trajectories tt
         LEFT JOIN curated_trees ct
           ON ct.STATECD=tt.statecd AND ct.UNITCD=tt.unitcd AND ct.COUNTYCD=tt.countycd
-          AND ct.PLOT=tt.plot AND ct.SUBP=tt.subp AND ct.TREE=tt.tree AND ct.MEASDATE=tt.measdate
+          AND ct.PLOT=tt.plot AND ct.SUBP=tt.subp AND ct.TREE=tt.tree AND ct.INVYR=tt.invyr
           AND NOT COALESCE(ct.misrecorded_death, FALSE)   -- r6 D26: never a status source
         WHERE tt.drybio_g IS NOT NULL AND tt.tpa IS NOT NULL {ws}
     """).pl()
     ev = (c1.disturbance_events(con, states or None)
           .rename({k: k.lower() for k in c1.TREE_ID})
           .select(["statecd", "unitcd", "countycd", "plot", "subp", "tree",
-                   pl.col("event_measdate").alias("removal_measdate"),
+                   pl.col("event_invyr").alias("removal_invyr"),
                    (~pl.col("first_record_dead")).alias("removal_counted"),
                    pl.col("event_kind").alias("removal_kind")]))
     keys = ["statecd", "unitcd", "countycd", "plot", "subp", "tree"]
@@ -90,13 +90,13 @@ def load_scaffold(con, states):
     """r7 D42: the subplot visit axis of the FULL scaffold (clean_subplot_years) with the shared
     strict sim_year (cohorts_landis.sim_year_map, the axis of Sim A / Sim B / the trajectories).
     The trajectory rows alone miss a visit at which no tree has a slot (a clear-cut subplot whose
-    cut records carry no TPA): its full removals were never paired. Lower-case keys + measdate,
+    cut records carry no TPA): its full removals were never paired. Lower-case keys + invyr, measdate,
     sim_year."""
     import cohorts_landis as c1
     import dbconn
     ws = dbconn.state_filter(states or None, col="STATECD", prefix="WHERE")
-    v = con.execute(f"SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, MEASDATE FROM clean_subplot_years {ws}").pl()
-    return c1.sim_year_map(v).rename({k: k.lower() for k in c1.SUBPLOT_ID + ["MEASDATE"]})
+    v = con.execute(f"SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR, MEASDATE FROM clean_subplot_years {ws}").pl()
+    return c1.sim_year_map(v).rename({k: k.lower() for k in c1.SUBPLOT_ID + ["INVYR", "MEASDATE"]})
 
 
 def compute(df, timber_only: bool = False, scaffold=None):
@@ -107,7 +107,7 @@ def compute(df, timber_only: bool = False, scaffold=None):
     die or are cut, and trees that grow past 5 in between the visits, no longer put drops on
     surviving timber cohorts.
 
-    `df` must carry the D41 removal columns of load(): removal_measdate (the tree's event visit)
+    `df` must carry the D41 removal columns of load(): removal_invyr (the tree's event visit)
     and removal_counted (False for a first_record_dead event, D38). A tree gone at the visit is a
     COUNTED removal only when that visit IS its removal event (r7 D41; before, any tree whose
     terminal_fate was a disturbance fate counted at any pair where it was absent, C F7).
@@ -115,7 +115,7 @@ def compute(df, timber_only: bool = False, scaffold=None):
     `scaffold` (load_scaffold, r7 D42): the full subplot visit axis; the visits are then ranked over
     it, so a visit with no trajectory row (every tree removed) still follows its predecessor.
     None (the fixtures): the visits of df."""
-    miss = {"removal_measdate", "removal_counted"} - set(df.columns)
+    miss = {"removal_invyr", "removal_counted"} - set(df.columns)
     if miss:
         raise ValueError(f"cohort_disturbance.compute: df lacks the D41 removal columns {sorted(miss)} "
                          f"(load() joins them from cohorts_landis.disturbance_events)")
@@ -129,23 +129,22 @@ def compute(df, timber_only: bool = False, scaffold=None):
     ])
 
     # dense per-subplot visit rank (the measurement time axis)
-    visits = df.select(SUBPLOT_ID + ["measdate", "sim_year"]).unique()
+    visits = df.select(SUBPLOT_ID + ["invyr", "measdate", "sim_year"]).unique()
     if scaffold is not None:
-        sc = (scaffold.with_columns([pl.col(k).cast(df.schema[k]) for k in SUBPLOT_ID + ["measdate", "sim_year"]])
+        sc = (scaffold.with_columns([pl.col(k).cast(df.schema[k]) for k in SUBPLOT_ID + ["invyr", "measdate", "sim_year"]])
               .join(visits.select(SUBPLOT_ID).unique(), on=SUBPLOT_ID, how="semi"))
-        both = visits.join(sc, on=SUBPLOT_ID + ["measdate"], how="inner", suffix="_sc")
+        both = visits.join(sc, on=SUBPLOT_ID + ["invyr"], how="inner", suffix="_sc")
         nbad = both.filter(pl.col("sim_year") != pl.col("sim_year_sc")).height
         if nbad:
             raise ValueError(f"cohort_disturbance.compute: {nbad} trajectory visits disagree with the scaffold sim_year")
         n0 = visits.height
-        visits = pl.concat([visits, sc.select(visits.columns).join(visits, on=SUBPLOT_ID + ["measdate"], how="anti")])
+        visits = pl.concat([visits, sc.select(visits.columns).join(visits, on=SUBPLOT_ID + ["invyr"], how="anti")])
         print(f"[visits] {visits.height - n0:,} scaffold visits without a trajectory row added to the visit axis (D42)")
     visits = (
         visits
-        .sort(SUBPLOT_ID + ["measdate"])
-        .with_columns(pl.col("measdate").rank("dense").over(SUBPLOT_ID).cast(pl.Int32).alias("vrank"))
+        .with_columns(pl.col("invyr").rank("dense").over(SUBPLOT_ID).cast(pl.Int32).alias("vrank"))
     )
-    df = df.join(visits.select(SUBPLOT_ID + ["measdate", "vrank"]), on=SUBPLOT_ID + ["measdate"], how="left")
+    df = df.join(visits.select(SUBPLOT_ID + ["invyr", "vrank"]), on=SUBPLOT_ID + ["invyr"], how="left")
 
     # one row per alive tree-visit
     alive = df.filter(pl.col("alive")).with_columns(
@@ -153,7 +152,7 @@ def compute(df, timber_only: bool = False, scaffold=None):
     alive_all = alive
     if timber_only:
         alive = alive.filter(pl.col("_timber"))
-    rem = df.select(COHORT_ID[:5] + ["tree", "removal_measdate", "removal_counted", "terminal_fate"]).unique()
+    rem = df.select(COHORT_ID[:5] + ["tree", "removal_invyr", "removal_counted", "terminal_fate"]).unique()
     if rem.select(SUBPLOT_ID + ["tree"]).is_duplicated().any():
         raise ValueError("a tree carries two removal states")
 
@@ -163,7 +162,7 @@ def compute(df, timber_only: bool = False, scaffold=None):
         .rename({"vrank": "vrank_prev", "w": "w_prev"})
         .with_columns((pl.col("vrank_prev") + 1).alias("vrank"))
         .join(rem, on=SUBPLOT_ID + ["tree"], how="left")
-        .join(visits.select(SUBPLOT_ID + ["vrank", pl.col("measdate").alias("_vmd")]),
+        .join(visits.select(SUBPLOT_ID + ["vrank", pl.col("invyr").alias("_vinvyr")]),
               on=SUBPLOT_ID + ["vrank"], how="left")
     )
     cur = alive.select(COHORT_ID + ["tree", "vrank", "w"]).rename({"w": "w_cur"})
@@ -177,7 +176,7 @@ def compute(df, timber_only: bool = False, scaffold=None):
                     .filter(pl.col("_nont").is_null()).drop("_nont"))
 
     # classify each tree at the target visit vrank
-    at_event = (pl.col("removal_measdate") == pl.col("_vmd")).fill_null(False)
+    at_event = (pl.col("removal_invyr") == pl.col("_vinvyr")).fill_null(False)
     disturbed_removal = pl.col("w_cur").is_null() & at_event & pl.col("removal_counted").fill_null(False)
     natural_removal   = pl.col("w_cur").is_null() & ~disturbed_removal & pl.col("terminal_fate").is_in(NATURAL_FATES)
     other_gone        = pl.col("w_cur").is_null() & ~(disturbed_removal | natural_removal)  # censored, first-seen, ...
@@ -258,14 +257,14 @@ def compute(df, timber_only: bool = False, scaffold=None):
         coh = coh.filter(pl.col("disturbance_drop_pct") >= COHORT_SEVERITY_FRAC)
 
     # map (cohort, vrank) -> the measurement key for curated_cohorts_landis
-    vr = visits.select(SUBPLOT_ID + ["measdate", "sim_year", "vrank"])
+    vr = visits.select(SUBPLOT_ID + ["invyr", "measdate", "sim_year", "vrank"])
     coh = (
         coh.join(vr, on=SUBPLOT_ID + ["vrank"], how="left")
         .with_columns((pl.col("sim_year") - pl.col("birth_sim_year")).cast(pl.Int32).alias("age_calc"))
-        .select(SUBPLOT_ID + ["species_symbol", "measdate", "age_calc",
+        .select(SUBPLOT_ID + ["species_symbol", "invyr", "measdate", "age_calc",
                               "disturbance_drop_pct", "dropped", "would_be", "n_disturbed", "n_survivors",
                               "full_removal"])
-        .sort(SUBPLOT_ID + ["species_symbol", "measdate", "age_calc"])
+        .sort(SUBPLOT_ID + ["species_symbol", "invyr", "age_calc"])
     )
     return coh
 

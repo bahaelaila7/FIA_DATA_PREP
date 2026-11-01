@@ -62,7 +62,7 @@ def _interp_case(nonforest_v2: bool = False, censor: bool = False, dead_at_v2: b
 
 _BASE = dict(statecd=99, unitcd=1, countycd=1, plot=1, subp=1, species_symbol="PITA",
              tpa=6.018, death_cause=None)
-_SCHEMA = {"statuscd": pl.Int64, "death_cause": pl.Utf8, "removal_measdate": pl.Date,
+_SCHEMA = {"statuscd": pl.Int64, "death_cause": pl.Utf8, "removal_invyr": pl.Int64,
            "removal_counted": pl.Boolean, "intro_type": pl.Utf8, "terminal_fate": pl.Utf8}
 
 
@@ -72,9 +72,9 @@ class _Rows:
         self.rows = []
 
     def add(self, tree, md, sy, bio, it, st, fate, dia, rem_md=None, counted=False, term=False):
-        self.rows.append({**_BASE, "tree": tree, "measdate": md, "sim_year": sy, "age_calc": sy + 20,
+        self.rows.append({**_BASE, "tree": tree, "invyr": md.year, "measdate": md, "sim_year": sy, "age_calc": sy + 20,
                           "drybio_g": bio, "intro_type": it, "statuscd": st, "terminal_fate": fate,
-                          "is_terminal": term, "dia": dia, "removal_measdate": rem_md, "removal_counted": counted})
+                          "is_terminal": term, "dia": dia, "removal_invyr": rem_md.year if rem_md else None, "removal_counted": counted})
 
     def df(self):
         return pl.DataFrame(self.rows, schema_overrides=_SCHEMA)

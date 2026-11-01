@@ -51,13 +51,14 @@ con.execute("""CREATE OR REPLACE TABLE cohort_disturbance AS
            age_calc::INTEGER AS age_calc, disturbance_drop_pct::DOUBLE AS disturbance_drop_pct,
            dropped::DOUBLE AS dropped, would_be::DOUBLE AS would_be,
            n_disturbed::UINTEGER AS n_disturbed, n_survivors::UINTEGER AS n_survivors,
-           full_removal::BOOLEAN AS full_removal       -- r7 D42 (appended)
-    FROM _cd ORDER BY statecd, unitcd, countycd, plot, subp, species_symbol, measdate, age_calc""")
+           full_removal::BOOLEAN AS full_removal,      -- r7 D42 (appended)
+           invyr::INTEGER AS invyr                     -- D69: the visit's natural id (appended)
+    FROM _cd ORDER BY statecd, unitcd, countycd, plot, subp, species_symbol, invyr, age_calc""")
 con.unregister("_cd")
 # r7 D42: a full removal has no live member at the visit, so Sim B has no row at its key
 n_full_row = con.execute(f"""SELECT count(*) FROM cohort_disturbance d SEMI JOIN {TABLE} c
     ON c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot AND c.subp=d.subp
-   AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc
+   AND c.species_symbol=d.species_symbol AND c.invyr=d.invyr AND c.age_calc=d.age_calc
     WHERE d.full_removal""").fetchone()[0]
 if n_full_row:
     raise SystemExit(f"[D42] {n_full_row} full-removal rows have a Sim B row at their key (must be 0)")
@@ -65,15 +66,15 @@ if n_full_row:
 # (cohort = subplot x species x birth_sim_year, birth_sim_year = sim_year - age_calc)
 con.execute(f"""
     CREATE OR REPLACE TEMP TABLE _first_rows AS
-    SELECT statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc FROM (
-      SELECT *, min(measdate) OVER (PARTITION BY statecd,unitcd,countycd,plot,subp,species_symbol,
-                                                 sim_year - age_calc) AS md0 FROM {TABLE})
-    WHERE measdate = md0""")
+    SELECT statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc FROM (
+      SELECT *, min(invyr) OVER (PARTITION BY statecd,unitcd,countycd,plot,subp,species_symbol,
+                                              sim_year - age_calc) AS y0 FROM {TABLE})
+    WHERE invyr = y0""")
 n_first = con.execute("""SELECT count(*) FROM cohort_disturbance
-    SEMI JOIN _first_rows USING (statecd,unitcd,countycd,plot,subp,species_symbol,measdate,age_calc)""").fetchone()[0]
+    SEMI JOIN _first_rows USING (statecd,unitcd,countycd,plot,subp,species_symbol,invyr,age_calc)""").fetchone()[0]
 con.execute("""DELETE FROM cohort_disturbance d USING _first_rows f
     WHERE d.statecd=f.statecd AND d.unitcd=f.unitcd AND d.countycd=f.countycd AND d.plot=f.plot AND d.subp=f.subp
-      AND d.species_symbol=f.species_symbol AND d.measdate=f.measdate AND d.age_calc=f.age_calc""")
+      AND d.species_symbol=f.species_symbol AND d.invyr=f.invyr AND d.age_calc=f.age_calc""")
 print(f"[I-1] {n_first:,} drops on a cohort's first Sim B row removed")
 # r6 R6: Pan's consumer (landis_region4 src/data/utils.jl _weighted_cohort_drop) reconstructs the
 # pre-drop biomass of a row as would_be = agb / (1 - drop), i.e. it reads drop as
@@ -88,7 +89,7 @@ con.execute(f"""
     SET disturbance_drop_pct = round((d.dropped / {ACRE_M2}) / (c.agb + d.dropped / {ACRE_M2}), 9)
     FROM {TABLE} c
     WHERE NOT d.full_removal AND c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
-      AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc""")
+      AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.invyr=d.invyr AND c.age_calc=d.age_calc""")
 
 _meta = ["n_trees_natural_treeage_scale", "share_natural_treeage_scale", "age_source_major",
         "n_trees_known_bias", "share_known_bias"]
@@ -102,14 +103,16 @@ con.execute(f"""
     FROM {TABLE} c
     LEFT JOIN cohort_disturbance d
       ON c.statecd=d.statecd AND c.unitcd=d.unitcd AND c.countycd=d.countycd AND c.plot=d.plot
-      AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.measdate=d.measdate AND c.age_calc=d.age_calc
+      AND c.subp=d.subp AND c.species_symbol=d.species_symbol AND c.invyr=d.invyr AND c.age_calc=d.age_calc
       AND NOT d.full_removal
-    ORDER BY c.statecd, c.unitcd, c.countycd, c.plot, c.subp, c.species_symbol, c.measdate, c.age_calc
+    ORDER BY c.statecd, c.unitcd, c.countycd, c.plot, c.subp, c.species_symbol, c.invyr, c.age_calc
 """)
 # curation-fix (audit I4) + r7 D39: the visit metadata (procedural_break, all_live_withdrawn_rc7),
 # appended after the age metadata
 from cohorts_landis import add_visit_flags
 add_visit_flags(con, TABLE)
+# D69: invyr stays the last column, so the old schema remains an exact prefix
+con.execute(f"CREATE OR REPLACE TABLE {TABLE} AS SELECT * EXCLUDE (invyr), invyr FROM {TABLE}")
 con.commit()
 tot = con.execute(f"SELECT COUNT(*) FROM {TABLE}").fetchone()[0]
 nz = con.execute(f"SELECT COUNT(*) FROM {TABLE} WHERE disturbance_drop_pct>0").fetchone()[0]

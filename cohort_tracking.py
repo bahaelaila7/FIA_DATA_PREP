@@ -388,7 +388,8 @@ def build_cohorts(df: pl.DataFrame) -> pl.DataFrame:
         "n_disturbance_dead",
         "ever_harvested",
         "ever_disturbed_dead",
-    ]).sort(["cohort_id", "MEASDATE"])
+        "INVYR",                 # D69: the visit's natural id, appended
+    ]).sort(["cohort_id", "INVYR"])
 
     # Diagnostics
     n_rows     = cohorts.height

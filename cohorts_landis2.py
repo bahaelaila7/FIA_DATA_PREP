@@ -639,7 +639,7 @@ def attach_land_use_and_cycle(con) -> None:
     """Rebuild curated_cohorts_landis with (SQL join, no polars rebuild needed):
       - `land_use` (r7 D44 / C F10): the 2-way STDORGCD label, the same rule as _stdorg / Sim B /
         tree_trajectories (cohorts_landis.plot_land_use_sql; r6 carried the 4-way label here);
-      - `cycle`: the FIA inventory cycle, per (plot, measdate) from base_subplot_cond;
+      - `cycle`: the FIA inventory cycle, per (plot, invyr) from base_subplot_cond;
       - `land_use_4way` (r7): the DERIVED management land use (reserved / plantation / managed /
         natural; build_tree_trajectories.derive_land_use, per subplot there), as the per-PLOT
         dominant (most frequent over trajectory rows, ties -> alphabetical) value, so it is a
@@ -670,9 +670,9 @@ def attach_land_use_and_cycle(con) -> None:
     ),
     plot_cycle AS (
         SELECT STATECD AS statecd, UNITCD AS unitcd, COUNTYCD AS countycd, PLOT AS plot,
-               MEASDATE AS measdate, MAX(CYCLE) AS cycle
+               INVYR AS invyr, MAX(CYCLE) AS cycle
         FROM base_subplot_cond
-        GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE
+        GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, INVYR
     )
     SELECT {base},
            lu.land_use, cy.cycle,
@@ -688,9 +688,11 @@ def attach_land_use_and_cycle(con) -> None:
         ON c.statecd=lu4.statecd AND c.unitcd=lu4.unitcd AND c.countycd=lu4.countycd AND c.plot=lu4.plot
     LEFT JOIN plot_cycle cy
         ON c.statecd=cy.statecd AND c.unitcd=cy.unitcd AND c.countycd=cy.countycd
-        AND c.plot=cy.plot AND c.measdate=cy.measdate
+        AND c.plot=cy.plot AND c.invyr=cy.invyr
     """)
     add_visit_flags(con, "curated_cohorts_landis")   # fills the two visit-flag columns in place
+    # D69: invyr stays the last column, so the old schema remains an exact prefix
+    con.execute("CREATE OR REPLACE TABLE curated_cohorts_landis AS SELECT * EXCLUDE (invyr), invyr FROM curated_cohorts_landis")
     con.commit()
     tot, n_lu, n_lu4, n_cy = con.execute(
         "SELECT COUNT(*), COUNT(land_use), COUNT(land_use_4way), COUNT(cycle) FROM curated_cohorts_landis").fetchone()
