@@ -1641,6 +1641,16 @@ for flag_, (rule_, scopes_) in _kb_rules.items():
     check(f"(l) known-bias flag {flag_} set exactly on its rule", r[0] == 0 and r[1] == 0,
           f"(missing {r[0]:,}, extra {r[1]:,}; live flagged {r[2]:,})")
 
+# ---- (l2) the fate labels reach every product (a prefix test on "harvest" lost silvicultural_death, D60) ---------
+r = con.execute(f"""SELECT count(*) FILTER (WHERE terminal_fate IN ('silvicultural_death', 'harvest_inferred') AND death_cause IS NULL),
+                           count(*) FILTER (WHERE terminal_fate = 'silvicultural_death')
+                    FROM new.tree_trajectories WHERE {scope('', 'statecd', 'countycd')}""").fetchone()
+check("(l2) every harvest fate carries its death_cause in the trajectories", r[0] == 0, f"({r[1]:,} silvicultural rows; missing {r[0]:,})")
+r = con.execute(f"""WITH f AS (SELECT count(*) n FROM new.curated_trees WHERE {scope()} AND STATUSCD IN (2, 3) AND NOT COALESCE(rerecord_dead, FALSE)
+                               AND tree_fate IN ('silvicultural_death', 'harvest_inferred'))
+                    SELECT (SELECT n FROM f), (SELECT sum(n_harvested) FROM new.curated_snapshots WHERE {scope()})""").fetchone()
+check("(l2) curated_snapshots.n_harvested counts every first harvest record", r[0] > 0 and r[0] == r[1], f"(records {r[0]:,}, snapshots {r[1]:,})")
+
 # ---- (l) M1 / M2 / M3 / I4 --------------------------------------------------------------------------
 if a.simb_db:
     # an unmatched drop is MISALIGNED only if its cohort has a real live >= 5 in member at that

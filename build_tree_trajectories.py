@@ -525,7 +525,7 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
             .then(pl.lit("disturbance"))
         .when(pl.col("terminal_fate") == "dead_natural")
             .then(pl.lit("natural"))
-        .when(pl.col("terminal_fate").str.starts_with("harvest"))
+        .when(pl.col("terminal_fate").is_in(["silvicultural_death", "harvest_inferred"]))
             .then(pl.col("terminal_fate"))
         .when(pl.col("terminal_fate") == "disappeared_inferred_removal")
             .then(pl.lit("harvest_inferred"))

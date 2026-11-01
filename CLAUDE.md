@@ -9,6 +9,15 @@ FIADB is `../FIASQLITE2PGSQL/FIADB.duckdb`, opened READ_ONLY.
 
 ---
 
+## FIA Truth (D59): start here
+
+The curation now runs as ONE pipeline into ONE DB per region: `python -I fia_truth.py --config config/fia_truth_r4.yml`
+(see `docs/FIA_TRUTH.md`). Natural ids are the identity; CNs are never join keys and `fia_truth_lint.py` enforces it.
+CONDID is scoped to a visit: link conditions across visits with `cond_link`. Consumers read the truth DB, never FIADB.
+Text below on per-state DBs, slim builds and CN-based splits (PREV_TRE_CN, PREV_PLT_CN) is history.
+
+---
+
 ## Pipeline sequence
 
 ```

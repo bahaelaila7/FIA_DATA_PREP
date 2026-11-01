@@ -2194,7 +2194,7 @@ def build_snapshots(df: pl.DataFrame, scaffold: pl.DataFrame) -> pl.DataFrame:
         .group_by(SUBPLOT_INVYR)
         .agg([
             pl.len().alias("n_dead_or_removed"),
-            (pl.col("tree_fate").str.starts_with("harvest")).sum()
+            (pl.col("tree_fate").is_in(["silvicultural_death", "harvest_inferred"])).sum()
                 .alias("n_harvested"),
             (pl.col("tree_fate") == "dead").sum().alias("n_natural_dead"),
         ])

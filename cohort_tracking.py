@@ -204,7 +204,7 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
     disturbed_cond = disturbance_death_expr()
 
     harvest_agg = (
-        dead.filter(pl.col("tree_fate").str.starts_with("harvest"))
+        dead.filter(pl.col("tree_fate").is_in(["silvicultural_death", "harvest_inferred"]))
         .group_by(["cohort_id", "MEASDATE"])
         .agg(pl.len().alias("n_harvested"))
     )

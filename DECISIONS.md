@@ -1486,3 +1486,24 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - Tree across visits: (plot, SUBP, TREE) under an unchanged DESIGNCD (guide §3.1.10), split where a number is reused after an end.
   - Conditions across visits: SUBP_COND_CHNG_MTRX, resolved to natural keys on both ends (its PREV_PLT_CN is validated against the plot's natural predecessor), or subplot-level evidence.
   - Plot key changes: explicit `plot_renumber` table, evidence-checked. 34 annual links here.
+- **Deviations from the approved plan:**
+  - Flat DB with the curation's table names, not a new `core` schema. With natural ids primary the existing composite keys are the ids, so a new key layer would add nothing and Pan's loaders would churn. Consumers change their path and CN joins only.
+  - Schema `raw` added: genveg needs periodic and nonsampled visits, which the annual copies exclude. Its CN columns hold the natural visit id, so existing joins stay natural by construction; FIA's values are FIA_CN / FIA_PLT_CN.
+  - No per-module product tables; consumers read the shared tables.
+  - `curated_trees_fvs` is not built: only `tools/legacy` reads it.
+  - NIMIWAE's legacy D53 `load` and the `--frame` / `--fiadb` options are removed.
+
+## D60 — R4 regional fit: tree-number closure and the re-measured age cells (2026-11-01)
+- **Closed tree numbers (verifier n19).** One AL plot (1/2/25/105) was closed STATUSCD 0 RC9 in 2001 and re-tallied in 2007 as RC3 on the same numbers with different species and sizes. FIA's PREV_STATUS_CD is 0 there, so "PREV_STATUS_CD non-null = link" merged 5 pairs of different trees.
+  - **Fix:** PREV_STATUS_CD = 0 starts a new tree. Those are the only 5 such records in R4; D59's equivalence on 2.76 M successors stands, because those links point at the dropped STATUSCD 0 record.
+- **Age cells.** One DB per region gives one age fit over 8 states, a scope that had never been measured. Bars are unchanged; the 4 cells that fail them are recorded as KNOWN with the drift guard, per D14 / D24:
+  - (j) FL planted 10–15 in −3.6 yr and 15+ in −4.9 yr, flag `known_bias_fl_planted_model_10plus`;
+  - (j) KY planted 5–10 in −4.4 yr, flag `known_bias_ky_planted_model_5to10`;
+  - (h) KY planted step 5.6 vs limit 4.4 yr, 31 condition-visits, below the reliability floor.
+  - **Exposure:** only trees without a TreeAge record take the model age: 86 FL and 123 KY live records.
+  - **Option rejected:** fitting per state inside the regional DB. It would keep the single-state cells, but it changes the agreed one-fit-per-region design and gives up pooled support where single-state planted data are thin (KY 31 condition-visits).
+
+## D61 — Forest Explorer's FVS engine stays on FIA's FVS tables (2026-11-01)
+- **Situation:** the FVS engine starts from `FVS_STANDINIT_PLOT` / `FVS_TREEINIT_PLOT` in `SQLite_FIADB_ENTIRE.db`, picked by TreeMap's CN, and FVS's DBS reads SQLite. These are FIA's own FVS-ready tables, not curated records.
+- **Options:** (a) keep them as a documented exception; (b) copy them into the truth DB, which moves the same uncurated rows and adds a DuckDB-to-SQLite step; (c) derive FVS inputs from curated trees, a new model input needing its own validation and FVS re-baselining. **Chosen (a)**; (c) is open if FVS should start from curated trees.
+- **Audit:** R4 has 358,303 stands. 358,254 STAND_CNs resolve to a PLOT; all 358,254 agree on plot number, and state, county and INVYR agree wherever the stand records an inventory year. The 49 others are in the SQLite but not in FIADB.duckdb, so they are not in the truth DB.
