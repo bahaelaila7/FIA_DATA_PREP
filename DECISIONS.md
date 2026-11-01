@@ -1682,3 +1682,5 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 | Not graduated, link probability | 61.2 | 62.0 | 60.9 |
 
 By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 20.0 / 47.8; after move 1.7 / 6.0 / 19.7 / 47.7; moved 1.5 / 5.2 / 16.5 / 43.9.
+
+**D65 amendment 9 (2026-11-01; user: include silent re-tally in the table).** Silent moves with a 10–15 yr horizon: 906 saplings on 177 plots (883 KY, 15 GA, 8 TN), 9.4 yr to the next visit against 5.8 in normal plots. None keeps its number even at ≥ 5 in, and 899 have no record at all, so death, cut and survival at the next visit are unknown. The closure-based model does not fit: its first pass gave 1.7, because it had learned that first-interval debuts are never graduates. Refit with all numbers hidden from the start, no visit-gap features, on normal plots out of fold (calibration 0.03 / 0.03, 0.15 / 0.15, 0.35 / 0.35, 0.61 / 0.63, 0.83 / 0.90). Standardised to the silent mix by wood × size, graduated: normal KY + TN true 7.8, relinked 20.2, link probability 6.3; silent relinked 24.8, link probability 6.7.
