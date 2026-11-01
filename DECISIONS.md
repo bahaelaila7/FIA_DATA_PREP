@@ -1667,3 +1667,18 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - Hard links: p ≥ 0.5 precision 0.75–0.77, recall 0.26–0.30; p ≥ 0.7 precision 0.87, recall 0.18.
   - Moved plots: soft graduated 8.2, against the 9 implied in am. 6.
 - **Assumption:** training plots have every live graduate re-tallied. Moved plots may not, and cannot be checked there.
+
+**D65 amendment 8 (2026-11-01): the am. 6 table with the closure fix and link probabilities.** Normal plots are now scored out of fold on all plots, replacing the 12.2 vs 13.3 of am. 7, which covered half of them with a different mix. % of saplings at A, standardised to the moved plots.
+
+| Outcome | Normal | After move | Moved |
+|---|---|---|---|
+| Dead or cut by next visit, curation today | 29.0 | 28.0 | 0.1 |
+| Dead or cut by next visit, closure fix | 29.0 | 28.0 | 27.4 |
+| Lost track | 0.8 | 0.8 | 3.4 |
+| Graduated, true | 9.9 | 10.3 | unknown |
+| Graduated, relinked | 17.1 | 17.5 | 15.6 |
+| Graduated, link probability | 9.0 | 9.2 | 8.3 |
+| Not graduated, true | 60.3 | 60.9 | unknown |
+| Not graduated, link probability | 61.2 | 62.0 | 60.9 |
+
+By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 20.0 / 47.8; after move 1.7 / 6.0 / 19.7 / 47.7; moved 1.5 / 5.2 / 16.5 / 43.9.
