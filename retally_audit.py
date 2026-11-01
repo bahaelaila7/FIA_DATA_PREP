@@ -148,7 +148,7 @@ def pairs(hid, pool):
     x["yrs"] = (pd.to_datetime(x.mdD) - pd.to_datetime(x.t0)).dt.days / 365.25
     x = x[x.yrs > 0].copy()
     x["r"] = (x.dn - x.d0) / x.yrs; x["rh"] = (x.hn - x.h0) / x.yrs; x["live"] = (x.dst == 1).astype(int); x["true"] = x.t1 == -x.TREE
-    return x[(x.r >= 0) & (x.r <= 1.0)].reset_index(drop=True)
+    return x[(x.r >= 0) & (x.r <= 1.0)].sort_values(K + ["SUBP", "TREE", "t1", "vD"]).reset_index(drop=True)   # SQL row order varies between runs
 
 
 def rule_links(x):
@@ -180,16 +180,70 @@ def fold(df, n=5):
     return df[K].astype(str).agg("|".join, axis=1).map(lambda s: zlib.crc32(s.encode()) % n)
 
 
-def fit_scores(train_sets, score_sets, n=5):
+def fit_scores(train_sets, score_sets, n=5, feat=FEAT, col="p"):
     from sklearn.ensemble import HistGradientBoostingClassifier as HGB
     tr = pd.concat(train_sets, ignore_index=True); tr["f"] = fold(tr, n)
-    ms = [HGB(max_iter=200, max_depth=4, learning_rate=.05, min_samples_leaf=40, random_state=0).fit(tr.loc[tr.f != i, FEAT], tr.loc[tr.f != i, "true"]) for i in range(n)]
+    ms = [HGB(max_iter=200, max_depth=4, learning_rate=.05, min_samples_leaf=40, random_state=0).fit(tr.loc[tr.f != i, feat], tr.loc[tr.f != i, "true"]) for i in range(n)]
     for s in train_sets:
-        f = fold(s, n); s["p"] = 0.0
+        f = fold(s, n); s[col] = 0.0
         for i in range(n):
-            s.loc[f == i, "p"] = ms[i].predict_proba(s.loc[f == i, FEAT])[:, 1]
+            s.loc[f == i, col] = ms[i].predict_proba(s.loc[f == i, feat])[:, 1]
     for s in score_sets:
-        s["p"] = np.mean([m.predict_proba(s[FEAT])[:, 1] for m in ms], axis=0)
+        s[col] = np.mean([m.predict_proba(s[feat])[:, 1] for m in ms], axis=0)
+    return ms
+
+
+RICH = ["a_cc", "a_cr", "d_cc", "d_cr", "d_dmg", "spcd", "ba0", "ba1", "tpa1", "nb_inc", "a_org", "a_site", "d_org", "d_site", "d_fty", "d_age", "d_balive", "d_slope", "d_dst", "d_trt", "l3"]
+
+
+def enrich(c, x):
+    """the tree and context inputs NIMIWAE conditions on, as far as they exist at A (sapling) and at the debut visit. Hidden trees add nothing after A."""
+    rec = c.execute(f"""SELECT r.STATECD, r.UNITCD, r.COUNTYCD, r.PLOT, r.SUBP, r.TREE, v.vn, r.CCLCD cc, r.CR cr, r.CONDID, r.INVYR,
+        CASE WHEN r.DAMAGE_AGENT_CD1 > 0 THEN 1 WHEN r.DAMAGE_AGENT_CD1 = 0 THEN 0 END dmg FROM TREE r JOIN vv v USING ({PK}, INVYR) WHERE r.SUBP <= 4""").df()
+    cd = c.execute(f"SELECT {PK}, INVYR, CONDID, STDORGCD org, SITECLCD site, FORTYPCD fty, STDAGE age, BALIVE balive, SLOPE slope, COALESCE(DSTRBCD1, 0) dst, COALESCE(TRTCD1, 0) trt FROM COND").df()
+    rec = rec.merge(cd, on=K + ["INVYR", "CONDID"], how="left")
+    y = x.merge(rec[K + ["SUBP", "TREE", "vn", "cc", "cr", "org", "site"]].rename(columns={"vn": "va", "cc": "a_cc", "cr": "a_cr", "org": "a_org", "site": "a_site"}), on=K + ["SUBP", "TREE", "va"], how="left")
+    y["_t"] = y.t1.abs()
+    y = y.merge(rec[K + ["SUBP", "TREE", "vn", "cc", "cr", "dmg", "org", "site", "fty", "age", "balive", "slope", "dst", "trt"]].rename(columns={"TREE": "_t", "vn": "vD", "cc": "d_cc", "cr": "d_cr", "dmg": "d_dmg", "org": "d_org", "site": "d_site", "fty": "d_fty", "age": "d_age", "balive": "d_balive", "slope": "d_slope", "dst": "d_dst", "trt": "d_trt"}), on=K + ["SUBP", "_t", "vD"], how="left")
+    big = c.execute(f"SELECT {PK}, SUBP, TREE, chn, vn, DIA, md, tpa FROM tc WHERE st = 1 AND DIA >= 5").df()
+    ba = big.assign(b=0.005454 * big.DIA ** 2 * big.tpa.fillna(0)).groupby(K + ["SUBP", "vn"]).agg(ba=("b", "sum"), tpa=("tpa", "sum")).reset_index()
+    y = y.merge(ba.rename(columns={"vn": "va", "ba": "ba0"})[K + ["SUBP", "va", "ba0"]], on=K + ["SUBP", "va"], how="left")
+    y = y.merge(ba.rename(columns={"vn": "vD", "ba": "ba1", "tpa": "tpa1"}), on=K + ["SUBP", "vD"], how="left")
+    tri = y[K + ["SUBP", "va", "vD"]].drop_duplicates()
+    m = tri.merge(big.rename(columns={"vn": "va", "DIA": "d_a", "md": "m_a"})[K + ["SUBP", "TREE", "chn", "va", "d_a", "m_a"]], on=K + ["SUBP", "va"]).merge(
+        big.rename(columns={"vn": "vD", "DIA": "d_b", "md": "m_b"})[K + ["SUBP", "TREE", "chn", "vD", "d_b", "m_b"]], on=K + ["SUBP", "TREE", "chn", "vD"])
+    m["inc"] = (m.d_b - m.d_a) / ((pd.to_datetime(m.m_b) - pd.to_datetime(m.m_a)).dt.days / 365.25).clip(lower=.5)
+    y = y.merge(m.groupby(K + ["SUBP", "va", "vD"]).inc.mean().rename("nb_inc").reset_index(), on=K + ["SUBP", "va", "vD"], how="left")
+    eco = c.execute("SELECT statecd STATECD, unitcd UNITCD, countycd COUNTYCD, plot PLOT, any_value(epa_l3) l3 FROM data_plot_eco GROUP BY ALL").df()
+    y = y.merge(eco, on=K, how="left"); y["l3"] = pd.factorize(y.l3)[0].astype(float); y["spcd"] = y.SPCD.astype(float)
+    return y.drop(columns="_t").reset_index(drop=True)
+
+
+def rich_report(c, T, G, X, wt, keys):
+    from sklearn.metrics import average_precision_score as ap, log_loss
+    R = {g: enrich(c, T[g]) for g in T}
+    fit_scores([R["normal"], R["after"]], [R["moved"]], feat=FEAT + RICH, col="p2")
+    # context only, no tree-specific inputs (sizes stay): how much is the tree record vs the place
+    C_ = [f for f in RICH if f not in ("a_cc", "a_cr", "d_cc", "d_cr", "d_dmg")]
+    fit_scores([R["normal"], R["after"]], [R["moved"]], feat=FEAT + C_, col="p3")
+    fit_scores([R["normal"], R["after"]], [R["moved"]], feat=FEAT + ["a_cc", "a_cr", "d_cc", "d_cr", "d_dmg"], col="p4")
+    o = {}
+    for g in ("normal", "after"):
+        r = R[g]; o[g] = {}
+        for nm, col in (("base inputs", "p"), ("+ NIMIWAE tree and context", "p2"), ("+ context only", "p3"), ("+ tree only", "p4")):
+            e = {"avg_precision": round(ap(r.true, r[col]), 4), "log_loss": round(log_loss(r.true, r[col].clip(1e-6, 1 - 1e-6)), 4)}
+            for tau in (.5, .7):
+                q = r[r[col] >= tau]; L = []
+                for key, q_ in q.groupby(K + ["SUBP"], sort=False):
+                    L += [(*key, a_, b_) for a_, b_ in one_to_one([(int(i), int(j), -float(p_)) for i, j, p_ in zip(q_.TREE, q_.t1, q_[col])])]
+                A = accuracy(pd.DataFrame(L, columns=K + ["SUBP", "TREE", "t1"]), X[g]["n_live"]); e[f"p>={tau}"] = (A["links"], round(A["precision"], 3), round(A["recall"], 3))
+            z = G[g].merge(soft_weights(r.assign(p=r[col])), on=K + ["SUBP", "TREE"], how="left").fillna({"psoft": 0})
+            z["G_p"] = (z.cls == 'ge5').astype(float) + z.psoft.clip(upper=1); e["graduated"] = round(standard(z, "G_p", wt, keys), 1); o[g][nm] = e
+    print(json.dumps(o, indent=0))
+    z = G["moved"].merge(soft_weights(R["moved"].assign(p=R["moved"].p2)), on=K + ["SUBP", "TREE"], how="left").fillna({"psoft": 0}); z["G_p"] = (z.cls == 'ge5').astype(float) + z.psoft.clip(upper=1)
+    print("moved graduated, rich model", round(standard(z, "G_p", wt, keys), 1), "null shares", {f: round(R["moved"][f].isna().mean(), 2) for f in RICH})
+    print("calibration rich, after", R["after"].assign(b=pd.cut(R["after"].p2, [0, .1, .25, .5, .75, 1])).groupby("b", observed=True).agg(p=("p2", "mean"), t=("true", "mean"), n=("p2", "size")).round(3).values.tolist())
+    return o
 
 
 def soft_weights(x):
@@ -351,6 +405,7 @@ def run(db, out):
     T = {g: tight(v["x"], Q) for g, v in X.items()}
     fit_scores([T["normal"], T["after"]], [T["moved"]])
     keys = ["STATECD", "wood", "bin"]; wt = G["moved"].groupby(keys, observed=True).size().rename("wt").reset_index()
+    RR = rich_report(c, T, G, X, wt, keys)
     rows, acc = {}, {}
     for g, a in G.items():
         lk = rule_links(X[g]["x"]).assign(lk=1); s = soft_weights(T[g])
@@ -395,7 +450,7 @@ def run(db, out):
         sr[g] = dict(n=len(a), G_true=round(standard(q, "G_true", ws, wk), 1), G_rel=round(standard(q, "G_rel", ws, wk), 1), G_p=round(standard(q, "G_p", ws, wk), 1))
     print(json.dumps(sr, indent=0), {"silent_no_record": int(S["silent"].bst.isna().sum()), "states": S["silent"].STATECD.value_counts().to_dict(), "A_to_B": round(float(((pd.to_datetime(S["silent"].mdb) - pd.to_datetime(S["silent"].mda)).dt.days / 365.25).mean()), 1)})
     if out:
-        json.dump(dict(facts=F, table=rows, accuracy=acc, silent=sr, one_interval=OI.to_dict('records'), no_candidate=NC.to_dict('records')), open(out, "w"), indent=1, default=float)
+        json.dump(dict(facts=F, table=rows, accuracy=acc, silent=sr, rich=RR, one_interval=OI.to_dict('records'), no_candidate=NC.to_dict('records')), open(out, "w"), indent=1, default=float)
 
 
 if __name__ == "__main__":
