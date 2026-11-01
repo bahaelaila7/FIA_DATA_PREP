@@ -1448,12 +1448,19 @@ def assign_stdage(df: pl.DataFrame,
         (pl.col("cond_fldszcd") == 1) |
         (pl.col("DIA") >= 5.0)
     )
-    # r3 I2(b): pre-reset trees NEVER inherit STDAGE — whether they survived the reset or
-    # not (the old `pre_reset & ~survived_reset` branch broadcast a stand age onto them)
-    base_eligible = (
-        (pl.col("cond_stdorgcd") == 1) |
-        post_reset_debut
+    # STDORGSP match flag (for planted stands). D59 / audit A1: spcd_resolved, not the per-visit SPCD
+    df = df.with_columns(
+        ((pl.col("cond_stdorgcd") == 1) & (pl.col("spcd_resolved") == pl.col("cond_stdorgsp")))
+        .fill_null(False).alias("matches_stdorgsp")
     )
+    # r3 I2(b): pre-reset trees NEVER inherit STDAGE — whether they survived the reset or
+    # not (the old `pre_reset & ~survived_reset` branch broadcast a stand age onto them).
+    # D59 / audit A1 (user): STDAGE is the AVERAGE age of the stand-size class (guide §2.5.18) and
+    # STDORGSP the planted species (§2.5.26), so in a planted condition only the planted species
+    # inherits it; other species take TreeAge / model ages. A blank STDORGSP is no evidence: kept.
+    planted = (pl.col("cond_stdorgcd") == 1).fill_null(False)
+    planted_ok = planted & (pl.col("matches_stdorgsp") | pl.col("cond_stdorgsp").is_null())
+    base_eligible = planted_ok | (post_reset_debut & ~planted)
     # Qualify/anchor on LIVE measurements only: STDAGE is the mean age of the
     # *live* trees in the size class, and a tree must not qualify (or be anchored)
     # via a dead record — e.g. a sub-5" sapling whose death record happens to read
@@ -1483,16 +1490,7 @@ def assign_stdage(df: pl.DataFrame,
         .select(TREE_ID).unique().height
     )
 
-    # STDORGSP match flag (for planted stands)
-    df = df.with_columns(
-        pl.when(
-            (pl.col("cond_stdorgcd") == 1) &
-            (pl.col("SPCD") == pl.col("cond_stdorgsp"))
-        )
-        .then(pl.lit(True))
-        .otherwise(pl.lit(False))
-        .alias("matches_stdorgsp")
-    )
+
 
     # --- STDAGE anchor selection ---
     # Candidates: eligible measurements with a valid, positive cond_stdage.
