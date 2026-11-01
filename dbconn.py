@@ -92,7 +92,7 @@ def check_args(a, curated: bool = False, scope_check: bool = True):
 
 PLOT_NK = ("STATECD", "UNITCD", "COUNTYCD", "PLOT", "INVYR")     # a plot visit's natural id (guide §2.4.7)
 QUARANTINED = ("SUBPLOT", "COND", "SUBP_COND", "TREE", "SITETREE", "SEEDLING")   # tables joined by the stages
-RENUM_MIN_PAIRS, RENUM_MIN_SHARE = 3, 0.9     # plot_renumber: trees that must agree across a changed plot key
+RENUM_MIN_PAIRS, RENUM_MIN_SHARE = 2, 0.9     # plot_renumber: trees that must agree across a changed plot key
 
 
 def nk(a: str, b: str, *extra: str) -> str:

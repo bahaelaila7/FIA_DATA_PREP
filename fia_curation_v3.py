@@ -478,6 +478,31 @@ def sql_rc7_withdrawn_visits(con, scope: str = ""):
     print(f"[step3c] visits whose live trees were ALL withdrawn by RC7: {n[0]:,} ({n[1]:,} live records)")
 
 
+def sql_cond_link(con, scope: str = ""):
+    """D59 / audit F1: conditions across visits. CONDID is per visit ("can change at remeasurement",
+    guide §2.5.8), so the only cross-visit link is FIA's SUBP_COND_CHNG_MTRX (§2.9; SUBPTYP = 1, the
+    subplot). That table has no natural key columns: each row is resolved to natural ids at both ends
+    and kept only if both are product visits of the SAME canonical plot and both conditions exist.
+    cond_link: (plot key, CONDID, MEASDATE) <- (PREV_CONDID, PREV_MEASDATE), prop = subplot proportions."""
+    con.execute(f"""
+    DROP TABLE IF EXISTS cond_link;
+    CREATE TABLE cond_link AS
+    SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, CAST(M.CONDID AS BIGINT) AS CONDID, V.MEASDATE,
+           CAST(M.PREVCOND AS BIGINT) AS PREV_CONDID, V0.MEASDATE AS PREV_MEASDATE, sum(M.SUBPTYP_PROP_CHNG) AS prop
+    FROM SUBP_COND_CHNG_MTRX M
+    JOIN PLOT P ON P.CN = M.PLT_CN
+    JOIN PLOT O ON O.CN = M.PREV_PLT_CN
+    JOIN product_visits V ON {dbconn.nk('V', 'P')}
+    JOIN product_visits V0 ON {dbconn.nk('V0', 'O')}
+    JOIN COND C ON {dbconn.nk('C', 'P')} AND C.CONDID = M.CONDID
+    JOIN COND C0 ON {dbconn.nk('C0', 'O')} AND C0.CONDID = M.PREVCOND
+    WHERE M.SUBPTYP = 1 AND M.SUBPTYP_PROP_CHNG > 0 AND V0.MEASDATE < V.MEASDATE
+      AND P.UNITCD = O.UNITCD AND P.COUNTYCD = O.COUNTYCD AND P.PLOT = O.PLOT {scope}
+    GROUP BY ALL ORDER BY ALL
+    """)
+    print(f"[step2c] cond_link: {con.execute('SELECT count(*) FROM cond_link').fetchone()[0]:,} condition links")
+
+
 def sql_product_visits(con):
     """r7 D43: the annual plot visits (PLT_CN, canonical key, INVYR, MEASDATE) of the curated
     scaffold. export_reference_tables copies only PLOT / COND rows of these visits (plus the
@@ -1237,23 +1262,25 @@ def propagate_totage(df: pl.DataFrame,
 RESET_LOSS_FRAC = 0.5   # stand-replacing: >= 50 % of live trees or live BA lost since the previous visit
 
 
-def detect_condition_resets(df: pl.DataFrame) -> pl.DataFrame:
+def detect_condition_resets(df: pl.DataFrame, link: pl.DataFrame):
     """
     r3 I2 — STAND-REPLACING resets only. A condition-visit is a reset when
-      1. STDAGE dropped since the condition's previous visit AND >= RESET_LOSS_FRAC of its live
-         trees (count) or live basal area was lost since then        -> 'stdage_drop_with_loss'
+      1. STDAGE dropped from its predecessor AND >= RESET_LOSS_FRAC of its predecessor's live trees
+         (count) or live basal area was lost                         -> 'stdage_drop_with_loss'
       2. TRTCD 10 (cutting) together with TRTCD 30/40 (artificial / natural regeneration)
                                                                       -> 'cut_with_regen'
       3. TRTCD 10 together with that >= RESET_LOSS_FRAC loss          -> 'cut_with_loss'
     TRTCD 10 alone (a partial cut), including at a condition's first visit, is NOT a reset, and
     neither is an STDAGE drop without the loss (STDAGE re-estimation).
 
-    D40 (audit r7 M-10): the loss is measured across the subplot's CONDIDs. A tree that was
-    live in the condition at its previous visit and is live at this visit in ANOTHER CONDID of
-    its subplot (condition re-delineation) is not lost: it counts towards this visit's live
-    count / live BA (its BA at this visit).
+    D59 / audit F1 (replaces D40): the predecessor comes from cond_link (FIA's change matrix), never
+    from CONDID equality. A previous condition's trees are shared among its successors by area
+    (prop), so re-delineation, splits and merges need no special case. The STDAGE of the predecessor
+    is that of the largest link.
 
-    Returns (reset_flag, reset_reasons) keyed by COND_ID + MEASDATE.
+    Returns (reset_flag, reset_reasons, first_reset): the first two keyed by COND_ID + MEASDATE;
+    first_reset gives each condition-visit the earliest reset along its largest links (a condition
+    that split off an untouched part does not inherit the reset of the other part).
     """
     COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
     live = pl.col("STATUSCD") == 1
@@ -1269,38 +1296,23 @@ def detect_condition_resets(df: pl.DataFrame) -> pl.DataFrame:
         ])
         .sort(COND_ID + ["MEASDATE"])
     )
-    # trees live in the condition at its previous visit and live in another CONDID at this visit
-    live_rec = dfb.filter(live).select(TREE_ID + ["CONDID", "MEASDATE", "_ba"])
-    nxt = cv.select(COND_ID + ["MEASDATE"]).with_columns(
-        pl.col("MEASDATE").shift(-1).over(COND_ID).alias("_next_md")).filter(pl.col("_next_md").is_not_null())
-    moved = (live_rec.select(TREE_ID + ["CONDID", "MEASDATE"])
-             .join(nxt, on=COND_ID + ["MEASDATE"], how="inner")
-             .join(live_rec.rename({"CONDID": "_condid_next", "MEASDATE": "_next_md", "_ba": "_ba_next"}),
-                   on=TREE_ID + ["_next_md"], how="inner")
-             .filter(pl.col("_condid_next") != pl.col("CONDID"))
-             .group_by(COND_ID + ["_next_md"])
-             .agg(pl.len().alias("_n_moved"), pl.col("_ba_next").sum().alias("_ba_moved"))
-             .rename({"_next_md": "MEASDATE"}))
-    cv = (
-        cv.join(moved, on=COND_ID + ["MEASDATE"], how="left")
-        .with_columns(pl.col("_n_moved").fill_null(0), pl.col("_ba_moved").fill_null(0.0))
-        .sort(COND_ID + ["MEASDATE"])
-        .with_columns([
-            pl.col("cond_stdage").shift(1).over(COND_ID).alias("_prev_stdage"),
-            pl.col("n_live").shift(1).over(COND_ID).alias("_prev_n"),
-            pl.col("ba_live").shift(1).over(COND_ID).alias("_prev_ba"),
-        ])
-        .with_columns([
-            (((pl.col("_prev_n") > 0) & ((pl.col("n_live") + pl.col("_n_moved"))
-                                         <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
-             ((pl.col("_prev_ba") > 0) & ((pl.col("ba_live") + pl.col("_ba_moved"))
-                                          <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
-            .fill_null(False).alias("_loss"),
-            (((pl.col("_prev_n") > 0) & (pl.col("n_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
-             ((pl.col("_prev_ba") > 0) & (pl.col("ba_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
-            .fill_null(False).alias("_loss_within_condid"),
-        ])
-    )
+    PLOT_KEY = ["STATECD", "UNITCD", "COUNTYCD", "PLOT"]
+    link = link.with_columns([pl.col(c).cast(cv.schema[c]) for c in COND_ID]).with_columns(
+        pl.col("PREV_CONDID").cast(cv.schema["CONDID"]))
+    prev_keys = PLOT_KEY + ["PREV_CONDID", "PREV_MEASDATE"]
+    lk = (link.with_columns((pl.col("prop") / pl.col("prop").sum().over(prev_keys)).alias("_share"))
+          .join(cv.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("MEASDATE").alias("PREV_MEASDATE"),
+                                      pl.col("cond_stdage").alias("_pstd"), pl.col("n_live").alias("_pn"), pl.col("ba_live").alias("_pba")]),
+                on=prev_keys, how="inner")
+          .sort(COND_ID + ["MEASDATE", "prop", "PREV_CONDID"], descending=[False] * 6 + [True, False]))
+    prev = lk.group_by(COND_ID + ["MEASDATE"], maintain_order=True).agg(
+        (pl.col("_share") * pl.col("_pn")).sum().alias("_prev_n"),
+        (pl.col("_share") * pl.col("_pba")).sum().alias("_prev_ba"),
+        pl.col("_pstd").first().alias("_prev_stdage"))
+    cv = cv.join(prev, on=COND_ID + ["MEASDATE"], how="left").with_columns(
+        (((pl.col("_prev_n") > 0) & (pl.col("n_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
+         ((pl.col("_prev_ba") > 0) & (pl.col("ba_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
+        .fill_null(False).alias("_loss"))
     drop = (pl.col("_prev_stdage").is_not_null() & pl.col("cond_stdage").is_not_null()
             & (pl.col("cond_stdage") < pl.col("_prev_stdage")))
     parts = [
@@ -1312,18 +1324,29 @@ def detect_condition_resets(df: pl.DataFrame) -> pl.DataFrame:
     reset_reasons = (all_resets.group_by(COND_ID + ["MEASDATE"])
                      .agg(pl.col("reset_reason").unique().sort().alias("reset_reasons")))
     reset_flag = reset_reasons.select(COND_ID + ["MEASDATE"]).unique().with_columns(pl.lit(True).alias("is_reset"))
+    # forward along each condition-visit's largest link
+    dom = (link.sort(COND_ID + ["MEASDATE", "prop", "PREV_CONDID"], descending=[False] * 6 + [True, False])
+           .unique(subset=COND_ID + ["MEASDATE"], keep="first", maintain_order=True))
+    fr = reset_flag.select(COND_ID + ["MEASDATE", pl.col("MEASDATE").alias("first_reset")])
+    for _ in range(32):
+        nxt = (dom.join(fr.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("MEASDATE").alias("PREV_MEASDATE"), "first_reset"]),
+                        on=prev_keys, how="inner").select(COND_ID + ["MEASDATE", "first_reset"]))
+        new = (pl.concat([fr, nxt]).group_by(COND_ID + ["MEASDATE"]).agg(pl.col("first_reset").min()))
+        if new.height == fr.height and new["first_reset"].cast(pl.Int64).sum() == fr["first_reset"].cast(pl.Int64).sum():
+            break
+        fr = new
     n_drop_only = cv.filter(drop & ~pl.col("_loss")).height
     n_cut_only = cv.filter(pl.col("cut") & ~pl.col("regen") & ~pl.col("_loss")).height
-    n_moved_only = cv.filter(pl.col("_loss_within_condid") & ~pl.col("_loss") & (drop | pl.col("cut"))).height
+    n_nolink = cv.filter(pl.col("_prev_n").is_null()).height
     print(f"[step6b-reset] {reset_flag.height:,} stand-replacing condition-visit resets: "
           + ", ".join(f"{p.get_column('reset_reason')[0] if p.height else '?'} {p.height:,}" for p in parts)
           + f" | NOT resets: STDAGE drop without loss {n_drop_only:,}, TRTCD 10 alone {n_cut_only:,}"
-          + f" | D40: {n_moved_only:,} drop/cut visits whose within-CONDID loss is trees now live in another CONDID")
-    return reset_flag, reset_reasons
+          + f" | condition-visits without a linked predecessor {n_nolink:,} of {cv.height:,}")
+    return reset_flag, reset_reasons, fr
 
 
 def assign_stdage(df: pl.DataFrame,
-                  tree_bounds: pl.DataFrame) -> pl.DataFrame:
+                  tree_bounds: pl.DataFrame, cond_link: pl.DataFrame) -> pl.DataFrame:
     """
     Assign STDAGE using first-measurement anchoring:
     For each tree, use the STDAGE from its first eligible measurement,
@@ -1345,7 +1368,7 @@ def assign_stdage(df: pl.DataFrame,
     COND_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
 
     # Detect resets
-    reset_flag, reset_reasons = detect_condition_resets(df)
+    reset_flag, reset_reasons, first_reset = detect_condition_resets(df, cond_link)
 
     # Attach per-measurement-date reset flag
     df = df.join(
@@ -1355,21 +1378,16 @@ def assign_stdage(df: pl.DataFrame,
         how="left",
     ).with_columns(pl.col("is_reset").fill_null(False))
 
-    # cond_ever_reset: condition had at least one reset at any date
-    ever_reset_conds = (
-        reset_flag.select(COND_ID).unique()
-        .with_columns(pl.lit(True).alias("cond_ever_reset"))
+    # D59 / audit F1: a reset belongs to the ground a tree stands on, and no condition id persists,
+    # so the date is read per TREE: the earliest reset over its own condition-visits (each carrying
+    # first_reset along its links). cond_ever_reset = such a date exists.
+    tree_first_reset = (
+        df.select(TREE_ID + COND_ID[-1:] + ["MEASDATE"]).join(
+            first_reset, on=COND_ID + ["MEASDATE"], how="inner")
+        .group_by(TREE_ID).agg(pl.col("first_reset").min().alias("stdage_cond_first_reset_measdate"))
     )
-    df = df.join(ever_reset_conds, on=COND_ID, how="left").with_columns(
-        pl.col("cond_ever_reset").fill_null(False)
-    )
-
-    # First reset date per condition (earliest MEASDATE a reset was detected).
-    first_reset_per_cond = (
-        reset_flag.group_by(COND_ID)
-        .agg(pl.col("MEASDATE").min().alias("stdage_cond_first_reset_measdate"))
-    )
-    df = df.join(first_reset_per_cond, on=COND_ID, how="left")
+    df = df.join(tree_first_reset, on=TREE_ID, how="left").with_columns(
+        pl.col("stdage_cond_first_reset_measdate").is_not_null().alias("cond_ever_reset"))
 
     # Tree's first measurement date across all conditions.
     tree_first_meas = (
@@ -2553,7 +2571,8 @@ def _polars_steps(con, df: pl.DataFrame, estage_raw, all_subplot_years,
 
     tree_bounds = _compute_tree_bounds(df, all_subplot_years)
     df = propagate_totage(df, tree_bounds)
-    df = assign_stdage(df, tree_bounds)
+    st = int(df["STATECD"][0])
+    df = assign_stdage(df, tree_bounds, con.execute(f"SELECT * FROM cond_link WHERE STATECD = {st}").pl())
     df = merge_age_estimates(df)
 
     if estage_raw is not None:
@@ -2659,6 +2678,7 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
     sql_base_measurements(con, scope)
     sql_clean_subplot_years(con)
     sql_product_visits(con)
+    sql_cond_link(con, scope)
     sql_longitudinal_subplots(con)
     sql_excluded_trees(con, scope)
     sql_rc7_withdrawn_visits(con, scope)
