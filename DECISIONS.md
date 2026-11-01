@@ -1551,3 +1551,12 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   3. Stand and cohort tables of completed data use one list per visit: the list on the microplot sampled at that visit.
   4. Consider the 60,585 closure measurements as real last sizes; curation drops them.
 - **Supersedes** the cut-lineages proposal: lineages stay; only the stand-table membership changes.
+- **Closure records split by size (same day).** At moves 60,585 RC8 closures carry a size and 28,674 do not. Recorded deaths are only 116, against about 30 % of saplings per normal interval.
+  - **With size:** alive. Growth matches ordinary remeasurement (median 0.049 vs 0.050 in/yr). DIA, HT and TPA only; no CR, crown class or agent. None reach 5 in, because those trees stay on the subplot.
+  - **Without size:** behaves like death or cut. Size-less share by the plot's timber-cut share at the visit, vs the sapling dead share at normal visits in the same bin: 0 %: 0.191 / 0.210; up to 25 %: 0.333 / 0.351; 25–50 %: 0.482 / 0.503; 50–75 %: 0.634 / 0.667; over 75 %: 0.645 / 0.884. Indirect evidence; the guide does not define it.
+  - 1,895 plots (9,222 trees, including GA MANUAL 1.0 → 4.0) have no sized closure at all, so size-less is uninformative there.
+- **Proposed placement (not applied):** the move visit is a seam: the old list's last visit and the new list's first.
+  - Sized closure: a real last record at the move, then censored. Not a live row in Sim A or Sim B.
+  - Size-less closure on a plot with sized closures: a soft "gone" signal with label noise. Never hard.
+  - Both together: adding only the sized ones would select survivors and bias mortality low over that interval.
+  - Stand tables at the seam use one list, never the sum.
