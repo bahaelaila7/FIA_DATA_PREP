@@ -60,9 +60,11 @@ def load54(db: str) -> pl.DataFrame:
     dr AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.invyr) dead_invyr, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
            FROM ct JOIN tr USING ({K}) WHERE ct.statuscd = 2 AND ct.measdate > tr.d1 GROUP BY ALL),
     s0 AS (SELECT e.STATECD statecd, e.UNITCD unitcd, e.COUNTYCD countycd, e.PLOT plot, e.SUBP subp, e.TREE tree,
-                  min(e.MEASDATE) s0_md, arg_min(e.RC, e.MEASDATE) s0_rc
+                  min(e.MEASDATE) s0_md, arg_min(e.RC, e.MEASDATE) s0_rc, arg_min(e.DIA, e.MEASDATE) s0_dia, arg_min(e.HT, e.MEASDATE) s0_ht,
+                  arg_min(e.closure_kind, e.MEASDATE) s0_kind
            FROM tree_status0_events e JOIN tr ON tr.statecd = e.STATECD AND tr.unitcd = e.UNITCD AND tr.countycd = e.COUNTYCD
-                AND tr.plot = e.PLOT AND tr.subp = e.SUBP AND tr.tree = e.TREE AND e.MEASDATE > tr.d1 GROUP BY ALL),
+                AND tr.plot = e.PLOT AND tr.subp = e.SUBP AND tr.tree = e.TREE AND e.MEASDATE > tr.d1
+                AND e.closure_kind IS DISTINCT FROM 'dead_cut' GROUP BY ALL),
     fr AS (SELECT tr.*, sv.invyr, sv.measdate, sv.fsp, sv.fmp FROM tr JOIN sv USING (statecd, unitcd, countycd, plot, subp)
            UNION ALL
            SELECT tr.*, r.invyr, r.measdate, NULL, NULL FROM tr JOIN real r USING ({K})
@@ -96,7 +98,7 @@ def load54(db: str) -> pl.DataFrame:
            f.species_symbol, f.spcd, f.sp_revised, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use,
            CASE WHEN t.tree IS NOT NULL THEN ct.treeclcd END treeclcd, CASE WHEN t.tree IS NOT NULL THEN ct.actualht END actualht,
            dm.dmg1, dm.dmg2, dm.dmg3,
-           rc.rcd0, f.terminal_fate, dr.dead_invyr, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc,
+           rc.rcd0, f.terminal_fate, dr.dead_invyr, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc, s0.s0_dia, s0.s0_ht, s0.s0_kind,
            f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, NULL::INT cond_status,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
            sa.sicond, sa.siteclcd, sa.physclcd, sa.slope, sa.aspect, sa.fortypcd, sa.canopy_pct, sa.stdorgcd,

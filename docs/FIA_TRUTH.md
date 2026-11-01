@@ -31,6 +31,8 @@ Records are identified by their natural keys in the FIADB User Guide v9.4. CNs a
 
 - **Tree-number reuse:** a record starts a new tree when it has no PREV_STATUS_CD after a dead or cut record, when it has none and a new-tree RECONCILECD, when its PREV_STATUS_CD is 0 (the number was closed), or at a lineage-break visit. Later segments are `TREE + 100000 k`, and `tree % 100000` is FIA's number.
 - **Plot renumbering (D67):** found from tree records, with no CN. A visit whose trees do not match its own key's previous visit is an orphan. It links to an earlier visit of another key when at least 2 trees, and at least 90 % of the orphan's trees, have the same SUBP and TREE there and PREVDIA within 0.05 in of that DIA. The two keys must not be visited side by side, and the link must be one-to-one. FIA's PREV_PLT_CN chain is the verifier's independent check.
+- **RC8 closures (D65):** of a tree alive at the previous visit. With AGENTCD it is a dead or cut record (`closure_dead`, no size). With a size the tree is censored and the size stays in `tree_status0_events` (`closure_kind` = `sized`). With neither it is censored.
+- **Microplot moves (D65):** `procedural_breaks.is_microplot_move`, from MICROPLOT_LOC CENTER then OFFSET. A move means a different set of microplot trees; never relink across it.
 - **Quarantine:** a row whose natural key names no parent, or whose CN disagrees with its natural key, goes to `id_quarantine` and is excluded. R4 has none. Nationally the disagreements are OK and AR periodic plots plus one MO and one OR plot.
 - **Verifier:** it keeps FIA's CN links on purpose, as an independent cross-check of the natural-key rules. It is the only code allowed to.
 

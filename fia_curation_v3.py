@@ -208,21 +208,34 @@ RETALLY_MIN_N       = 3
 RETALLY_TRANS_MIN_N = 20
 
 
+# D65 am. 2: an RC8 closure of a tree alive at the previous visit is one of three things. With AGENTCD the crew
+# recorded it dead or cut (a dead / cut record, AGENTCD 80 -> removed); with a size it was alive and measured
+# (its size is kept in tree_status0_events, the tree is censored); with neither it is unknown (censored).
+CLOSURE_DEAD = "(T.STATUSCD = 0 AND T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 AND COALESCE(T.AGENTCD, 0) > 0)"
+
+
 def _sql_procedural_breaks(con, scope: str = ""):
-    """procedural_breaks = per (plot, MEASDATE) re-tally visits, break_kind 'rc8' (STATUSCD=0
-    + RECONCILECD=8 closures) or 'unrecorded' (silent re-tally, detector above). Also leaves
+    """procedural_breaks = per plot visit re-tally visits, break_kind 'rc8' (STATUSCD=0
+    + RECONCILECD=8 closures), 'unrecorded' (silent re-tally, detector above) or 'move' (a microplot
+    move with neither). D65: a move is read from MICROPLOT_LOC, CENTER at the plot's previous annual
+    visit and OFFSET at this one (is_microplot_move), whatever the closures say. Also leaves
     _retally_saplings (every previous-visit live sapling with its next-visit status)."""
     con.execute(f"""
     CREATE OR REPLACE TEMP TABLE _pv AS
     SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.MANUAL,
-           P.PLOT_STATUS_CD,
+           P.PLOT_STATUS_CD, P.MICROPLOT_LOC,
            MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS MEASDATE
     FROM PLOT P JOIN ANNUAL_INV SRV ON SRV.STATECD = P.STATECD AND SRV.INVYR = P.INVYR
     WHERE P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope};
     CREATE OR REPLACE TEMP TABLE _pv2 AS
     SELECT *, LEAD(INVYR) OVER w AS next_invyr, LEAD(MEASDATE) OVER w AS next_md,
               LEAD(MANUAL) OVER w AS next_manual, LEAD(PLOT_STATUS_CD) OVER w AS next_ps
-    FROM _pv WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY MEASDATE);
+    FROM _pv WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY INVYR);
+    CREATE OR REPLACE TEMP TABLE _moves AS
+    SELECT * FROM (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, MEASDATE, MICROPLOT_LOC AS loc,
+                          LAG(MICROPLOT_LOC) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY INVYR) AS prev_loc
+                   FROM _pv)
+    WHERE prev_loc = 'CENTER' AND loc = 'OFFSET';
     CREATE OR REPLACE TEMP TABLE _retally_saplings AS
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, v.MEASDATE, v.next_md, v.next_invyr,
            v.MANUAL AS prev_manual, v.next_manual, (T2.TREE IS NULL) AS unrecorded,
@@ -283,13 +296,23 @@ def _sql_procedural_breaks(con, scope: str = ""):
       ON u.STATECD=r.STATECD AND u.UNITCD=r.UNITCD AND u.COUNTYCD=r.COUNTYCD
      AND u.PLOT=r.PLOT AND u.INVYR=r.INVYR
     """)
-    # an rc8 break plot-visit also needs its unrecorded-sapling count (they are censored too)
+    con.execute("""
+    ALTER TABLE procedural_breaks ADD COLUMN is_microplot_move BOOLEAN DEFAULT FALSE;
+    UPDATE procedural_breaks b SET is_microplot_move = TRUE FROM _moves m
+    WHERE m.STATECD = b.STATECD AND m.UNITCD = b.UNITCD AND m.COUNTYCD = b.COUNTYCD AND m.PLOT = b.PLOT AND m.INVYR = b.INVYR;
+    INSERT INTO procedural_breaks (STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE, n_closed_rc8, n_closed_rc8_prev_sapling,
+                                   n_prev_saplings, n_unrecorded_saplings, detect_tier, break_kind, INVYR, is_microplot_move)
+    SELECT m.STATECD, m.UNITCD, m.COUNTYCD, m.PLOT, m.MEASDATE, 0, 0, 0, 0, NULL, 'move', m.INVYR, TRUE
+    FROM _moves m ANTI JOIN procedural_breaks b
+      ON m.STATECD = b.STATECD AND m.UNITCD = b.UNITCD AND m.COUNTYCD = b.COUNTYCD AND m.PLOT = b.PLOT AND m.INVYR = b.INVYR;
+    """)
+    # an rc8 or move plot-visit also needs its unrecorded-sapling count (they are censored too)
     con.execute("""
     UPDATE procedural_breaks b SET n_prev_saplings = pv.n, n_unrecorded_saplings = pv.u
     FROM (SELECT STATECD, UNITCD, COUNTYCD, PLOT, next_invyr, COUNT(*) n,
                  COUNT(*) FILTER (WHERE unrecorded) u
           FROM _retally_saplings GROUP BY ALL) pv
-    WHERE b.break_kind = 'rc8' AND pv.STATECD=b.STATECD AND pv.UNITCD=b.UNITCD
+    WHERE b.break_kind IN ('rc8', 'move') AND pv.STATECD=b.STATECD AND pv.UNITCD=b.UNITCD
       AND pv.COUNTYCD=b.COUNTYCD AND pv.PLOT=b.PLOT AND pv.next_invyr=b.INVYR
     """)
 
@@ -341,7 +364,8 @@ def sql_excluded_trees(con, scope: str = ""):
 
     Tables:
       tree_status0_events    one row per STATUSCD=0 record (tree, MEASDATE, RC) — ALL of them,
-                             so a censor -> live -> censor history is not collapsed (audit M8)
+                             so a censor -> live -> censor history is not collapsed (audit M8);
+                             closure_kind (D65 am. 2) and the closure's measurements
       tree_reconcile_events  per tree: rc7_erroneous_measdate, FIRST and LAST censoring
       procedural_breaks      per (plot, MEASDATE) re-tally visit; break_kind 'rc8'
                              (STATUSCD=0 + RECONCILECD=8 closures; keyed per PLOT because the
@@ -367,7 +391,11 @@ def sql_excluded_trees(con, scope: str = ""):
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, T.INVYR,
            MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS MEASDATE,
            CAST(T.RECONCILECD AS INTEGER) AS RC, T.PREVDIA,
-           T.TREE AS TREE_RAW, CAST(T.CN AS VARCHAR) AS CN, T.SPCD
+           T.TREE AS TREE_RAW, CAST(T.CN AS VARCHAR) AS CN, T.SPCD,
+           T.DIA, T.HT, T.ACTUALHT, T.TPA_UNADJ, T.TREECLCD, T.AGENTCD,
+           CASE WHEN T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 THEN
+                CASE WHEN COALESCE(T.AGENTCD, 0) > 0 THEN 'dead_cut' WHEN T.DIA IS NOT NULL THEN 'sized' ELSE 'unknown' END
+           END AS closure_kind
     FROM TREE T
     JOIN PLOT P ON P.STATECD = T.STATECD AND P.UNITCD = T.UNITCD AND P.COUNTYCD = T.COUNTYCD AND P.PLOT = T.PLOT AND P.INVYR = T.INVYR
     JOIN ANNUAL_INV SRV ON SRV.STATECD = P.STATECD AND SRV.INVYR = P.INVYR
@@ -384,7 +412,7 @@ def sql_excluded_trees(con, scope: str = ""):
            CASE RC WHEN 5 THEN 'shrank' WHEN 6 THEN 'moved' WHEN 8 THEN 'procedural'
                    WHEN 9 THEN 'nonsampled' ELSE 'not_in_sample' END AS reason,
            TREE AS TREE_RAW, INVYR
-    FROM tree_status0_events WHERE RC IS DISTINCT FROM 7
+    FROM tree_status0_events WHERE RC IS DISTINCT FROM 7 AND closure_kind IS DISTINCT FROM 'dead_cut'   -- D65 am. 2: a dead / cut record
     UNION ALL
     SELECT s.STATECD, s.UNITCD, s.COUNTYCD, s.PLOT, s.SUBP, s.TREE, s.next_md, NULL,
            'procedural_unrecorded', s.TREE, s.next_invyr
@@ -547,7 +575,9 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
         condition, and dropping that record would mislabel the removal as an unexplained
         disappearance (it becomes 'diverted_landuse', r3 M6);
       * the STATUSCD=0 record itself is dropped (its information is carried as censoring /
-        RC7 columns: censor_* via attach_censor_columns after the split, r7 D36);
+        RC7 columns: censor_* via attach_censor_columns after the split, r7 D36), except an RC8
+        closure with AGENTCD: the crew recorded the tree dead or cut, so it is a dead / cut record
+        (AGENTCD 80 -> STATUSCD 3, else 2; closure_dead, D65 am. 2). It has no size;
       * records BEFORE a STATUSCD=0 + RECONCILECD=7 event are dropped (erroneous tally);
       * explicit exclusion of P2A (periodic-to-annual GRM-only, P2A_GRM_FLG='Y') records;
         live records need TPA_UNADJ > 0 (sample trees). Dead/cut records are kept even with
@@ -563,7 +593,9 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
         T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, T.INVYR,
         T.CN,
         CSY.MEASDATE, CSY.CYCLE,
-        T.CONDID, T.STATUSCD, T.RECONCILECD, T.AGENTCD,
+        T.CONDID, CASE WHEN {CLOSURE_DEAD} THEN (CASE WHEN T.AGENTCD = 80 THEN 3 ELSE 2 END) ELSE T.STATUSCD END AS STATUSCD,
+        {CLOSURE_DEAD} AS closure_dead,
+        T.RECONCILECD, T.AGENTCD,
         T.PREV_STATUS_CD AS prev_status_cd,
         T.SPCD, T.SPGRPCD, SP.STOCKING_SPGRPCD, SP.JENKINS_SPGRPCD,
         T.DIA, T.HT, T.ACTUALHT, T.CR, T.CCLCD,
@@ -640,10 +672,10 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
         AND E.COUNTYCD = T.COUNTYCD AND E.PLOT = T.PLOT
         AND E.SUBP = T.SUBP AND E.TREE = T.TREE
     WHERE COALESCE(T.P2A_GRM_FLG, '') <> 'Y'                -- explicit: P2A GRM-only records out
-      AND T.STATUSCD IN (1, 2, 3)                           -- drop the STATUSCD=0 record itself
+      AND (T.STATUSCD IN (1, 2, 3) OR {CLOSURE_DEAD})       -- drop the STATUSCD=0 record itself, unless a recorded death (D65)
       AND (   (T.STATUSCD = 1 AND T.TPA_UNADJ > 0           -- live: a sample tree (TPA > 0) ...
                AND C.COND_STATUS_CD = 1)                    -- ... on its own forest condition
-           OR (T.STATUSCD IN (2, 3)                         -- dead / cut: kept for FATE even with
+           OR ((T.STATUSCD IN (2, 3) OR {CLOSURE_DEAD})     -- dead / cut: kept for FATE even with
                AND C.COND_STATUS_CD IN (1, 2, 3, 4)))       -- a null TPA (audit I1); also on
                                                             -- nonforest/water (r2 M5)
       AND NOT (E.rc7_erroneous_measdate IS NOT NULL         -- erroneously tallied previously
@@ -2559,6 +2591,7 @@ FIX_COLUMNS = [
     "age_stratum", "unitcd_raw", "countycd_raw", "plot_raw",          # r5 M-5 / M-2
     "misrecorded_death",                                               # r6 R4
     "first_record_dead", "all_live_withdrawn_rc7",                     # r7 D38 / D39
+    "closure_dead",                                                    # D65 am. 2
 ]
 
 

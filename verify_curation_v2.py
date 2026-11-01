@@ -416,6 +416,15 @@ SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR ry,
        bool_or(T.PREVDIA < 5) AS sap_closed
 FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY S ON S.CN=P.SRV_CN AND S.ANN_INVENTORY='Y'
 WHERE T.STATUSCD=0 AND T.RECONCILECD=8 AND T.SUBP<=4 AND {scope('T')} GROUP BY ALL""")
+# D65: raw microplot moves: MICROPLOT_LOC CENTER at the plot's previous annual visit, OFFSET at this one
+con.execute(f"""
+CREATE TEMP TABLE rm AS
+SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR ry, bd FROM (
+  SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.MICROPLOT_LOC loc,
+         MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS bd,
+         lag(P.MICROPLOT_LOC) OVER (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY P.INVYR) ploc
+  FROM f.PLOT P JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y' WHERE {scope('P')})
+WHERE ploc = 'CENTER' AND loc = 'OFFSET'""")
 # raw RC7/RC8 closures (for the RC3 >= 5 in re-tally pairing of rule a)
 con.execute(f"""
 CREATE TEMP TABLE rclo AS
@@ -501,7 +510,9 @@ def block_reasons(src_sql, rule_c=True):
       (j.ddia < 5 AND (EXISTS (SELECT 1 FROM rb WHERE rb.STATECD=j.STATECD AND rb.UNITCD=j.UNITCD AND rb.COUNTYCD=j.COUNTYCD
                              AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D AND rb.sap_closed)
                     OR EXISTS (SELECT 1 FROM ub WHERE ub.STATECD=j.STATECD AND ub.UNITCD=j.UNITCD AND ub.COUNTYCD=j.COUNTYCD
-                             AND ub.PLOT=j.PLOT AND ub.bd > j.p AND ub.bd <= j.D)))
+                             AND ub.PLOT=j.PLOT AND ub.bd > j.p AND ub.bd <= j.D)
+                    OR EXISTS (SELECT 1 FROM rm WHERE rm.STATECD=j.STATECD AND rm.UNITCD=j.UNITCD AND rm.COUNTYCD=j.COUNTYCD
+                             AND rm.PLOT=j.PLOT AND rm.bd > j.p AND rm.bd <= j.D)))
       OR (COALESCE(j.drn = 8, FALSE) AND EXISTS (SELECT 1 FROM rb WHERE rb.STATECD=j.STATECD AND rb.UNITCD=j.UNITCD
                              AND rb.COUNTYCD=j.COUNTYCD AND rb.PLOT=j.PLOT AND rb.bd > j.p AND rb.bd <= j.D)) AS r_b,
       {"(j.ddia >= 5 AND COALESCE(j.drc NOT IN (2,3,7,8), TRUE) AND EXISTS (SELECT 1 FROM rv WHERE rv.STATECD=j.STATECD AND rv.UNITCD=j.UNITCD AND rv.COUNTYCD=j.COUNTYCD AND rv.PLOT=j.PLOT AND rv.SUBP=j.SUBP AND rv.md >= j.p AND rv.md < j.D AND rv.fmic > 0))" if rule_c else "FALSE"} AS r_c
@@ -621,7 +632,11 @@ check_n("(n16) E7: tree_trajectories: one birth year per tree and debut age_calc
 
 # ---- r7 E9: record values and units re-derived from RAW TREE (by CN) ---------------------------
 LB_G, M2_AC = 453.592, 4046.86   # lbs -> g; m2 per acre (the products' documented constants)
-con.execute(f"""CREATE TEMP TABLE rt AS SELECT CAST(T.CN AS VARCHAR) cn, T.STATUSCD, T.SPCD, T.DIA, T.TPA_UNADJ, T.DRYBIO_AG
+# D65 am. 2: an RC8 closure with AGENTCD, of a tree alive at the previous visit, is a dead (80: cut) record
+CLOSURE_RAW = "(T.STATUSCD = 0 AND T.RECONCILECD = 8 AND T.PREV_STATUS_CD = 1 AND COALESCE(T.AGENTCD, 0) > 0)"
+con.execute(f"""CREATE TEMP TABLE rt AS SELECT CAST(T.CN AS VARCHAR) cn,
+                       CASE WHEN {CLOSURE_RAW} THEN (CASE WHEN T.AGENTCD = 80 THEN 3 ELSE 2 END) ELSE T.STATUSCD END STATUSCD,
+                       T.SPCD, T.DIA, T.TPA_UNADJ, T.DRYBIO_AG
                 FROM f.TREE T WHERE {scope('T')}""")
 r = con.execute(f"""SELECT count(*),
        count(*) FILTER (WHERE r.cn IS NULL),
@@ -763,7 +778,7 @@ con.execute(f"""CREATE TEMP TABLE rs0 AS {_rekey(f'''
            MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md
     FROM f.TREE T JOIN f.PLOT P ON P.CN = T.PLT_CN JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
     JOIN f.COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
-    WHERE T.STATUSCD = 0 AND T.SUBP <= 4 AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y' AND {scope('T')}''', 'md')}""")
+    WHERE T.STATUSCD = 0 AND NOT {CLOSURE_RAW} AND T.SUBP <= 4 AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y' AND {scope('T')}''', 'md')}""")
 r = con.execute(f"""
 WITH e AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, md MEASDATE,
                   CASE RC WHEN 5 THEN 'shrank' WHEN 6 THEN 'moved' WHEN 8 THEN 'procedural' WHEN 9 THEN 'nonsampled'
@@ -898,13 +913,14 @@ FROM t JOIN new.tree_trajectories tt ON tt.statecd=t.STATECD AND tt.unitcd=t.UNI
 # (replaces the circular GRM check: in these states CUT <=> AGENTCD 80)
 con.execute(f"""
 CREATE TEMP TABLE rawdead AS
-SELECT CAST(T.CN AS VARCHAR) cn, T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE, T.STATUSCD, T.AGENTCD,
+SELECT CAST(T.CN AS VARCHAR) cn, T.STATECD,T.UNITCD,T.COUNTYCD,T.PLOT,T.SUBP,T.TREE,
+       CASE WHEN {CLOSURE_RAW} THEN (CASE WHEN T.AGENTCD = 80 THEN 3 ELSE 2 END) ELSE T.STATUSCD END STATUSCD, T.AGENTCD,
        T.PREV_STATUS_CD ps, C.COND_STATUS_CD cs, T.INVYR, T.CONDID, C.TRTCD1, C.TRTCD2, C.TRTCD3,
        C.DSTRBCD1, C.DSTRBCD2, C.DSTRBCD3,
        MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md
 FROM f.TREE T JOIN f.PLOT P ON P.CN=T.PLT_CN JOIN f.SURVEY SV ON SV.CN = P.SRV_CN AND SV.ANN_INVENTORY = 'Y'
 JOIN f.COND C ON C.PLT_CN=T.PLT_CN AND C.CONDID=T.CONDID
-WHERE T.STATUSCD IN (2,3) AND T.SUBP<=4 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y' AND C.COND_STATUS_CD IN (1,2,3,4)
+WHERE (T.STATUSCD IN (2,3) OR {CLOSURE_RAW}) AND T.SUBP<=4 AND COALESCE(T.P2A_GRM_FLG,'')<>'Y' AND C.COND_STATUS_CD IN (1,2,3,4)
   AND {scope('T')}""")
 # r7 (D36): the tree id of a raw record is the POST-split id of its curated record (raw number if absent)
 con.execute("""CREATE OR REPLACE TEMP TABLE rawdead AS SELECT d.*, COALESCE(c.TREE, d.TREE) ctree
@@ -1223,14 +1239,16 @@ _tc = {r[0] for r in con.execute("SELECT column_name FROM duckdb_columns() WHERE
 check("(n23) D44 C F10: tree_trajectories keeps the 4-way management class as land_use_4way", "land_use_4way" in _tc, "")
 # procedural_breaks re-derived: RC8 closure visits (rb), silent re-tallies (ub) (r8 D48: no coord_link breaks)
 r = con.execute(f"""
-WITH e AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM rb UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM ub),
+WITH e AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM rb UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM ub
+           UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, bd FROM rm),
 p AS (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE bd FROM new.procedural_breaks WHERE {scope()})
 SELECT (SELECT count(*) FROM e), (SELECT count(*) FROM (SELECT * FROM e EXCEPT SELECT * FROM p)),
        (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM e))""").fetchone()
-check_n("(n23) procedural_breaks = re-derived (RC8 closures, silent re-tallies; both directions)",
+check_n("(n23) procedural_breaks = re-derived (RC8 closures, silent re-tallies, microplot moves; both directions)",
         r[1] == 0 and r[2] == 0, r[0], f"({r[0]:,} re-derived plot-visits; missing {r[1]}, extra {r[2]})")
 con.execute(f"""CREATE TEMP TABLE pbx AS SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, ry invyr FROM rb
-                UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, ny FROM ub""")
+                UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, ny FROM ub
+                UNION SELECT STATECD, UNITCD, COUNTYCD, PLOT, ry FROM rm""")
 for _t, _db in _TABS:
     if _t == "tree_trajectories":
         continue

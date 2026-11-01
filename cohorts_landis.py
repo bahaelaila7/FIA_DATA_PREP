@@ -678,7 +678,7 @@ def load_backfill_context(con) -> dict:
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS break_date,
                bool_or(break_kind = 'rc8') AS _brk_rc8,
                bool_or(n_closed_rc8_prev_sapling > 0 OR break_kind = 'unrecorded'
-                       OR n_unrecorded_saplings > 0) AS _brk_sap
+                       OR n_unrecorded_saplings > 0 OR is_microplot_move) AS _brk_sap
         FROM procedural_breaks GROUP BY ALL
     """).pl()
     visit = con.execute("""
