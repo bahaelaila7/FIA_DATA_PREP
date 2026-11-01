@@ -1641,3 +1641,20 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Rule:** under 4 in passes at all three visits. 4–4.5 in passes through +2. 4.5+ in never passes. Keep 4 in as the single limit. Visit +4 is not tested.
 - **Caveat:** the pseudo-move assumes every live graduate is re-tallied, so these are lower bounds. The placebo estimates of am. 4 (24–30 % at 4.5+ in) are higher, but species clustering affects them. Real and pseudo candidate shares agree in pattern, real lower by about a quarter (4.5+ in 0.49 vs 0.57) at every size, including sizes with almost no graduates.
 - **Matching is worse than the placebo suggested:** matched pairs are right 13 % overall (35–41 % at 4.5+ in), and 31 % of live graduates get their true debut. This replaces the 45–48 % of am. 4. It confirms no renumbering on species, size and height. Any soft link weight must come from these rates.
+
+**D65 amendment 6 (2026-11-01; user: compare 10–15 yr outcomes of microplot saplings, normal plots vs moved plots including silent moves, to test the bias from relinking).** Saplings at the visit A before a move, followed about 12.4 yr. Comparators: never-CENTER plots (63,308 saplings) and the OFFSET list after the move in the same plots (81,070). Moved set 77,444. Percentages of saplings at A, standardised to the moved plots on state × wood × size. Relinked = hide numbers after the next visit and match one-to-one, as at a real move.
+
+| Outcome | Normal | OFFSET after move | Moved |
+|---|---|---|---|
+| Dead or cut by the next visit | 29.0 | 28.0 | 27.4 |
+| Lost track | 0.8 | 0.8 | 3.4 |
+| Graduated, true (by number) | 9.9 | 10.3 | not observable |
+| Graduated, relinked | 17.1 | 17.5 | 15.6 |
+| Not graduated, true | 60.3 | 60.9 | not observable |
+| Not graduated, relinked | 53.2 | 53.7 | 53.6 |
+
+- Of the true not-graduated: still a live sapling 37.9 / 37.5; died later 21.8 / 22.8. Moved plots cannot make that split.
+- **Graduated by size at A (< 2 / 2–3 / 3–4 / 4–5 in):** normal true 2.1 / 7.4 / 21.5 / 51.4; normal relinked 7.7 / 20.1 / 32.2 / 51.6; moved relinked 7.3 / 16.1 / 26.0 / 47.2.
+- **Finding:** relinking inflates graduation by about 7 points (17 vs 10, 3.7× under 2 in, 1.5× at 3–4 in), because false links outnumber misses. Early mortality matches. Moved plots run through the same relink come out 1.5–1.9 points below normal, so the relink bias looks the same in both and could be calibrated by size from normal plots. Moved vs normal is 4–6 points lower at 2–5 in, unexplained.
+- **Silent moves:** 566 KY saplings on 118 plots with a 10–15 yr horizon. Relinked from the previous visit 26.9 vs KY + TN normal plots relinked the same way 21.2, true 8.3. Too few to read, and the link spans an extra interval.
+- **AZIMUTH / DIST:** in neither FIADB.duckdb nor SQLite_FIADB_ENTIRE.db; FVS_TREEINIT DISTANCE is empty on 2,000,000 rows checked. Scrambling cannot be tested from local data. The guide's fuzzing and swapping covers plot LAT / LON only.
