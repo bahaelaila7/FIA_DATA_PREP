@@ -6,7 +6,11 @@ Independent of the session's scratch scripts: cohorts and outcomes are SQL over 
   python -I retally_audit.py --db FIA/truth/fia_truth_r4.duckdb [--out docs/RETALLY_AUDIT.json]
 
 A tree number is one tree only while its chain is unbroken: a record with no PREV_STATUS_CD after an earlier record of that number
-is a new tree, so a reused number ends the chn and that record counts as a debut."""
+is a new tree, so a reused number ends the chain and that record counts as a debut.
+
+Identity: a tree is (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, chain). Saplings and debuts carry that id on one footing, a pair is true when the two ids
+are equal, and nothing about the truth is encoded in an id or a row position. Ties are resolved from a hash of the pair's ids and folds from the plot's id, so
+results do not depend on row order: `--shuffle SEED` reorders the inputs and must reproduce the output byte for byte."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse, itertools, json, zlib
 import duckdb, numpy as np, pandas as pd
@@ -18,6 +22,16 @@ BINS, BLAB = [0, 2, 3, 4, 5.01], ["<2", "2-3", "3-4", "4-5"]
 PRIOR = {"<2": .01, "2-3": .03, "3-4": .1, "4-5": .45}
 FEAT = ["d0", "h0", "dn", "hn", "yrs", "r", "rh", "wood", "nd", "nt", "live"]
 TPA_MICRO = 50.0
+SHUFFLE = None
+
+
+def tree_id(tree, chn):
+    return tree.astype(int).astype(str) + "." + chn.astype(int).astype(str)
+
+
+def tie(*ids):
+    """a small cost offset fixed by the ids alone."""
+    return zlib.crc32("|".join(map(str, ids)).encode()) / 2 ** 32 * 1e-6
 
 
 def prepare(c):
@@ -92,7 +106,7 @@ def debuts(c, group_query):
     return c.execute(f"""
     WITH g AS ({group_query}),
     f AS (SELECT {PK}, SUBP, TREE, chn, min(vn) fv FROM tc GROUP BY ALL)
-    SELECT r.STATECD, r.UNITCD, r.COUNTYCD, r.PLOT, r.SUBP, r.TREE t1, r.SPCD sp1, r.DIA dn, r.HT hn, r.st dst, r.vn vD, r.md mdD, g.vn va, g.vh
+    SELECT r.STATECD, r.UNITCD, r.COUNTYCD, r.PLOT, r.SUBP, r.TREE dt, r.chn dc, r.SPCD sp1, r.DIA dn, r.HT hn, r.st dst, r.vn vD, r.md mdD, g.vn va, g.vh
     FROM tc r JOIN f USING ({PK}, SUBP, TREE, chn) JOIN g USING ({PK})
     WHERE r.vn = f.fv AND r.st IN (1, 2, 3) AND r.DIA >= 5 AND (r.tpa IS NULL OR r.tpa < {TPA_MICRO})
       AND NOT (r.st <> 1 AND r.rc IS NOT DISTINCT FROM 4) AND r.vn > g.vn AND r.vn <= g.vh""").df()
@@ -104,20 +118,20 @@ def tracked_debuts(c, a, after_visit_offset):
         return pd.DataFrame()
     c.register("_h", a[K + ["SUBP", "TREE", "chn", "va", "vh"]])
     d = c.execute(f"""SELECT * EXCLUDE (rn) FROM (
-        SELECT h.STATECD, h.UNITCD, h.COUNTYCD, h.PLOT, h.SUBP, h.TREE true_of, r.SPCD sp1, r.DIA dn, r.HT hn, 1 dst, r.vn vD, r.md mdD, h.va, h.vh,
+        SELECT h.STATECD, h.UNITCD, h.COUNTYCD, h.PLOT, h.SUBP, h.TREE dt, h.chn dc, r.SPCD sp1, r.DIA dn, r.HT hn, 1 dst, r.vn vD, r.md mdD, h.va, h.vh,
                row_number() OVER (PARTITION BY h.STATECD, h.UNITCD, h.COUNTYCD, h.PLOT, h.SUBP, h.TREE ORDER BY r.vn) rn
         FROM _h h JOIN tc r ON r.STATECD = h.STATECD AND r.UNITCD = h.UNITCD AND r.COUNTYCD = h.COUNTYCD AND r.PLOT = h.PLOT AND r.SUBP = h.SUBP
              AND r.TREE = h.TREE AND r.chn = h.chn
         WHERE r.st = 1 AND r.DIA >= 5 AND r.vn > h.va + {after_visit_offset} AND r.vn <= h.vh) WHERE rn = 1""").df()
     c.unregister("_h")
-    return d.assign(t1=lambda x: -x.true_of)
+    return d
 
 
 def one_to_one(edges):
     """edges: (i, j, cost). Maximum pairs first, then minimum cost. -> list of (i, j)."""
     if not edges:
         return []
-    I = sorted({e[0] for e in edges}); J = sorted({e[1] for e in edges}, key=lambda v: zlib.crc32(str(abs(v)).encode())); ii = {v: n for n, v in enumerate(I)}; jj = {v: n for n, v in enumerate(J)}
+    I = sorted({e[0] for e in edges}, key=str); J = sorted({e[1] for e in edges}, key=str); ii = {v: n for n, v in enumerate(I)}; jj = {v: n for n, v in enumerate(J)}
     big = 1 + sum(abs(e[2]) for e in edges) * 2
     C = np.full((len(I), len(J)), big * 10.0)
     for i, j, co in edges:
@@ -143,23 +157,35 @@ def brute(edges):
 def pairs(hid, pool):
     """same subplot + same species candidates in the debut window, from size d0, height h0 at date t0."""
     on = K + ["SUBP"]
-    x = hid[on + ["va", "vh", "TREE", "SPCD", "d0", "h0", "t0", "v0", "binB", "wood"]].merge(pool.drop(columns=["va", "vh"]), on=on)
+    if SHUFFLE is not None:
+        hid, pool = hid.sample(frac=1, random_state=SHUFFLE), pool.sample(frac=1, random_state=SHUFFLE + 1)
+    x = hid[on + ["va", "vh", "TREE", "chn", "SPCD", "d0", "h0", "t0", "v0", "binB", "wood"]].merge(pool.drop(columns=["va", "vh"]), on=on)
     x = x[(x.SPCD == x.sp1) & (x.vD > x.v0) & (x.vD <= x.vh)].copy()
     x["yrs"] = (pd.to_datetime(x.mdD) - pd.to_datetime(x.t0)).dt.days / 365.25
     x = x[x.yrs > 0].copy()
-    x["r"] = (x.dn - x.d0) / x.yrs; x["rh"] = (x.hn - x.h0) / x.yrs; x["live"] = (x.dst == 1).astype(int); x["true"] = x.t1 == -x.TREE
-    return x[(x.r >= 0) & (x.r <= 1.0)].sort_values(K + ["SUBP", "TREE", "t1", "vD"]).reset_index(drop=True)   # SQL row order varies between runs
+    x["r"] = (x.dn - x.d0) / x.yrs; x["rh"] = (x.hn - x.h0) / x.yrs; x["live"] = (x.dst == 1).astype(int)
+    x["sap"] = tree_id(x.TREE, x.chn); x["deb"] = tree_id(x.dt, x.dc); x["true"] = x.sap == x.deb
+    return x[(x.r >= 0) & (x.r <= 1.0)].reset_index(drop=True)
 
 
-def rule_links(x):
-    y = x[(x.r <= .6) & ((x.dst != 1) | (x.hn >= x.h0 - 5))]
+def links_from(x, cost):
+    """one-to-one links per subplot; x with sap, deb and a cost column name."""
     out = []
-    for key, e in y.groupby(K + ["SUBP"], sort=False):
-        # equal costs would be broken by column order, and hidden debuts carry negative ids: a seeded jitter keeps ties blind to the truth
-        rng = np.random.default_rng(zlib.crc32(str(key).encode()))
-        ed = [(int(a), int(b), -float(np.log(PRIOR[c_])) + float(u)) for a, b, c_, u in zip(e.TREE, e.t1, e.binB, rng.random(len(e)) * 1e-6)]
+    for key, e in x.groupby(K + ["SUBP"], sort=False):
+        ed = [(a, b, float(co) + tie(key, a, b)) for a, b, co in zip(e.sap, e.deb, e[cost])]
         out += [(*key, a, b) for a, b in one_to_one(ed)]
-    return pd.DataFrame(out, columns=K + ["SUBP", "TREE", "t1"])
+    L = pd.DataFrame(out, columns=K + ["SUBP", "sap", "deb"])
+    return L.assign(TREE=L.sap.str.split(".").str[0].astype(int)) if len(L) else L.assign(TREE=[])
+
+
+def rule_links(x, prior=PRIOR):
+    y = x[(x.r <= .6) & ((x.dst != 1) | (x.hn >= x.h0 - 5))]
+    return links_from(y.assign(cost=-np.log(y.binB.map(prior).astype(float))), "cost")
+
+
+def prob_links(x, col, tau):
+    y = x[x[col] >= tau]
+    return links_from(y.assign(cost=-y[col]), "cost")
 
 
 def limits(g):
@@ -171,8 +197,8 @@ def limits(g):
 def tight(x, Q):
     y = x.merge(Q, on=["wood", "binB"], how="left")
     y = y[(y.r <= y.r99) & ((y.dst != 1) | y.rh.between(y.h1, y.h99))].copy()
-    tk, dk = K + ["SUBP", "TREE"], K + ["SUBP", "t1"]
-    y["nd"] = y.groupby(tk).t1.transform("nunique"); y["nt"] = y.groupby(dk).TREE.transform("nunique")
+    tk, dk = K + ["SUBP", "sap"], K + ["SUBP", "deb"]
+    y["nd"] = y.groupby(tk).deb.transform("nunique"); y["nt"] = y.groupby(dk).sap.transform("nunique")
     return y
 
 
@@ -183,7 +209,7 @@ def fold(df, n=5):
 def fit_scores(train_sets, score_sets, n=5, feat=FEAT, col="p"):
     from sklearn.ensemble import HistGradientBoostingClassifier as HGB
     tr = pd.concat(train_sets, ignore_index=True); tr["f"] = fold(tr, n)
-    ms = [HGB(max_iter=200, max_depth=4, learning_rate=.05, min_samples_leaf=40, random_state=0).fit(tr.loc[tr.f != i, feat], tr.loc[tr.f != i, "true"]) for i in range(n)]
+    ms = [HGB(max_iter=200, max_depth=4, learning_rate=.05, min_samples_leaf=40, early_stopping=False, random_state=0).fit(tr.loc[tr.f != i, feat], tr.loc[tr.f != i, "true"]) for i in range(n)]
     for s in train_sets:
         f = fold(s, n); s[col] = 0.0
         for i in range(n):
@@ -203,7 +229,7 @@ def enrich(c, x):
     cd = c.execute(f"SELECT {PK}, INVYR, CONDID, STDORGCD org, SITECLCD site, FORTYPCD fty, STDAGE age, BALIVE balive, SLOPE slope, COALESCE(DSTRBCD1, 0) dst, COALESCE(TRTCD1, 0) trt FROM COND").df()
     rec = rec.merge(cd, on=K + ["INVYR", "CONDID"], how="left")
     y = x.merge(rec[K + ["SUBP", "TREE", "vn", "cc", "cr", "org", "site"]].rename(columns={"vn": "va", "cc": "a_cc", "cr": "a_cr", "org": "a_org", "site": "a_site"}), on=K + ["SUBP", "TREE", "va"], how="left")
-    y["_t"] = y.t1.abs()
+    y["_t"] = y.dt
     y = y.merge(rec[K + ["SUBP", "TREE", "vn", "cc", "cr", "dmg", "org", "site", "fty", "age", "balive", "slope", "dst", "trt"]].rename(columns={"TREE": "_t", "vn": "vD", "cc": "d_cc", "cr": "d_cr", "dmg": "d_dmg", "org": "d_org", "site": "d_site", "fty": "d_fty", "age": "d_age", "balive": "d_balive", "slope": "d_slope", "dst": "d_dst", "trt": "d_trt"}), on=K + ["SUBP", "_t", "vD"], how="left")
     big = c.execute(f"SELECT {PK}, SUBP, TREE, chn, vn, DIA, md, tpa FROM tc WHERE st = 1 AND DIA >= 5").df()
     ba = big.assign(b=0.005454 * big.DIA ** 2 * big.tpa.fillna(0)).groupby(K + ["SUBP", "vn"]).agg(ba=("b", "sum"), tpa=("tpa", "sum")).reset_index()
@@ -215,7 +241,7 @@ def enrich(c, x):
     m["inc"] = (m.d_b - m.d_a) / ((pd.to_datetime(m.m_b) - pd.to_datetime(m.m_a)).dt.days / 365.25).clip(lower=.5)
     y = y.merge(m.groupby(K + ["SUBP", "va", "vD"]).inc.mean().rename("nb_inc").reset_index(), on=K + ["SUBP", "va", "vD"], how="left")
     eco = c.execute("SELECT statecd STATECD, unitcd UNITCD, countycd COUNTYCD, plot PLOT, any_value(epa_l3) l3 FROM data_plot_eco GROUP BY ALL").df()
-    y = y.merge(eco, on=K, how="left"); y["l3"] = pd.factorize(y.l3)[0].astype(float); y["spcd"] = y.SPCD.astype(float)
+    y = y.merge(eco, on=K, how="left"); y["l3"] = y.l3.map(lambda v: np.nan if pd.isna(v) else float(sum(int(n) * 100 ** (2 - i) for i, n in enumerate(str(v).split(".")[:3])))); y["spcd"] = y.SPCD.astype(float)   # the code itself, not its position
     return y.drop(columns="_t").reset_index(drop=True)
 
 
@@ -233,10 +259,7 @@ def rich_report(c, T, G, X, wt, keys):
         for nm, col in (("base inputs", "p"), ("+ NIMIWAE tree and context", "p2"), ("+ context only", "p3"), ("+ tree only", "p4")):
             e = {"avg_precision": round(ap(r.true, r[col]), 4), "log_loss": round(log_loss(r.true, r[col].clip(1e-6, 1 - 1e-6)), 4)}
             for tau in (.5, .7):
-                q = r[r[col] >= tau]; L = []
-                for key, q_ in q.groupby(K + ["SUBP"], sort=False):
-                    L += [(*key, a_, b_) for a_, b_ in one_to_one([(int(i), int(j), -float(p_)) for i, j, p_ in zip(q_.TREE, q_.t1, q_[col])])]
-                A = accuracy(pd.DataFrame(L, columns=K + ["SUBP", "TREE", "t1"]), X[g]["n_live"]); e[f"p>={tau}"] = (A["links"], round(A["precision"], 3), round(A["recall"], 3))
+                A = accuracy(prob_links(r, col, tau), X[g]["n_live"]); e[f"p>={tau}"] = (A["links"], round(A["precision"], 3), round(A["recall"], 3))
             z = G[g].merge(soft_weights(r.assign(p=r[col])), on=K + ["SUBP", "TREE"], how="left").fillna({"psoft": 0})
             z["G_p"] = (z.cls == 'ge5').astype(float) + z.psoft.clip(upper=1); e["graduated"] = round(standard(z, "G_p", wt, keys), 1); o[g][nm] = e
     print(json.dumps(o, indent=0))
@@ -247,7 +270,7 @@ def rich_report(c, T, G, X, wt, keys):
 
 
 def soft_weights(x):
-    tk, dk = K + ["SUBP", "TREE"], K + ["SUBP", "t1"]
+    tk, dk = K + ["SUBP", "TREE"], K + ["SUBP", "deb"]
     w = x.p / x.groupby(dk).p.transform("sum").clip(lower=1)
     w = w / w.groupby([x[c_] for c_ in tk]).transform("sum").clip(lower=1)
     return x.assign(w=w).groupby(tk).w.sum().rename("psoft").reset_index()
@@ -260,7 +283,7 @@ def standard(a, col, wt, keys):
 
 
 def accuracy(links, truth_n):
-    right = int((links.t1 == -links.TREE).sum())
+    right = int((links.sap == links.deb).sum())
     return dict(links=len(links), right=right, precision=right / max(len(links), 1), recall=right / max(truth_n, 1))
 
 
@@ -293,18 +316,24 @@ def selftest():
     n = cohort(c, group_sql("normal")).set_index("TREE")
     assert n.cls.to_dict() == {1: 'ge5', 2: 'dead', 3: 'sap', 4: 'sap', 5: 'lost', 6: 'dead'}, n.cls.to_dict()
     assert n.ever5.to_dict() == {1: 1, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0}, n.ever5.to_dict()    # tree 6's number is reused by a new tree: not a graduate
-    d = debuts(c, group_sql("normal")); assert sorted(d.t1) == [6], d
-    d = debuts(c, group_sql("moved")); assert sorted(d.t1) == [9], d
+    d = debuts(c, group_sql("normal")); assert d[["dt", "dc"]].values.tolist() == [[6, 1]], d    # the reused number is a new tree, chain 1
+    d = debuts(c, group_sql("moved")); assert d[["dt", "dc"]].values.tolist() == [[9, 0]], d
     h = cohort(c, group_sql("moved")); h = h[h.cls == 'closed_sized'].assign(d0=lambda z: z.bd, h0=lambda z: z.bh, t0=lambda z: z.mdb, v0=lambda z: z.va + 1, binB=lambda z: pd.cut(z.bd, BINS, right=False, labels=BLAB).astype(str))
-    x = pairs(h, debuts(c, group_sql("moved"))); assert len(x) == 1 and x.t1[0] == 9, x
+    x = pairs(h, debuts(c, group_sql("moved"))); assert len(x) == 1 and x.deb[0] == "9.0" and not x.true[0], x
     assert len(rule_links(x)) == 1
+    # a hidden tree's own later record is its true debut, by id; shuffling rows changes nothing
+    h2 = cohort(c, group_sql("normal")); h2 = h2[h2.cls == 'sap'].assign(d0=lambda z: z.bd, h0=lambda z: z.bh, t0=lambda z: z.mdb, v0=lambda z: z.va + 1, binB=lambda z: pd.cut(z.bd, BINS, right=False, labels=BLAB).astype(str))
+    tr = tracked_debuts(c, h2, 1); y = pairs(h2, pd.concat([debuts(c, group_sql("normal")), tr], ignore_index=True))
+    assert y[y.true].sap.tolist() == ["3.0"], y[["sap", "deb", "true"]]
+    k_ = lambda L: sorted(map(tuple, L[["sap", "deb"]].values.tolist()))
+    assert k_(rule_links(y)) == k_(rule_links(y.sample(frac=1, random_state=3))), "row order changed the links"
     rng = np.random.default_rng(0)
     for _ in range(400):
         e = list({(int(a), int(b)): float(c_) for a, b, c_ in zip(rng.integers(0, 4, 7), rng.integers(0, 4, 7), rng.random(7))}.items())
         e = [(a, b, c_) for (a, b), c_ in e]
         got = one_to_one(e); want, wc = brute(e); co = {(a, b): c_ for a, b, c_ in e}
         assert len(got) == len(want) and abs(sum(co[p] for p in got) - wc) < 1e-9, (e, got, want)
-    print("selftest: 8 fixture checks and 400 matching cases PASS")
+    print("selftest: 10 fixture checks and 400 matching cases PASS")
 
 
 def facts(c):
@@ -351,19 +380,14 @@ def no_candidate(c):
     base["wood"] = (base.SPCD < 300).astype(int)
     prior = {"<2": .01, "2-3": .03, "3-3.5": .06, "3.5-4": .14, "4-4.5": .28, "4.5+": .65}
     c.execute(f"CREATE OR REPLACE TEMP TABLE f AS SELECT {PK}, SUBP, TREE, chn, min(vn) fv FROM tc GROUP BY ALL")
-    all_d = c.execute(f"""SELECT r.STATECD, r.UNITCD, r.COUNTYCD, r.PLOT, r.SUBP, r.TREE t1, r.SPCD sp1, r.DIA dn, r.HT hn, r.st dst, r.vn vD, r.md mdD
+    all_d = c.execute(f"""SELECT r.STATECD, r.UNITCD, r.COUNTYCD, r.PLOT, r.SUBP, r.TREE dt, r.chn dc, r.SPCD sp1, r.DIA dn, r.HT hn, r.st dst, r.vn vD, r.md mdD
        FROM tc r JOIN f USING ({PK}, SUBP, TREE, chn) WHERE r.vn = f.fv AND r.st IN (1, 2, 3) AND r.DIA >= 5 AND (r.tpa IS NULL OR r.tpa < {TPA_MICRO}) AND NOT (r.st <> 1 AND r.rc IS NOT DISTINCT FROM 4)""").df()
     h_ = base.assign(vh=lambda d: d.vm); tr = tracked_debuts(c, h_, 0)
     for k in (1, 2, 3):
         hid = base[base.vm >= base.v0 + k].assign(vh=lambda d: d.v0 + k)
-        pool = pd.concat([all_d.assign(va=0, vh=0), tr.drop(columns=["true_of"]).assign(va=0, vh=0)], ignore_index=True)
-        x = pairs(hid, pool); x = x[(x.r <= .6) & ((x.dst != 1) | (x.hn >= x.h0 - 5))]
-        lk = []
-        for key, e in x.groupby(K + ["SUBP"], sort=False):
-            rng = np.random.default_rng(zlib.crc32(str(key).encode()))
-            lk += [(*key, a_) for a_, _ in one_to_one([(int(a_), int(b_), -float(np.log(prior[c_])) + float(u)) for a_, b_, c_, u in zip(e.TREE, e.t1, e.binB, rng.random(len(e)) * 1e-6)])]
-        m = pd.DataFrame(lk, columns=K + ["SUBP", "TREE"]).assign(lk=1)
-        z = hid.merge(m, on=K + ["SUBP", "TREE"], how="left").merge(tr.rename(columns={"true_of": "TREE"})[K + ["SUBP", "TREE", "vD"]], on=K + ["SUBP", "TREE"], how="left")
+        pool = pd.concat([all_d.assign(va=0, vh=0), tr.assign(va=0, vh=0)], ignore_index=True)
+        m = rule_links(pairs(hid, pool), prior).assign(lk=1)
+        z = hid.merge(m[K + ["SUBP", "TREE", "lk"]], on=K + ["SUBP", "TREE"], how="left").merge(tr.rename(columns={"dt": "TREE"})[K + ["SUBP", "TREE", "vD"]], on=K + ["SUBP", "TREE"], how="left")
         z["live_grad"] = z.vD.notna() & (z.vD <= z.v0 + k); none = z[z.lk.isna()]
         t_ = none.groupby("binB").agg(none=("live_grad", "size"), hidden=("live_grad", "mean")).round(3); t_["k"] = k
         ROWS.append(t_.reset_index())
@@ -400,7 +424,7 @@ def run(db, out):
         hid = hid.assign(d0=hid.bd, h0=hid.bh, t0=hid.mdb, v0=hid.va + 1, binB=pd.cut(hid.bd, BINS, right=False, labels=BLAB).astype(str))
         tr = tracked_debuts(c, hid, 1) if g != "moved" else pd.DataFrame()
         if len(tr):
-            pool = pd.concat([pool, tr.drop(columns="true_of")], ignore_index=True)
+            pool = pd.concat([pool, tr], ignore_index=True)
         x = pairs(hid, pool); X[g] = dict(x=x, n_live=len(tr), hid=hid); print(g, "pool", len(pool), "hidden", len(hid), "pairs", len(x), "live graduates hidden", len(tr))
     T = {g: tight(v["x"], Q) for g, v in X.items()}
     fit_scores([T["normal"], T["after"]], [T["moved"]])
@@ -421,10 +445,7 @@ def run(db, out):
         if g != "moved":
             acc[g] = {"relinked": accuracy(rule_links(X[g]["x"]), X[g]["n_live"])}
             for tau in (.3, .5, .7):
-                e = T[g][T[g].p >= tau]; o = []
-                for key, q_ in e.groupby(K + ["SUBP"], sort=False):
-                    o += [(*key, a_, b_) for a_, b_ in one_to_one([(int(i), int(j), -float(p_)) for i, j, p_ in zip(q_.TREE, q_.t1, q_.p)])]
-                acc[g][f"p>={tau}"] = accuracy(pd.DataFrame(o, columns=K + ["SUBP", "TREE", "t1"]), X[g]["n_live"])
+                acc[g][f"p>={tau}"] = accuracy(prob_links(T[g], "p", tau), X[g]["n_live"])
             acc[g]["calibration"] = T[g].assign(b=pd.cut(T[g].p, [0, .1, .25, .5, .75, 1])).groupby("b", observed=True).agg(p=("p", "mean"), t=("true", "mean"), n=("p", "size")).round(3).values.tolist()
     print(json.dumps(rows, indent=0)); print(json.dumps(acc, indent=0))
     # silent moves: nothing keeps its number, hide everything from A
@@ -439,7 +460,7 @@ def run(db, out):
         pool = debuts(c, sq if g == "silent" else group_sql(g))
         tr = tracked_debuts(c, hid, 0) if g != "silent" else pd.DataFrame()
         if len(tr):
-            pool = pd.concat([pool, tr.drop(columns="true_of")], ignore_index=True)
+            pool = pd.concat([pool, tr], ignore_index=True)
         SX[g] = pairs(hid, pool)
     ST = {g: tight(v, Q) for g, v in SX.items()}; fit_scores([ST["normal"], ST["after"]], [ST["silent"]])
     wk = ["wood", "bin"]; ws = S["silent"].groupby(wk, observed=True).size().rename("wt").reset_index(); sr = {}
@@ -454,6 +475,6 @@ def run(db, out):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("--db"); ap.add_argument("--out"); ap.add_argument("--selftest", action="store_true")
-    a_ = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--db"); ap.add_argument("--out"); ap.add_argument("--selftest", action="store_true"); ap.add_argument("--shuffle", type=int)
+    a_ = ap.parse_args(); SHUFFLE = a_.shuffle
     selftest() if a_.selftest else run(a_.db, a_.out)

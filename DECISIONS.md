@@ -1725,3 +1725,22 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - **Links, all inputs vs base:** p ≥ 0.7 precision 0.88 / 0.88 vs 0.87 / 0.87, recall 0.23 / 0.24 vs 0.22 / 0.23. Graduated unchanged (8.8 / 9.1 vs 8.8 / 9.0); moved 8.3.
 - **Reading:** a small real gain, mostly from context. Use the full inputs. The remaining uncertainty is identity: most debuts come from outside the microplot and look like graduates.
 - **Determinism:** rows are now sorted before matching and fitting; two full runs give byte-identical JSON. Before this, link accuracy moved by up to about 1 point between runs because SQL row order varied. am. 12 figures are replaced by `docs/RETALLY_AUDIT.json`: graduated relinked 16.5 / 16.9 / 15.6; not graduated relinked 53.7 / 54.3 / 53.6; accuracy p ≥ 0.3 0.62 / 0.64, 0.44 / 0.44; p ≥ 0.5 0.76 / 0.78, 0.33 / 0.33; p ≥ 0.7 0.87 / 0.87, 0.22 / 0.23.
+
+## D66 — Natural ids and no row-order logic in the curation (user, 2026-11-01)
+- **Request:** use natural unique ids, not CNs and not local ids, and do not rely on sorting.
+- **Rules:**
+  - One selection helper, `fia_ids.pick(df, key, by, which)`: the row of each key with the smallest or largest `by`. A tie is an error, never a coin flip.
+  - Windows state their order: `.over(key, order_by=...)`. A frame's `.sort` is for storage and display only.
+  - Ids are never positions: `cohort_id` is the cohort's natural key as text (was a row index offset per state).
+  - CN appears once for plot chains, as FIA's claim about the previous visit, then chains run on natural visit ids. SUBP_COND_CHNG_MTRX and the quarantine check stay at the boundary. `curated_trees.CN` stays as an attribute.
+  - Age-model order and draws use the natural record id, not CN. That order stays because binning and bootstraps in the fit are order-sensitive; it is an id order, not row luck.
+  - NIMIWAE prep joins climate on (tree, MEASDATE), not a row number; area-dominant classes break ties by value.
+- **Found and fixed:**
+  - a cross-visit shift over CONDID in a diagnostic of `fia_curation_v3` that the lint missed (removed);
+  - `cohort_id` as a row index;
+  - `unique(keep=...)` with no order in `build_tree_trajectories`, `cohort_disturbance`, `cohorts_landis2`;
+  - last-digit float differences in `curated_cohorts` and `curated_snapshots` from summation order, now rounded to 6 decimals.
+- **Tests:**
+  - `fia_truth_lint.py` gains L4 (no `keep=`, no unordered shift or cumulative window, no bare `.first()` in an aggregate, no row index) and catches `cond_id_cols`.
+  - `fia_order_test.py`: steps 1–10 on a county, plain vs loaded trees shuffled and every table rewritten in random order after each step. GA 13:87 and KY 21:175: all 40 tables identical.
+- **Consequence:** age-model bootstrap draws change with the id, so model ages move slightly. Full R4 rebuild goes to a separate folder and through the verifier before it replaces the truth DB.

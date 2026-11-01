@@ -38,6 +38,7 @@ import sys
 import duckdb
 import numpy as np
 import polars as pl
+from fia_ids import natural_record_id
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import OrdinalEncoder
 from threadpoolctl import threadpool_limits
@@ -160,12 +161,12 @@ def plot_fold(plot_keys) -> np.ndarray:
     import zlib
     return np.array([zlib.crc32(str(k).encode()) % N_FOLDS for k in plot_keys], dtype=np.int64)
 CAL_SLOPE_MIN, CAL_SLOPE_MAX = 0.25, 1.5
-CAL_COLS = ["CN", "STATECD", "UNITCD", "COUNTYCD", "PLOT", "SPCD", "spcd_resolved", "spgrpcd_resolved",
+CAL_COLS = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE", "MEASDATE", "SPCD", "spcd_resolved", "spgrpcd_resolved",
             "cond_stdorgcd", "STATUSCD", "DIA", "estage_raw", "age_from_totage", "age_from_stdage", "age_stratum"]
 
 
 def _calibration_set(con) -> pl.DataFrame:
-    """Planted calibration rows (D40), sorted by CN (row order never depends on the DB)."""
+    """Planted calibration rows (D40), ordered by natural record id, because isotonic and gradient-boosting fits are order-sensitive (D66)."""
     cols = ", ".join(CAL_COLS)
     df = con.execute(f"""
         SELECT {cols} FROM curated_trees
@@ -181,7 +182,7 @@ def _calibration_set(con) -> pl.DataFrame:
                               separator="_").alias("_plot"),
             ])
             .filter(pl.col("field_age") > 0)
-            .sort(pl.col("CN").cast(pl.Utf8)))
+            .with_columns(natural_record_id().alias("_rid")).sort("_rid"))
     return df.with_columns(pl.Series("_fold", plot_fold(df["_plot"].to_list())))
 
 
@@ -523,12 +524,12 @@ def build_training_set(con, est) -> pl.DataFrame:
       natural: TOTAGE where present ('field'), else the RAW Tree_Age of live >= 5 in records
                with Tree_Age > 1 ('treeage'). Natural STDAGE is not a target.
     SITETREE bored ages are never used for fitting (they are the independent check).
-    Rows are sorted by CN (D40), so neither the fit nor the folds depend on the DB row order.
+    Rows are ordered by natural record id (D40, D66), so neither the fit nor the folds depend on the DB row order.
     `_kept` is the robust outlier rule on ALL rows (the production fit); the CV recomputes it
     on each fold's training rows. Outliers are scored but not trained on."""
     cols = ", ".join(TRAIN_COLS + ["estage_raw", "spgrpcd_resolved", "cond_fldszcd", "cond_stdszcd",
                                    "cond_stdorgcd", "age_from_totage", "age_stratum",
-                                   "SUBP", "TREE", "MEASDATE", "CN"])
+                                   "SUBP", "TREE", "MEASDATE"])
     df = attach_modeling_context(con, con.execute(f"SELECT {cols} FROM curated_trees").pl())
     df = df.filter((pl.col("STATUSCD") == 1) & pl.col("DIA").is_not_null() & pl.col("DIA").is_not_nan())
     df = df.with_columns(
@@ -548,7 +549,7 @@ def build_training_set(con, est) -> pl.DataFrame:
     nat = df.filter(~field_ok & ~pl.col("_planted") & valid_te)
     parts.append(nat.with_columns(pl.col("estage_raw").cast(pl.Float64).alias("target"),
                                   pl.lit("treeage").alias("source")))
-    train = pl.concat(parts, how="diagonal_relaxed").sort(pl.col("CN").cast(pl.Utf8))
+    train = pl.concat(parts, how="diagonal_relaxed").with_columns(natural_record_id().alias("_rid")).sort("_rid")
     train = train.with_columns((pl.col("DIA") / 2).floor().clip(0, 15).cast(pl.Int32).alias("_dcls"))
     train = train.with_columns(pl.Series("_kept", _kept_mask(
         train["target"].to_numpy().astype(float), train["source"].to_numpy(), train["_dcls"].to_numpy(),
@@ -579,7 +580,7 @@ _POISSON1_CDF = np.cumsum([np.exp(-1.0) / np.prod(np.arange(1, k + 1)) for k in 
 
 
 def _row_uniforms(cns, salt: str, seed: int) -> np.ndarray:
-    """Uniform [0, 1) per row from crc32('CN|salt|seed') — reproducible, order-free."""
+    """Uniform [0, 1) per row from crc32('natural record id|salt|seed') — reproducible, order-free."""
     import zlib
     return np.fromiter((zlib.crc32(f"{c}|{salt}|{seed}".encode()) for c in cns),
                        dtype=np.float64, count=len(cns)) / 2.0 ** 32
@@ -693,7 +694,7 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
     enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan,
                          encoded_missing_value=np.nan)
     X = _build_X(train, enc, fit_enc=True)
-    draws = row_draws(train["CN"].cast(pl.Utf8).to_list())
+    draws = row_draws(train["_rid"].to_list())
     n = train.height
     kept = train["_kept"].to_numpy()
     folds = train["_fold"].to_numpy()
@@ -889,7 +890,7 @@ def apply_age_model(df: pl.DataFrame,
     if isinstance(recal, tuple):
         recal, oof_tab = recal
     if oof_tab is not None and oof_tab.height:   # r5 M-6: cross-fitted predictions for training rows
-        o = (alive_w_dia.select(TREE_ID + ["MEASDATE"]).with_row_index("_i")
+        o = (alive_w_dia.select(TREE_ID + ["MEASDATE"]).with_row_index("_i")   # order-ok: a position in this frame's own prediction array
              .join(oof_tab, on=TREE_ID + ["MEASDATE"], how="inner"))
         if o.height:
             raw[o["_i"].to_numpy()] = o["_raw_oof"].to_numpy()

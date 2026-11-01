@@ -28,6 +28,7 @@ import os
 
 import duckdb
 import polars as pl
+from fia_ids import pick, maybe_shuffle
 
 TREE_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP", "TREE"]
 SUBPLOT_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP"]
@@ -643,7 +644,7 @@ def load_trees(con, state: int | None = None) -> pl.DataFrame:
 
     df = df.sort(TREE_ID + ["MEASDATE"])
     print(f"[step4] loaded {df.height:,} tree-measurements into polars")
-    return df
+    return maybe_shuffle(df)
 
 
 TREE_SPLIT_OFFSET = 100_000   # R4 TREE numbers are < 61,000
@@ -684,8 +685,8 @@ def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.Data
     """
     d = (df.join(breaks.with_columns([pl.col(c).cast(df.schema[c]) for c in PLOT_INVYR]), on=PLOT_INVYR, how="left")
          .with_columns(pl.col("_brk").fill_null(False))).sort(TREE_ID + ["MEASDATE"]).with_columns([
-        pl.col("STATUSCD").shift(1).over(TREE_ID).alias("_pst"),
-        pl.col("MEASDATE").shift(1).over(TREE_ID).alias("_pmd"),
+        pl.col("STATUSCD").shift(1).over(TREE_ID, order_by="MEASDATE").alias("_pst"),
+        pl.col("MEASDATE").shift(1).over(TREE_ID, order_by="MEASDATE").alias("_pmd"),
     ])
     # D59: FIA records PREV_STATUS_CD on a remeasured tree; a same-number record without one is a new
     # tree (equals the CN link on all 2.76M same-number successors of the 8 states)
@@ -699,7 +700,7 @@ def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.Data
     d = d.with_columns([(has_prev & r).fill_null(False).alias(n) for n, r in
                         (("_s_dead", r_dead), ("_s_newrc", r_newrc), ("_s_closed", r_closed), ("_s_visit", pl.col("_brk")))])
     new_seg = pl.any_horizontal("_s_dead", "_s_newrc", "_s_closed", "_s_visit")
-    d = d.with_columns(new_seg.cast(pl.Int64).cum_sum().over(TREE_ID).alias("_seg"))
+    d = d.with_columns(new_seg.cast(pl.Int64).cum_sum().over(TREE_ID, order_by="MEASDATE").alias("_seg"))
     d = d.with_columns((pl.col("_seg").max().over(TREE_ID) > 0).alias("tree_key_split"))
     n_split = d.filter(pl.col("_seg") > 0).select(TREE_ID).unique().height
     n_rec = d.filter(pl.col("_seg") > 0).height
@@ -772,7 +773,7 @@ def annotate_reconcile(df: pl.DataFrame) -> pl.DataFrame:
                          censored again — audit M8); terminal fate uses the last one
     """
     first_rc = (
-        df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+        df.pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID + [pl.col("RECONCILECD").cast(pl.Int32).alias("_rc_first")])
     )
     df = df.join(first_rc, on=TREE_ID, how="left").with_columns(
@@ -845,7 +846,7 @@ def analyze_spcd_confusion(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame
         df.select(TREE_ID + ["MEASDATE", "SPCD"])
         .sort(TREE_ID + ["MEASDATE"])
         .with_columns(
-            pl.col("SPCD").shift(-1).over(TREE_ID).alias("next_spcd"),
+            pl.col("SPCD").shift(-1).over(TREE_ID, order_by="MEASDATE").alias("next_spcd"),
         )
         .filter(
             pl.col("next_spcd").is_not_null() &
@@ -935,16 +936,13 @@ def analyze_spcd_confusion(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame
 
     # --- Resolve SPCD per tree: mode, tie-break by latest measurement ---
     # Count SPCD occurrences per tree, with latest MEASDATE as tie-breaker
-    # Sort ascending so that the LAST row per tree is the most-frequent,
-    # latest-observed SPCD. unique(keep="last") respects current row order.
     spcd_counts = (
         df.group_by(TREE_ID + ["SPCD"])
         .agg([
             pl.len().alias("_n_obs"),
             pl.col("MEASDATE").max().alias("_latest"),
         ])
-        .sort(["_n_obs", "_latest"])
-        .unique(subset=TREE_ID, keep="last")
+        .pipe(pick, TREE_ID, ["_n_obs", "_latest"], "last")
         .select(TREE_ID + [pl.col("SPCD").alias("spcd_resolved")])
     )
 
@@ -976,8 +974,7 @@ def _add_spgrpcd_resolved(df: pl.DataFrame) -> pl.DataFrame:
     constants instead of the raw per-visit values."""
     grp = (
         df.filter(pl.col("SPCD") == pl.col("spcd_resolved"))
-        .sort(TREE_ID + ["MEASDATE"])
-        .unique(subset=TREE_ID, keep="last")
+        .pipe(pick, TREE_ID, ["MEASDATE"], "last")
         .select(TREE_ID + [pl.col("SPGRPCD").alias("spgrpcd_resolved")])
     )
     return df.join(grp, on=TREE_ID, how="left")
@@ -1059,15 +1056,13 @@ def classify_tree_fate(df: pl.DataFrame, landuse_exits: pl.DataFrame | None = No
               .group_by(TREE_ID).agg(pl.col("linked_live_after_dead_md").max().alias("_res_lx")))
         df = (df.join(lx, on=TREE_ID, how="left")
                 .with_columns(pl.max_horizontal("_res_md", "_res_lx").alias("_res_md")).drop("_res_lx"))
-    # r7 D44 (F7-4): polars joins do not guarantee row order; the cum_sum below needs it
-    df = df.sort(TREE_ID + ["MEASDATE"])
     df = df.with_columns(
         (dead & pl.col("_res_md").is_not_null() & (pl.col("MEASDATE") < pl.col("_res_md"))).fill_null(False)
         .alias("misrecorded_death")).drop("_res_md")
     real_dead = dead & ~pl.col("misrecorded_death")
     df = df.with_columns(
         (real_dead & ((pl.col("prev_status_cd") == 2).fill_null(False) |
-                      (real_dead.cast(pl.Int32).cum_sum().over(TREE_ID) > 1))).alias("rerecord_dead"))
+                      (real_dead.cast(pl.Int32).cum_sum().over(TREE_ID, order_by="MEASDATE") > 1))).alias("rerecord_dead"))
     n_mis = df.filter(pl.col("misrecorded_death"))
     print(f"[step5] misrecorded deaths (dead/cut record followed by a linked live record): "
           f"{n_mis.height:,} records on {n_mis.select(TREE_ID).unique().height:,} trees")
@@ -1139,9 +1134,8 @@ def _next_visit(last: pl.DataFrame, subplot_years: pl.DataFrame) -> pl.DataFrame
         sv = sv.with_columns(pl.lit(False).alias("_nf"))
     return (last.join(sv, on=SUBPLOT_ID, how="inner")
             .filter(pl.col("MEASDATE") > pl.col("_last_md"))
-            .sort(TREE_ID + ["MEASDATE"])
-            .group_by(TREE_ID, maintain_order=True)
-            .agg(pl.len().alias("_n_later"), pl.col("_nf").first().alias("_next_nonforest"))
+            .group_by(TREE_ID)
+            .agg(pl.len().alias("_n_later"), pl.col("_nf").sort_by("MEASDATE").first().alias("_next_nonforest"))
             .with_columns((pl.col("_n_later") > 0).alias("_later"))
             .select(TREE_ID + ["_later", "_next_nonforest"]))
 
@@ -1187,11 +1181,11 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
     # records of it are re-records); otherwise at its last (live) record
     first_dead = (
         df.filter(pl.col("STATUSCD").is_in([2, 3]) & ~pl.col("misrecorded_death"))   # r6 R4
-        .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+        .pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID + [pl.col("MEASDATE").alias("_dmd"), pl.col("tree_fate").alias("_dfate")])
     )
     last = (
-        df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
+        df.pipe(pick, TREE_ID, ["MEASDATE"], "last")
         .select(TREE_ID + [pl.col("MEASDATE").alias("_lmd"),
                            # r6 D26: a misrecorded death means the tree was ALIVE at that visit
                            pl.when(pl.col("tree_fate") == "misrecorded_death").then(pl.lit("alive"))
@@ -1214,7 +1208,7 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
     df = df.join(last, on=TREE_ID, how="left")
 
     first_subp = subplot_years.group_by(SUBPLOT_ID).agg(pl.col("MEASDATE").min().alias("_fsv"))
-    dfirst = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+    dfirst = (df.pipe(pick, TREE_ID, ["MEASDATE"], "first")
               .join(first_subp, on=SUBPLOT_ID, how="left")
               .select(TREE_ID + [((pl.col("STATUSCD") == 2) & ~pl.col("misrecorded_death")
                                   & (pl.col("MEASDATE") == pl.col("_fsv")))
@@ -1224,7 +1218,7 @@ def add_final_tree_fate(df: pl.DataFrame, subplot_years: pl.DataFrame,
     # is dead or cut (STATUSCD 2 / 3; a misrecorded death counts as alive) at ANY visit — a
     # first-seen death, never observed
     # mortality of a live tree, so it never produces a mortality interval or a drop
-    frd = (df.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+    frd = (df.pipe(pick, TREE_ID, ["MEASDATE"], "first")
              .select(TREE_ID + [(pl.col("STATUSCD").is_in([2, 3]) & ~pl.col("misrecorded_death"))
                                 .fill_null(False).alias("first_record_dead")]))
     df = df.join(frd, on=TREE_ID, how="left")
@@ -1305,7 +1299,7 @@ def detect_condition_resets(df: pl.DataFrame, link: pl.DataFrame):
     cv = (
         dfb.group_by(COND_ID + ["MEASDATE"])
         .agg([
-            pl.col("cond_stdage").first().alias("cond_stdage"),
+            pl.col("cond_stdage").max().alias("cond_stdage"),   # one value per condition-visit
             live.sum().alias("n_live"),
             pl.col("_ba").filter(live).sum().alias("ba_live"),
             pl.any_horizontal([pl.col(c) == 10 for c in ("TRTCD1", "TRTCD2", "TRTCD3")]).any().alias("cut"),
@@ -1320,12 +1314,11 @@ def detect_condition_resets(df: pl.DataFrame, link: pl.DataFrame):
     lk = (link.with_columns((pl.col("prop") / pl.col("prop").sum().over(prev_keys)).alias("_share"))
           .join(cv.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("MEASDATE").alias("PREV_MEASDATE"),
                                       pl.col("cond_stdage").alias("_pstd"), pl.col("n_live").alias("_pn"), pl.col("ba_live").alias("_pba")]),
-                on=prev_keys, how="inner")
-          .sort(COND_ID + ["MEASDATE", "prop", "PREV_CONDID"], descending=[False] * 6 + [True, False]))
-    prev = lk.group_by(COND_ID + ["MEASDATE"], maintain_order=True).agg(
+                on=prev_keys, how="inner"))
+    prev = lk.group_by(COND_ID + ["MEASDATE"]).agg(
         (pl.col("_share") * pl.col("_pn")).sum().alias("_prev_n"),
         (pl.col("_share") * pl.col("_pba")).sum().alias("_prev_ba"),
-        pl.col("_pstd").first().alias("_prev_stdage"))
+        pl.col("_pstd").sort_by(["prop", "PREV_CONDID"], descending=[True, False]).first().alias("_prev_stdage"))
     cv = cv.join(prev, on=COND_ID + ["MEASDATE"], how="left").with_columns(
         (((pl.col("_prev_n") > 0) & (pl.col("n_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
          ((pl.col("_prev_ba") > 0) & (pl.col("ba_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_ba"))))
@@ -1342,8 +1335,7 @@ def detect_condition_resets(df: pl.DataFrame, link: pl.DataFrame):
                      .agg(pl.col("reset_reason").unique().sort().alias("reset_reasons")))
     reset_flag = reset_reasons.select(COND_ID + ["MEASDATE"]).unique().with_columns(pl.lit(True).alias("is_reset"))
     # forward along each condition-visit's largest link
-    dom = (link.sort(COND_ID + ["MEASDATE", "prop", "PREV_CONDID"], descending=[False] * 6 + [True, False])
-           .unique(subset=COND_ID + ["MEASDATE"], keep="first", maintain_order=True))
+    dom = pick(link, COND_ID + ["MEASDATE"], ["prop", "PREV_CONDID"], descending=[True, False])
     fr = reset_flag.select(COND_ID + ["MEASDATE", pl.col("MEASDATE").alias("first_reset")])
     for _ in range(32):
         nxt = (dom.join(fr.select(PLOT_KEY + [pl.col("CONDID").alias("PREV_CONDID"), pl.col("MEASDATE").alias("PREV_MEASDATE"), "first_reset"]),
@@ -1775,9 +1767,7 @@ def _select_best_anchor(candidates: pl.DataFrame,
 
     best = (
         cands
-        .sort(TREE_ID + ["_dev", "MEASDATE"],
-              descending=[False] * len(TREE_ID) + [False, True])
-        .unique(subset=TREE_ID, keep="first")
+        .pipe(pick, TREE_ID, ["_dev", "MEASDATE"], descending=[False, True])
         .with_columns(
             (pl.col("_age_at_first") +
              (pl.col("MEASDATE") - pl.col("first_measdate")).dt.total_days() / 365.25)
@@ -2179,10 +2169,10 @@ def build_snapshots(df: pl.DataFrame, scaffold: pl.DataFrame) -> pl.DataFrame:
                              "estimated_age", "age_source"]
         )
         .agg([
-            pl.col("biomass_contrib").sum().alias("biomass_per_acre_lbs"),
+            pl.col("biomass_contrib").sum().round(6).alias("biomass_per_acre_lbs"),
             pl.len().alias("n_trees"),
-            pl.col("DIA").mean().alias("mean_dia"),
-            pl.col("HT").mean().alias("mean_ht"),
+            pl.col("DIA").mean().round(6).alias("mean_dia"),
+            pl.col("HT").mean().round(6).alias("mean_ht"),
         ])
     )
 
@@ -2341,52 +2331,6 @@ def diagnostics(df: pl.DataFrame, snapshots: pl.DataFrame):
               f"({100*n_match/planted.height:.1f}%)")
         print(f"  Other species (ingrowth/regen):   {planted.height - n_match:,} "
               f"({100*(planted.height - n_match)/planted.height:.1f}%)")
-
-    # --- STDAGE trajectory anomalies (all conditions, by origin) ---
-    print("\n--- STDAGE trajectory anomalies (all conditions) ---")
-    all_with_stdage = (
-        df.select(["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID",
-                   "MEASDATE", "cond_stdage", "cond_stdorgcd"])
-        .unique(subset=["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID", "MEASDATE"])
-        .filter(pl.col("cond_stdage").is_not_null() & (pl.col("cond_stdage") > 0))
-        .sort(["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID", "MEASDATE"])
-    )
-    cond_id_cols = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "CONDID"]
-    if all_with_stdage.height > 0:
-        consec = all_with_stdage.with_columns([
-            pl.col("cond_stdage").shift(-1).over(cond_id_cols).alias("next_stdage"),
-            pl.col("MEASDATE").shift(-1).over(cond_id_cols).alias("next_measdate"),
-        ]).filter(pl.col("next_stdage").is_not_null())
-
-        consec = consec.with_columns([
-            ((pl.col("next_measdate") - pl.col("MEASDATE")).dt.total_days() / 365.25)
-                .alias("interval"),
-            (pl.col("next_stdage") - pl.col("cond_stdage")).alias("delta_stdage"),
-        ])
-
-        resets = consec.filter(pl.col("delta_stdage") < 0)
-        large_discrepancy = consec.filter(
-            (pl.col("delta_stdage") - pl.col("interval")).abs() > 3
-        )
-        print(f"  Consecutive condition-measurement pairs: {consec.height:,}")
-        print(f"  STDAGE decreased (resets):                {resets.height:,}")
-        print(f"  |delta_stdage - interval| > 3yr:         {large_discrepancy.height:,}")
-
-        # Breakdown by origin
-        for orgcd, label in [(1, "planted (STDORGCD=1)"), (0, "natural (STDORGCD=0)")]:
-            r_sub = resets.filter(pl.col("cond_stdorgcd") == orgcd)
-            d_sub = large_discrepancy.filter(pl.col("cond_stdorgcd") == orgcd)
-            print(f"    {label}: {r_sub.height:,} resets, {d_sub.height:,} large discrepancies")
-
-        if resets.height > 0:
-            print("\n  Sample STDAGE resets (up to 10):")
-            sample = resets.head(10)
-            for r in sample.iter_rows(named=True):
-                org_label = "planted" if r["cond_stdorgcd"] == 1 else "natural"
-                print(f"    [{org_label}] PLOT={r['PLOT']} COND={r['CONDID']} "
-                      f"{r['MEASDATE']}→{r['next_measdate']}: "
-                      f"STDAGE {r['cond_stdage']}→{r['next_stdage']} "
-                      f"(Δ={r['delta_stdage']})")
 
     # --- disturbance and age relationship ---
     print("\n--- Disturbance x age coverage ---")
@@ -2631,8 +2575,7 @@ def add_age_stratum(df: pl.DataFrame) -> pl.DataFrame:
     is 1, else 'natural' (null / other codes = natural); a tree without any live record takes its
     first record. Every age-scale decision in step 2 uses this column."""
     first = (df.with_columns((pl.col("STATUSCD") != 1).alias("_nl"))
-               .sort(TREE_ID + ["_nl", "MEASDATE"])
-               .group_by(TREE_ID, maintain_order=True).first()
+               .pipe(pick, TREE_ID, ["_nl", "MEASDATE"])
                .select(TREE_ID + [pl.when(pl.col("cond_stdorgcd") == 1).then(pl.lit("planted"))
                                   .otherwise(pl.lit("natural")).alias("age_stratum")]))
     return df.join(first, on=TREE_ID, how="left")

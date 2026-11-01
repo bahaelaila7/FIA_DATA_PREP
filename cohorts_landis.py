@@ -39,6 +39,7 @@ import sys
 
 import duckdb
 import polars as pl
+from fia_ids import pick, maybe_shuffle
 
 PLOT_KEY   = ["STATECD", "UNITCD", "COUNTYCD", "PLOT"]
 SUBPLOT_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP"]
@@ -431,9 +432,8 @@ def sim_year_map(visits: pl.DataFrame, anchors: pl.DataFrame | None = None) -> p
          .with_columns(pl.col("MEASDATE").min().over(SUBPLOT_ID).alias("_first_measdate"))
          .with_columns(((pl.col("MEASDATE") - pl.col("_first_measdate")).dt.total_days() / 365.25)
                        .round(0).cast(pl.Int32).alias("_raw"))
-         .sort(SUBPLOT_ID + ["MEASDATE"])
-         .with_columns(pl.int_range(pl.len()).over(SUBPLOT_ID).cast(pl.Int32).alias("_i")))
-    return (v.with_columns((pl.col("_i") + (pl.col("_raw") - pl.col("_i")).cum_max().over(SUBPLOT_ID))
+         .with_columns((pl.col("MEASDATE").rank("ordinal").over(SUBPLOT_ID).cast(pl.Int32) - 1).alias("_i")))
+    return (v.with_columns((pl.col("_i") + (pl.col("_raw") - pl.col("_i")).cum_max().over(SUBPLOT_ID, order_by="MEASDATE"))
                            .cast(pl.Int32).alias("sim_year"))
              .select(SUBPLOT_ID + ["MEASDATE", "sim_year"]))
 
@@ -463,8 +463,7 @@ def compute_sim_year_ages(df: pl.DataFrame, visits: pl.DataFrame | None = None) 
 
     # Per-tree debut: rounded age and sim_year at first measurement
     debut = (
-        df.sort(TREE_ID + ["MEASDATE"])
-        .unique(subset=TREE_ID, keep="first")
+        df.pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID + [
             pl.col("age_calc").alias("_debut_age"),
             pl.col("sim_year").alias("_debut_sim_year"),
@@ -518,23 +517,22 @@ def estimate_sapling_growth_rates(df: pl.DataFrame, basis: str, tag: str | None 
     else:
         raise ValueError(f"estimate_sapling_growth_rates: basis must be 'tpa_expanded' or 'per_tree', not {basis!r}")
     srt = df.filter(pl.col("intro_type").is_null() if "intro_type" in df.columns else pl.lit(True)) \
-            .with_columns(bio.alias("_bio")).sort(TREE_ID + ["MEASDATE"])
+            .with_columns(bio.alias("_bio"))
 
     first = (
-        srt.unique(subset=TREE_ID, keep="first")
+        srt.pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID + [pl.col("age_calc").alias("first_age"),
                             pl.col("_bio").alias("first_agb"),
                             pl.col("dia").alias("first_dia")])
     )
     last = (
-        srt.unique(subset=TREE_ID, keep="last")
+        srt.pipe(pick, TREE_ID, ["MEASDATE"], "last")
         .select(TREE_ID + [pl.col("age_calc").alias("last_age"),
                             pl.col("_bio").alias("last_agb")])
     )
     meta = (
-        df.select(TREE_ID + ["species_symbol", "spgrpcd", "epa_l3"])
-        .sort(TREE_ID + ["species_symbol", "spgrpcd", "epa_l3"], nulls_last=True)
-        .unique(subset=TREE_ID, keep="first")
+        df.select(TREE_ID + ["species_symbol", "spgrpcd", "epa_l3"]).unique()
+        .pipe(pick, TREE_ID, ["species_symbol", "spgrpcd", "epa_l3"], nulls_last=True)
     )
 
     tree_rates = (
@@ -729,7 +727,7 @@ def add_backfill_flags(df: pl.DataFrame, ctx=None) -> pl.DataFrame:
     """Per-row tree-level flags used by the blocking rules (debut = first REAL row of the
     tree). Needs dia, reconcile_new and rc_obs (RECONCILECD)."""
     real = df.filter(pl.col("intro_type").is_null()) if "intro_type" in df.columns else df
-    debut = (real.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+    debut = (real.pipe(pick, TREE_ID, ["MEASDATE"], "first")
              .select(TREE_ID + [pl.col("dia").alias("_debut_dia"),
                                 pl.col("rc_obs").alias("_debut_rc")]))
     df = df.drop([c for c in BF_FLAGS if c in df.columns]).join(debut, on=TREE_ID, how="left")
@@ -854,7 +852,7 @@ def tree_prior_candidates(df: pl.DataFrame, ctx, rule_c: bool = True) -> pl.Data
     """Allowed tree-level phantom slots: every REAL tree debut x every earlier scaffold visit
     with prior_age >= 1, minus the blocked ones. One row per (tree, prior_measdate)."""
     real = df.filter(pl.col("intro_type").is_null()) if "intro_type" in df.columns else df
-    tree_debut = real.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+    tree_debut = real.pipe(pick, TREE_ID, ["MEASDATE"], "first")
     prior = (
         tree_debut
         .join(scaffold_visits(df, ctx), on=SUBPLOT_ID, how="inner")
@@ -1005,7 +1003,7 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
                .select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
                .with_columns(pl.lit(True).alias("_cen")))
         forest = ctx["visit"].select(SUBPLOT_ID + ["prior_measdate", "_forest_prop", "_micro_prop"])
-        sap = df.select(TREE_ID + ["_bf_sap"]).sort(TREE_ID + ["_bf_sap"]).unique(subset=TREE_ID, keep="first") if "_bf_sap" in df.columns \
+        sap = df.group_by(TREE_ID).agg(pl.col("_bf_sap").min()) if "_bf_sap" in df.columns \
             else df.select(TREE_ID).unique().with_columns(pl.lit(False).alias("_bf_sap"))
         dd = (cand.select(TREE_ID + ["prior_measdate", "MEASDATE"]).unique()
               .join(ctx["dead"], on=TREE_ID, how="inner")
@@ -1027,13 +1025,11 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
     n_cand_slots = slots.select(ckey + ["prior_measdate"]).unique().height
     slot_key = SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"]
     # one phantom per target slot; representative = smallest surviving member (deterministic)
-    rep = (surv.sort(slot_key + ["MEASDATE", "TREE"])
-           .unique(subset=slot_key, keep="first")
+    rep = (surv.pipe(pick, slot_key, ["MEASDATE", "TREE"])
            .select(ckey + ["TREE", "prior_measdate", "prior_age", "prior_sim_year"]))
-    sources = (surv.sort(slot_key + ["MEASDATE", "TREE"])
-               .group_by(slot_key, maintain_order=True)
-               .agg(pl.col("MEASDATE").first().alias("src_measdate"),
-                    pl.col("age_calc").first().alias("src_age_calc"),
+    sources = (surv.group_by(slot_key)
+               .agg(pl.col("MEASDATE").sort_by(["MEASDATE", "TREE"]).first().alias("src_measdate"),
+                    pl.col("age_calc").sort_by(["MEASDATE", "TREE"]).first().alias("src_age_calc"),
                     pl.col("TREE").n_unique().cast(pl.UInt32).alias("n_members"),
                     pl.col("TREE").unique().sort().cast(pl.Utf8).str.join(",").alias("member_trees"))
                .select(empty_src.columns))
@@ -1042,7 +1038,7 @@ def backfill_phantom_cohorts(df: pl.DataFrame, ctx=None):
           f"{n_cand_slots - rep.height:,} blocked (every member individually blocked)")
     if rep.height == 0:
         return df, empty_src
-    src_rows = df.sort(ckey + ["TREE", "intro_type"], nulls_last=False).unique(subset=ckey + ["TREE"], keep="first")
+    src_rows = pick(df, ckey + ["TREE"], ["intro_type"])
     missing = rep.join(src_rows, on=ckey + ["TREE"], how="inner")
     synthetic = _to_synthetic(_phantom_agb(missing, df, "backfill cohorts"))
     print(f"[backfill cohorts] generated {synthetic.height:,} additional synthetic rows")
@@ -1166,10 +1162,9 @@ def check_cohort_continuity(df: pl.DataFrame, age_tol: int = 0) -> int:
     # sim_year is carried for arithmetic only — visits are identified by measdate.
     visits = (
         df.select(subplot_id + ["measdate", "sim_year"]).unique()
-        .sort(subplot_id + ["measdate"])
         .with_columns([
-            pl.col("measdate").shift(1).over(subplot_id).alias("prev_measdate"),
-            pl.col("sim_year").shift(1).over(subplot_id).alias("prev_sim_year"),
+            pl.col("measdate").shift(1).over(subplot_id, order_by="measdate").alias("prev_measdate"),
+            pl.col("sim_year").shift(1).over(subplot_id, order_by="measdate").alias("prev_sim_year"),
         ])
     )
 

@@ -21,8 +21,15 @@ def scan(path, name, findings):
         s = ln.split("#")[0]
         if not inside and "cn-boundary" not in ln and JOIN.search(s) and ("JOIN" in s.upper() or " ON " in s.upper() or "=" in s) and '"' not in s.split("=")[0][-1:]:
             findings.append(f"L1 {name}:{i}: {ln.strip()[:110]}")
+        # D66: no selection or previous-record lookup by row position
+        if name not in ("fia_ids.py", "fia_truth_lint.py", "fia_truth_assemble.py") and re.search(r'keep="(first|last)"|\.with_row_index\(|\.with_row_count\(', s) and "order-ok" not in ln:
+            findings.append(f"L4 {name}:{i}: {ln.strip()[:110]}")
+        if re.search(r"\.(shift|cum_sum|cum_max|cum_min|cum_count)\(", s) and ".over(" in s and "order_by" not in s:
+            findings.append(f"L4 {name}:{i}: {ln.strip()[:110]}")
+        if re.search(r"\.(first|last)\(\)\.alias", s) and "sort_by" not in s:
+            findings.append(f"L4 {name}:{i}: {ln.strip()[:110]}")
         # COND_ID (plot key + CONDID) is a condition only together with its visit
-        if re.search(r"(over|group_by|shift|partition_by)\(\s*COND_ID\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
+        if re.search(r"(over|group_by|shift|partition_by)\(\s*(COND_ID|cond_id_cols)\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
             findings.append(f"L2 {name}:{i}: {ln.strip()[:110]}")
 
 

@@ -33,6 +33,7 @@ import sys
 import duckdb
 import numpy as np
 import polars as pl
+from fia_ids import pick, maybe_shuffle
 
 from cohorts_landis import disturbance_death_expr   # r7 D41: the one disturbance definition
 
@@ -48,10 +49,10 @@ COHORT_KEY = SUBPLOT_ID + ["SPCD", "birth_date"]
 def assign_cohort_ids(df: pl.DataFrame) -> pl.DataFrame:
     """
     For each tree, derive birth_date from estimated_age at its earliest
-    measurement with a valid age, and assign an integer cohort_id to each
+    measurement with a valid age, and give each the natural cohort id
     unique (subplot, SPCD, birth_date) combination.
 
-    Adds columns: birth_date (Date), cohort_id (UInt32).
+    Adds columns: birth_date (Date), cohort_id (the cohort's natural key as text).
     Trees without any estimated_age get null in both columns.
     """
     # Per-tree birth year: use earliest measurement with a valid estimated_age.
@@ -63,8 +64,7 @@ def assign_cohort_ids(df: pl.DataFrame) -> pl.DataFrame:
             pl.col("estimated_age").is_not_nan() &
             (pl.col("estimated_age") > 0)
         )
-        .sort(TREE_ID + ["MEASDATE"])
-        .unique(subset=TREE_ID, keep="first")
+        .pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(
             TREE_ID +
             [(pl.col("MEASDATE") -
@@ -76,14 +76,12 @@ def assign_cohort_ids(df: pl.DataFrame) -> pl.DataFrame:
 
     df = df.join(tree_birth, on=TREE_ID, how="left")
 
-    # Integer cohort_id for each unique COHORT_KEY
+    # cohort_id = the natural cohort key as text (D66: never a row number)
     cohort_ids = (
         df.filter(pl.col("birth_date").is_not_null())
         .select(COHORT_KEY)
         .unique()
-        .sort(COHORT_KEY)
-        .with_row_index("cohort_id")
-        .with_columns(pl.col("cohort_id").cast(pl.UInt32))
+        .with_columns(pl.concat_str([pl.col(c).cast(pl.Utf8) for c in COHORT_KEY], separator="_").alias("cohort_id"))
     )
     df = df.join(cohort_ids, on=COHORT_KEY, how="left")
 
@@ -136,8 +134,7 @@ def build_cohort_intro(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("STATUSCD") == 1) &
             pl.col("cohort_id").is_not_null()
         )
-        .sort(["cohort_id", "MEASDATE"] + TREE_ID)     # r2 M2: full key tie-break
-        .unique(subset=["cohort_id"], keep="first")
+        .pipe(pick, ["cohort_id"], ["MEASDATE"] + TREE_ID)     # r2 M2: full key tie-break
         .select([
             "cohort_id",
             pl.col("MEASDATE").alias("first_measdate"),
@@ -184,9 +181,9 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
         .group_by(["cohort_id", "MEASDATE"])
         .agg([
             pl.len().alias("n_trees_live"),
-            pl.col("_bio").sum().alias("biomass_per_acre"),
-            pl.col("estimated_age").mean().alias("estimated_age_mean"),
-            pl.col("estimated_age").std().alias("estimated_age_sd"),
+            pl.col("_bio").sum().round(6).alias("biomass_per_acre"),          # D66: rounded, so a float sum does not carry the row order
+            pl.col("estimated_age").mean().round(6).alias("estimated_age_mean"),
+            pl.col("estimated_age").std().round(6).alias("estimated_age_sd"),
         ])
     )
 
@@ -251,12 +248,10 @@ def add_cumulative_flags(meas: pl.DataFrame) -> pl.DataFrame:
     measurement where the respective event occurred, forward through all
     subsequent measurements of the same cohort.
     """
-    # r7 D44 (F7-4): the joins before this do not guarantee row order; cum_sum needs date order
-    meas = meas.sort(["cohort_id", "MEASDATE"])
     return meas.with_columns([
-        (pl.col("n_harvested").cum_sum().over("cohort_id") > 0)
+        (pl.col("n_harvested").cum_sum().over("cohort_id", order_by="MEASDATE") > 0)
           .alias("ever_harvested"),
-        (pl.col("n_disturbance_dead").cum_sum().over("cohort_id") > 0)
+        (pl.col("n_disturbance_dead").cum_sum().over("cohort_id", order_by="MEASDATE") > 0)
           .alias("ever_disturbed_dead"),
     ])
 
@@ -280,9 +275,8 @@ def check_tree_continuity(df: pl.DataFrame, age_tol: float = 0.5) -> int:
     subp_prev = (
         df.select(SUBPLOT_ID + ["MEASDATE"])
         .unique()
-        .sort(SUBPLOT_ID + ["MEASDATE"])
         .with_columns(
-            pl.col("MEASDATE").shift(1).over(SUBPLOT_ID).alias("prev_measdate"),
+            pl.col("MEASDATE").shift(1).over(SUBPLOT_ID, order_by="MEASDATE").alias("prev_measdate"),
         )
     )
 
@@ -446,7 +440,6 @@ if __name__ == "__main__":
     # (constant per tree) instead of the raw per-visit SPCD, which flips between confused
     # species and split one tree over two cohorts; only the needed columns are loaded and
     # states are processed one at a time (cohorts never cross a subplot), with cohort_id
-    # offset per state so ids stay unique.
     import argparse
     import dbconn
     a = dbconn.add_db_args(argparse.ArgumentParser(description="cohort tracking")).parse_args()
@@ -456,15 +449,13 @@ if __name__ == "__main__":
     cols = ", ".join(LOAD_COLS)
     states = [r[0] for r in con.execute(
         "SELECT DISTINCT STATECD FROM curated_trees ORDER BY 1").fetchall()]
-    parts, offset = [], 0
+    parts = []
     for st in states:
         print(f"\n----- STATECD {st} -----")
         df = con.execute(f"SELECT {cols}, spcd_resolved AS SPCD FROM curated_trees "
                          f"WHERE STATECD = {int(st)}").pl()
         print(f"       {df.height:,} rows, {len(df.columns)} columns")
         cohorts = build_cohorts(df)
-        cohorts = cohorts.with_columns((pl.col("cohort_id") + offset).cast(pl.UInt32))
-        offset = int(cohorts["cohort_id"].max() or offset) + 1
         tab = f"_ct_{st}"
         con.register("_cohorts_view", cohorts)
         con.execute(f"CREATE OR REPLACE TABLE {tab} AS SELECT * FROM _cohorts_view")

@@ -83,8 +83,8 @@ def load54(db: str) -> pl.DataFrame:
                        (degrees(atan2(sum(wt * sin(radians(ASPECT))) FILTER (WHERE ASPECT IS NOT NULL),
                                       sum(wt * cos(radians(ASPECT))) FILTER (WHERE ASPECT IS NOT NULL))) + 360) % 360 END aspect,
                   sum(wt * canopy) FILTER (WHERE canopy IS NOT NULL) / nullif(sum(wt) FILTER (WHERE canopy IS NOT NULL), 0) canopy_pct,
-                  arg_max(FORTYPCD, wt) FILTER (WHERE FORTYPCD IS NOT NULL) fortypcd, arg_max(SITECLCD, wt) FILTER (WHERE SITECLCD IS NOT NULL) siteclcd,
-                  arg_max(PHYSCLCD, wt) FILTER (WHERE PHYSCLCD IS NOT NULL) physclcd, arg_max(STDORGCD, wt) FILTER (WHERE STDORGCD IS NOT NULL) stdorgcd,
+                  arg_max(FORTYPCD, struct_pack(w := wt, v := FORTYPCD)) FILTER (WHERE FORTYPCD IS NOT NULL) fortypcd, arg_max(SITECLCD, struct_pack(w := wt, v := SITECLCD)) FILTER (WHERE SITECLCD IS NOT NULL) siteclcd,
+                  arg_max(PHYSCLCD, struct_pack(w := wt, v := PHYSCLCD)) FILTER (WHERE PHYSCLCD IS NOT NULL) physclcd, arg_max(STDORGCD, struct_pack(w := wt, v := STDORGCD)) FILTER (WHERE STDORGCD IS NOT NULL) stdorgcd,
                   {", ".join(f"sum(wt * (len(list_filter(trt, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) trt_s{c}" for c in (10, 20, 30, 40, 50))},
                   {", ".join(f"sum(wt * (len(list_filter(dst, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) dst_s{c}" for c in (10, 20, 30, 40, 50, 60, 70, 80, 90))}
            FROM bw GROUP BY ALL),
@@ -130,11 +130,11 @@ def add_design_levels(df: pl.DataFrame, k) -> pl.DataFrame:
             .with_columns((pl.col('_thr') * 10).floor() / 10).sort(['designcd', '_tp'], descending=[False, True]))
     lv = lv.with_columns(pl.col('_tp').rank('ordinal', descending=True).over('designcd').alias('_lvl'))
     print('design tally levels (DESIGNCD, TPA_UNADJ, threshold in, n, level):', lv.select('designcd', '_tp', '_thr', '_n', '_lvl').rows(), flush=True)
-    dz = lv.group_by('designcd').agg(pl.col('_thr').filter(pl.col('_lvl') == 1).first().alias('thr_micro'),
-                                     pl.col('_thr').filter(pl.col('_lvl') == 2).first().alias('_t2'))
+    dz = lv.group_by('designcd').agg(pl.col('_thr').filter(pl.col('_lvl') == 1).max().alias('thr_micro'),
+                                     pl.col('_thr').filter(pl.col('_lvl') == 2).max().alias('_t2'))
     dz = dz.with_columns(pl.coalesce(['_t2', 'thr_micro']).alias('thr_subp')).drop('_t2')
-    deb = (df.filter(pl.col('obs')).sort(k + ['measdate']).group_by(k).agg(pl.col('designcd').first().alias('_dd'),
-                                                                          pl.col('tpa').first().round(3).alias('_tp')))
+    deb = (df.filter(pl.col('obs')).group_by(k).agg(pl.col('designcd').sort_by('measdate').first().alias('_dd'),
+                                                                          pl.col('tpa').sort_by('measdate').first().round(3).alias('_tp')))
     deb = deb.join(lv.select(pl.col('designcd').alias('_dd'), '_tp', '_thr'), on=['_dd', '_tp'], how='left')
     deb = deb.join(dz.rename({'designcd': '_dd'}), on='_dd', how='left').with_columns(pl.col('_thr').fill_null(pl.col('thr_subp')).alias('thr_in'))
     return df.drop([c for c in ('thr_in', 'thr_micro', 'thr_subp', 'nb_thr') if c in df.columns]).join(
@@ -145,7 +145,7 @@ def add_neighbours(df: pl.DataFrame) -> pl.DataFrame:
     visit (both records >= the design's subplot threshold nb_thr, real), and their counts. The local growth environment, observable whenever the visit happened."""
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']; sk, pk = k[:5], k[:4]
     r = (df.filter(pl.col('obs')).sort(k + ['measdate'])
-           .with_columns(pl.col('dia').shift(1).over(k).alias('_d0'), pl.col('measdate').shift(1).over(k).alias('_t0'))
+           .with_columns(pl.col('dia').shift(1).over(k, order_by='measdate').alias('_d0'), pl.col('measdate').shift(1).over(k, order_by='measdate').alias('_t0'))
            .with_columns(((pl.col('measdate') - pl.col('_t0')).dt.total_days() / 365.25).alias('_dt'))
            .filter((pl.col('dia') >= pl.col('nb_thr')) & (pl.col('_d0') >= pl.col('nb_thr')) & (pl.col('_dt') > 0.5))
            .with_columns(((pl.col('dia').log() - pl.col('_d0').log()) / pl.col('_dt')).clip(-0.05, 0.5).alias('_inc'))
@@ -164,21 +164,20 @@ def add_climate(df: pl.DataFrame, prism: str) -> pl.DataFrame:
     """Per slot: mean yearly tmean / ppt / vpdmax of its L4 over the interval ending at the slot (calendar years (prev slot, slot], first slot:
     the 5 years before it; clamped to the PRISM range), as anomalies against the L4 1991-2020 normal; plus the normals themselves (D51)."""
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']
-    d = df.with_row_index('_r').sort(k + ['measdate'])
-    d = d.with_columns(pl.col('measdate').dt.year().alias('_ye'), pl.col('measdate').shift(1).over(k).dt.year().alias('_yp'))
+    d = df.with_columns(pl.col('measdate').dt.year().alias('_ye'), pl.col('measdate').shift(1).over(k, order_by='measdate').dt.year().alias('_yp'))
     d = d.with_columns(pl.coalesce([pl.col('_yp') + 1, pl.col('_ye') - 4]).alias('_ys'))
     c = duckdb.connect(); c.execute(f"ATTACH '{prism}' AS p (READ_ONLY)")
     c.execute("""CREATE TEMP TABLE y AS SELECT EPA_L4_ID l4, YEAR yr, CAST(CAST(tmean_mean AS VARCHAR) AS DOUBLE) tm, CAST(CAST(ppt_mean AS VARCHAR) AS DOUBLE) pp,
                  CAST(CAST(vpdmax_mean AS VARCHAR) AS DOUBLE) vp FROM p.EPA_L4_yearly""")
     c.execute("CREATE TEMP TABLE nrm AS SELECT l4, avg(tm) tm_n, avg(pp) pp_n, avg(vp) vp_n FROM y WHERE yr BETWEEN 1991 AND 2020 GROUP BY l4")
     ymax = c.execute("SELECT max(yr) FROM y").fetchone()[0]
-    sl = d.select('_r', pl.col('epa_l4').alias('l4'), pl.col('_ys').clip(upper_bound=ymax).alias('ys'), pl.col('_ye').clip(upper_bound=ymax).alias('ye'))
+    sl = d.select(*k, 'measdate', pl.col('epa_l4').alias('l4'), pl.col('_ys').clip(upper_bound=ymax).alias('ys'), pl.col('_ye').clip(upper_bound=ymax).alias('ye'))
     c.register('sl', sl.to_arrow())
-    cl = pl.from_arrow(c.execute("""SELECT sl._r, avg(y.tm) - n.tm_n tm_anom, avg(y.pp) / n.pp_n - 1 pp_anom, avg(y.vp) - n.vp_n vp_anom,
+    cl = pl.from_arrow(c.execute(f"""SELECT {', '.join('sl.' + x for x in k)}, sl.measdate, avg(y.tm) - n.tm_n tm_anom, avg(y.pp) / n.pp_n - 1 pp_anom, avg(y.vp) - n.vp_n vp_anom,
                                    n.tm_n, n.pp_n, n.vp_n
                                    FROM sl JOIN y ON y.l4 = sl.l4 AND y.yr BETWEEN least(sl.ys, sl.ye) AND sl.ye JOIN nrm n ON n.l4 = sl.l4
-                                   GROUP BY sl._r, n.tm_n, n.pp_n, n.vp_n""").arrow())
-    return df.with_row_index('_r').join(cl, on='_r', how='left').drop('_r')
+                                   GROUP BY ALL""").arrow())
+    return df.join(cl, on=k + ['measdate'], how='left')
 
 def resplit_r2(split: str, key: str) -> str:
     """D50 fresh split: the old TEST is retired (-> train); the new TEST = old-train plots with crc32(key|r2) % 100 < 22; VAL unchanged."""
@@ -243,7 +242,7 @@ def main():
 
     # benchmark trees (VAL for model choices, TEST once): microplot debut below 3 in, >= 3 real visits, a visit < 3 in and a later one >= 3 in
     r = df.filter(pl.col('obs') & pl.col('split').is_in(['val', 'test'])).sort(k + ['measdate'])
-    r = r.with_columns(pl.col('dia').ge(PSEUDO_IN).cum_sum().over(k).alias('_nvis'))
+    r = r.with_columns(pl.col('dia').ge(PSEUDO_IN).cum_sum().over(k, order_by='measdate').alias('_nvis'))
     elig = (r.group_by(k).agg(pl.col('tpa0').first(), pl.col('thr_in').first(), pl.col('thr_micro').first(), pl.col('dia0').first(), pl.col('n_real').first(),
                               (pl.col('_nvis') == 0).sum().alias('n_hid'), (pl.col('_nvis') > 0).sum().alias('n_vis'))
               .filter((pl.col('thr_in') == pl.col('thr_micro')) & (pl.col('dia0') < PSEUDO_IN) & (pl.col('n_real') >= 3)

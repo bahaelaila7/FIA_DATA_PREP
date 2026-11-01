@@ -132,58 +132,62 @@ def build_plot_canon_map(con, max_iter: int = 50) -> int:
     Returns the plot_canon_map row count."""
     con.execute("""CREATE OR REPLACE TEMP VIEW ANNUAL_INV AS
         SELECT DISTINCT STATECD, INVYR FROM fia.main.SURVEY WHERE ANN_INVENTORY = 'Y' AND P3_OZONE_IND = 'N'""")
-    con.execute("""CREATE OR REPLACE TEMP TABLE _canon_ap AS
-        SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.LAT, P.LON, P.ELEV,
-               MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON, 0), 6) AS BIGINT),
-                         CAST(COALESCE(NULLIF(P.MEASDAY, 0), 15) AS BIGINT)) AS md
-        FROM fia.main.PLOT P JOIN ANNUAL_INV A ON A.STATECD = P.STATECD AND A.INVYR = P.INVYR""")
+    # the natural visit id; PREV_PLT_CN is read once, here, as FIA's claim about which visit came before (D66)
+    VID = "CAST({a}.STATECD AS VARCHAR) || '_' || CAST({a}.UNITCD AS VARCHAR) || '_' || CAST({a}.COUNTYCD AS VARCHAR) || '_' || CAST({a}.PLOT AS VARCHAR) || '_' || CAST({a}.INVYR AS VARCHAR)"
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE _canon_ap AS
+        WITH ap AS (SELECT P.CN, P.PREV_PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.LAT, P.LON, P.ELEV,
+                           MAKE_DATE(CAST(P.MEASYEAR AS BIGINT), CAST(COALESCE(NULLIF(P.MEASMON, 0), 6) AS BIGINT),
+                                     CAST(COALESCE(NULLIF(P.MEASDAY, 0), 15) AS BIGINT)) AS md
+                    FROM fia.main.PLOT P JOIN ANNUAL_INV A ON A.STATECD = P.STATECD AND A.INVYR = P.INVYR)
+        SELECT a.CN, a.STATECD, a.UNITCD, a.COUNTYCD, a.PLOT, a.INVYR, a.LAT, a.LON, a.ELEV, a.md, {VID.format(a='a')} AS vid,
+               {VID.format(a='b')} AS prev_vid
+        FROM ap a LEFT JOIN ap b ON b.CN = a.PREV_PLT_CN   -- cn-boundary""")
     con.execute(f"""CREATE OR REPLACE TEMP TABLE plot_renumber AS
-        WITH e AS (SELECT a.CN, a.STATECD, a.UNITCD, a.COUNTYCD, a.PLOT, a.INVYR, a.md,
+        WITH e AS (SELECT a.CN, a.vid, a.STATECD, a.UNITCD, a.COUNTYCD, a.PLOT, a.INVYR, a.md,
                           b.UNITCD AS UNITCD_PREV, b.COUNTYCD AS COUNTYCD_PREV, b.PLOT AS PLOT_PREV, b.INVYR AS INVYR_PREV
-                   FROM _canon_ap a JOIN _canon_ap b ON b.CN = a.PREV_PLT_CN
+                   FROM _canon_ap a JOIN _canon_ap b ON b.vid = a.prev_vid
                    WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS DISTINCT FROM (b.UNITCD, b.COUNTYCD, b.PLOT)),
-        t AS (SELECT e.CN, count(*) AS n_pairs, count(*) FILTER (WHERE abs(x.PREVDIA - o.DIA) <= 0.05) AS n_prevdia_ok,
+        t AS (SELECT e.vid, count(*) AS n_pairs, count(*) FILTER (WHERE abs(x.PREVDIA - o.DIA) <= 0.05) AS n_prevdia_ok,
                      count(*) FILTER (WHERE x.SPCD = o.SPCD) AS n_same_spcd
               FROM e JOIN fia.main.TREE x ON x.STATECD = e.STATECD AND x.UNITCD = e.UNITCD AND x.COUNTYCD = e.COUNTYCD
                           AND x.PLOT = e.PLOT AND x.INVYR = e.INVYR
                      JOIN fia.main.TREE o ON o.STATECD = e.STATECD AND o.UNITCD = e.UNITCD_PREV AND o.COUNTYCD = e.COUNTYCD_PREV
                           AND o.PLOT = e.PLOT_PREV AND o.INVYR = e.INVYR_PREV AND o.SUBP = x.SUBP AND o.TREE = x.TREE
               WHERE x.PREVDIA IS NOT NULL GROUP BY 1)
-        SELECT e.*, COALESCE(t.n_pairs, 0) AS n_pairs, COALESCE(t.n_prevdia_ok, 0) AS n_prevdia_ok, COALESCE(t.n_same_spcd, 0) AS n_same_spcd,
-               COALESCE(t.n_pairs >= {RENUM_MIN_PAIRS} AND t.n_prevdia_ok >= {RENUM_MIN_SHARE} * t.n_pairs, FALSE) AS accepted
-        FROM e LEFT JOIN t USING (CN)""")
+        SELECT e.* EXCLUDE (vid), COALESCE(t.n_pairs, 0) AS n_pairs, COALESCE(t.n_prevdia_ok, 0) AS n_prevdia_ok, COALESCE(t.n_same_spcd, 0) AS n_same_spcd,
+               COALESCE(t.n_pairs >= {RENUM_MIN_PAIRS} AND t.n_prevdia_ok >= {RENUM_MIN_SHARE} * t.n_pairs, FALSE) AS accepted, e.vid
+        FROM e LEFT JOIN t USING (vid)""")
     def _roots(tab: str):
         con.execute("""CREATE OR REPLACE TEMP TABLE _canon_prev AS
-            SELECT a.CN, CASE WHEN EXISTS (SELECT 1 FROM _canon_ap b WHERE b.CN = a.PREV_PLT_CN)
-                               AND COALESCE(r.accepted, TRUE) THEN a.PREV_PLT_CN END AS prev
-            FROM _canon_ap a LEFT JOIN plot_renumber r ON r.CN = a.CN""")
-        con.execute(f"CREATE OR REPLACE TEMP TABLE {tab} AS SELECT a.CN, a.CN AS root FROM _canon_ap a")
+            SELECT a.vid, CASE WHEN COALESCE(r.accepted, TRUE) THEN a.prev_vid END AS prev
+            FROM _canon_ap a LEFT JOIN plot_renumber r ON r.vid = a.vid""")
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {tab} AS SELECT a.vid, a.vid AS root FROM _canon_ap a")
         for _ in range(max_iter):
-            n = con.execute(f"""SELECT count(*) FROM {tab} r JOIN _canon_prev p ON p.CN = r.root
+            n = con.execute(f"""SELECT count(*) FROM {tab} r JOIN _canon_prev p ON p.vid = r.root
                                 WHERE p.prev IS NOT NULL""").fetchone()[0]
             if n == 0:
                 return
             con.execute(f"""CREATE OR REPLACE TEMP TABLE {tab} AS
-                SELECT r.CN, COALESCE(p.prev, r.root) AS root FROM {tab} r JOIN _canon_prev p ON p.CN = r.root""")
-        sys.exit("[dbconn] PREV_PLT_CN chain did not terminate (cycle?)")
+                SELECT r.vid, COALESCE(p.prev, r.root) AS root FROM {tab} r JOIN _canon_prev p ON p.vid = r.root""")
+        sys.exit("[dbconn] plot chain did not terminate (cycle?)")
 
-    _roots("_canon_root")          # chains by PREV_PLT_CN only (r8 D48)
+    _roots("_canon_root")          # chains by FIA's links only (r8 D48), on natural visit ids
     con.execute("""CREATE OR REPLACE TEMP TABLE plot_canon_map AS
-        SELECT a.CN, a.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
+        SELECT a.CN, a.vid, a.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
                a.UNITCD AS UNITCD_RAW, a.COUNTYCD AS COUNTYCD_RAW, a.PLOT AS PLOT_RAW, a.INVYR,
                'prev_plt_cn' AS reason
-        FROM _canon_root r JOIN _canon_ap a ON a.CN = r.CN JOIN _canon_ap o ON o.CN = r.root
+        FROM _canon_root r JOIN _canon_ap a ON a.vid = r.vid JOIN _canon_ap o ON o.vid = r.root
         WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS DISTINCT FROM (o.UNITCD, o.COUNTYCD, o.PLOT)""")
     # D28: one location per plot = its most recent annual visit (chains with a remapped visit)
     con.execute("""CREATE OR REPLACE TEMP TABLE plot_loc_visit AS
-        WITH rc AS (SELECT r.root FROM _canon_root r JOIN plot_canon_map m ON m.CN = r.CN GROUP BY 1),
-        last AS (SELECT r.root, arg_max(a.CN, a.md) lcn FROM _canon_root r JOIN rc USING (root)
-                 JOIN _canon_ap a ON a.CN = r.CN GROUP BY 1)
-        SELECT r.CN, o.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
+        WITH rc AS (SELECT r.root FROM _canon_root r JOIN plot_canon_map m ON m.vid = r.vid GROUP BY 1),
+        last AS (SELECT r.root, arg_max(a.vid, struct_pack(m := a.md, y := a.INVYR)) lvid FROM _canon_root r JOIN rc USING (root)
+                 JOIN _canon_ap a ON a.vid = r.vid GROUP BY 1)
+        SELECT a.CN, a.vid, o.STATECD, o.UNITCD, o.COUNTYCD, o.PLOT,
                l.UNITCD AS LOC_UNITCD, l.COUNTYCD AS LOC_COUNTYCD, l.PLOT AS LOC_PLOT, l.LAT, l.LON, l.ELEV,
                a.UNITCD AS UNITCD_RAW, a.COUNTYCD AS COUNTYCD_RAW, a.PLOT AS PLOT_RAW, a.INVYR
-        FROM _canon_root r JOIN last USING (root) JOIN _canon_ap l ON l.CN = last.lcn
-        JOIN _canon_ap o ON o.CN = r.root JOIN _canon_ap a ON a.CN = r.CN""")
+        FROM _canon_root r JOIN last USING (root) JOIN _canon_ap l ON l.vid = last.lvid
+        JOIN _canon_ap o ON o.vid = r.root JOIN _canon_ap a ON a.vid = r.vid""")
     dup = con.execute("""SELECT count(*) FROM (SELECT P.STATECD, COALESCE(m.UNITCD, P.UNITCD), COALESCE(m.COUNTYCD, P.COUNTYCD),
                              COALESCE(m.PLOT, P.PLOT), P.INVYR FROM fia.main.PLOT P
                              JOIN ANNUAL_INV A ON A.STATECD = P.STATECD AND A.INVYR = P.INVYR
@@ -228,11 +232,11 @@ def connect(out_db: str, fiadb: str, curated_db: str | None = None) -> duckdb.Du
         # M-2 (r5): plot-keyed raw tables carry the CANONICAL plot key (see build_plot_canon_map)
         on = t == "PLOT" or t in pltcn
         if t in keyed and on:
-            rep = ", ".join(f"CASE WHEN m.CN IS NULL THEN t.{k} ELSE CAST(m.{k} AS {ktype[t][k]}) END AS {k}"
+            rep = ", ".join(f"CASE WHEN m.INVYR IS NULL THEN t.{k} ELSE CAST(m.{k} AS {ktype[t][k]}) END AS {k}"
                             for k in ("UNITCD", "COUNTYCD", "PLOT"))
             loc = ""
             if t == "PLOT":   # D28: one location per plot (its most recent visit)
-                rep += ", " + ", ".join(f"CASE WHEN lv.CN IS NULL THEN t.{k} ELSE lv.{k} END AS {k}"
+                rep += ", " + ", ".join(f"CASE WHEN lv.INVYR IS NULL THEN t.{k} ELSE lv.{k} END AS {k}"
                                         for k in ("LAT", "LON", "ELEV"))
                 loc = ("LEFT JOIN plot_loc_visit lv ON lv.STATECD = t.STATECD AND lv.UNITCD_RAW = t.UNITCD "
                        "AND lv.COUNTYCD_RAW = t.COUNTYCD AND lv.PLOT_RAW = t.PLOT AND lv.INVYR = t.INVYR")

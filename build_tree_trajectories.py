@@ -35,6 +35,7 @@ import sys
 
 import duckdb
 import polars as pl
+from fia_ids import pick, maybe_shuffle
 
 from fia_curation_v3 import _next_visit   # shared next-visit / nonforest lookup (r2 M6)
 from cohorts_landis import (
@@ -201,7 +202,7 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
         .rename({"MEASDATE": "prior_measdate", "sim_year": "prior_sim_year"})
     )
 
-    tree_debut = live.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+    tree_debut = live.pipe(pick, TREE_ID, ["MEASDATE"], "first")
     prior = (
         tree_debut.join(visit_sim, on=SUBPLOT_ID, how="left")
         .filter(pl.col("prior_measdate") < pl.col("MEASDATE"))
@@ -221,8 +222,7 @@ def backfill_phantom_full(live: pl.DataFrame, visits: pl.DataFrame, ctx=None) ->
     )
     missing = (
         prior.join(existing, on=TREE_ID + ["prior_measdate"], how="left")
-        .filter(pl.col("_e").is_null()).drop("_e")
-        .unique(subset=TREE_ID + ["prior_measdate"], keep="first")
+        .filter(pl.col("_e").is_null()).drop("_e").unique()
     )
     n = missing.height
     n_plots = missing.select(PLOT_KEY).unique().height if n else 0
@@ -397,7 +397,7 @@ def interpolate_gaps(live: pl.DataFrame, visits: pl.DataFrame,
         )
 
     # sim_year + integer age_calc from the subplot axis
-    debut = real.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first").select(
+    debut = real.pipe(pick, TREE_ID, ["MEASDATE"], "first").select(
         TREE_ID + [pl.col("age_calc").alias("_dage"),
                    pl.col("sim_year").alias("_dsy")])
     g = (
@@ -447,7 +447,7 @@ def add_alt_age_axes(body: pl.DataFrame) -> pl.DataFrame:
     """
     debut = (
         body.filter(pl.col("intro_type") == "real")
-        .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+        .pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID +
                 [pl.col("sim_year").alias("_dsy0")] +
                 [pl.col(src).round(0, mode="half_away_from_zero").alias(f"_d_{out}") for src, out in ALT_AGE_SOURCES])
@@ -478,8 +478,8 @@ def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
     cols = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "AGENTCD",
                       "dist_death_def", "censor_last_measdate", "censor_last_reason"]
     first_dead = (full.filter(pl.col("STATUSCD").is_in([2, 3]))
-                  .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first").select(cols))
-    last_live = (full.sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last").select(cols)
+                  .pipe(pick, TREE_ID, ["MEASDATE"], "first").select(cols))
+    last_live = (full.pipe(pick, TREE_ID, ["MEASDATE"], "last").select(cols)
                  .join(first_dead.select(TREE_ID), on=TREE_ID, how="anti"))
     last = pl.concat([first_dead, last_live]).rename({"MEASDATE": "terminal_measdate"})
     # was the subplot visited strictly after the tree's last record, and was that next
@@ -560,7 +560,7 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
         full.filter(pl.col("tree_fate").is_in(["silvicultural_death", "harvest_inferred"])
                     & ~pl.col("rerecord_dead").fill_null(False)
                     & ~pl.col("first_record_dead").fill_null(False))
-        .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="first")
+        .pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID + ["MEASDATE"])
         .rename({"MEASDATE": "cut_measdate"})
     )
@@ -574,7 +574,7 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     # each cut tree's last ALIVE ba + age (pre-cut)
     last_alive = (
         full.filter(pl.col("STATUSCD") == 1)
-        .sort(TREE_ID + ["MEASDATE"]).unique(subset=TREE_ID, keep="last")
+        .pipe(pick, TREE_ID, ["MEASDATE"], "last")
         .select(TREE_ID + [pl.col("ba").alias("_precut_ba"),
                            pl.col("estimated_age").alias("_precut_age"),
                            pl.col("MEASDATE").alias("_last_alive_measdate")])
@@ -596,8 +596,7 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
     denom = (
         removed.join(live_ba, on=SUBPLOT_ID, how="left")
         .filter(pl.col("MEASDATE") < pl.col("cut_measdate"))
-        .sort(SUBPLOT_ID + ["cut_measdate", "MEASDATE"])
-        .group_by(SUBPLOT_ID + ["cut_measdate"]).agg(pl.col("live_ba").last().alias("precut_live_ba"))
+        .group_by(SUBPLOT_ID + ["cut_measdate"]).agg(pl.col("live_ba").sort_by("MEASDATE").last().alias("precut_live_ba"))
     )
 
     ev = (
@@ -724,8 +723,7 @@ def restamp_synthetic_rows(body: pl.DataFrame, vattr: pl.DataFrame) -> pl.DataFr
     """Phantom / gap rows: VISIT_ATTRS from their own visit (visit_attributes), and estimated_age
     = the tree's propagated age at that date (debut real estimated_age + elapsed years). Real
     rows are unchanged."""
-    debut = (body.filter(pl.col("intro_type") == "real").sort(TREE_ID + ["MEASDATE"])
-             .unique(subset=TREE_ID, keep="first")
+    debut = (body.filter(pl.col("intro_type") == "real").pipe(pick, TREE_ID, ["MEASDATE"], "first")
              .select(TREE_ID + [pl.col("MEASDATE").alias("_d_md"), pl.col("estimated_age").alias("_d_age")]))
     syn = pl.col("intro_type") != "real"
     body = body.join(vattr, on=SUBPLOT_ID + ["MEASDATE"], how="left").join(debut, on=TREE_ID, how="left")

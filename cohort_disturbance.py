@@ -138,7 +138,7 @@ def compute(df, timber_only: bool = False, scaffold=None):
         if nbad:
             raise ValueError(f"cohort_disturbance.compute: {nbad} trajectory visits disagree with the scaffold sim_year")
         n0 = visits.height
-        visits = pl.concat([visits, sc.select(visits.columns)]).unique(subset=SUBPLOT_ID + ["measdate"], keep="first")
+        visits = pl.concat([visits, sc.select(visits.columns).join(visits, on=SUBPLOT_ID + ["measdate"], how="anti")])
         print(f"[visits] {visits.height - n0:,} scaffold visits without a trajectory row added to the visit axis (D42)")
     visits = (
         visits
@@ -153,8 +153,9 @@ def compute(df, timber_only: bool = False, scaffold=None):
     alive_all = alive
     if timber_only:
         alive = alive.filter(pl.col("_timber"))
-    rem = df.select(COHORT_ID[:5] + ["tree", "removal_measdate", "removal_counted", "terminal_fate"]).unique(
-        subset=SUBPLOT_ID + ["tree"], keep="first")
+    rem = df.select(COHORT_ID[:5] + ["tree", "removal_measdate", "removal_counted", "terminal_fate"]).unique()
+    if rem.select(SUBPLOT_ID + ["tree"]).is_duplicated().any():
+        raise ValueError("a tree carries two removal states")
 
     # PAIR consecutive visits: a tree alive at vrank_prev, its state at vrank (= vrank_prev+1)
     prev = (

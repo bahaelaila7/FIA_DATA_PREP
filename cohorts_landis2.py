@@ -39,6 +39,7 @@ import sys
 
 import duckdb
 import polars as pl
+from fia_ids import pick, maybe_shuffle
 
 PLOT_KEY   = ["STATECD", "UNITCD", "COUNTYCD", "PLOT"]
 SUBPLOT_ID = ["STATECD", "UNITCD", "COUNTYCD", "PLOT", "SUBP"]
@@ -233,8 +234,7 @@ def compute_sim_year_ages(df: pl.DataFrame) -> pl.DataFrame:
 
     # Per-tree debut: rounded age and sim_year at first measurement
     debut = (
-        df.sort(TREE_ID + ["MEASDATE"])
-        .unique(subset=TREE_ID, keep="first")
+        df.pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID + [
             pl.col("age_calc").alias("_debut_age"),
             pl.col("sim_year").alias("_debut_sim_year"),
@@ -272,15 +272,15 @@ def estimate_sapling_growth_rates(df: pl.DataFrame) -> tuple:
       grp_rates  : (spgrpcd,        epa_l3) → rate
       glb_rates  : (spgrpcd)                → rate
     """
-    srt = df.sort(TREE_ID + ["MEASDATE"])
+    srt = df
 
     first = (
-        srt.unique(subset=TREE_ID, keep="first")
+        srt.pipe(pick, TREE_ID, ["MEASDATE"], "first")
         .select(TREE_ID + [pl.col("age_calc").alias("first_age"),
                             pl.col("agb").alias("first_agb")])
     )
     last = (
-        srt.unique(subset=TREE_ID, keep="last")
+        srt.pipe(pick, TREE_ID, ["MEASDATE"], "last")
         .select(TREE_ID + [pl.col("age_calc").alias("last_age"),
                             pl.col("agb").alias("last_agb")])
     )
@@ -347,8 +347,7 @@ def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
     """
     # One row per tree at its earliest measurement
     tree_debut = (
-        df.sort(TREE_ID + ["MEASDATE"])
-        .unique(subset=TREE_ID, keep="first")
+        df.pipe(pick, TREE_ID, ["MEASDATE"], "first")
     )
 
     # All distinct subplot measurement visits (sim_year for integer age arithmetic)
@@ -385,8 +384,7 @@ def backfill_phantom_cohorts(df: pl.DataFrame) -> pl.DataFrame:
         .filter(pl.col("_exists").is_null())
         .drop("_exists")
         # Multiple trees may require the same slot — keep one representative
-        .unique(subset=SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"],
-                keep="first")
+        .pipe(pick, SUBPLOT_ID + ["species_symbol", "prior_measdate", "prior_age"], ["TREE"])
     )
 
     n_slots = missing.height
@@ -466,9 +464,8 @@ def check_cohort_continuity(df: pl.DataFrame, age_tol: int = 1) -> int:
     # Previous subplot measdate via shift-within-group
     prev = (
         df.select(subplot_id + ["measdate"]).unique()
-        .sort(subplot_id + ["measdate"])
         .with_columns(
-            pl.col("measdate").shift(1).over(subplot_id).alias("prev_measdate")
+            pl.col("measdate").shift(1).over(subplot_id, order_by="measdate").alias("prev_measdate")
         )
     )
     cohorts = cohorts.join(prev, on=subplot_id + ["measdate"], how="left")

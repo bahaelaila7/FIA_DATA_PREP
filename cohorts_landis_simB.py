@@ -24,6 +24,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import argparse
 
 import polars as pl
+from fia_ids import pick, maybe_shuffle
 
 import dbconn
 
@@ -79,8 +80,7 @@ def build(con) -> pl.DataFrame:
     nu = c1.IS_NATURAL_MODEL
     kb = c1.IS_KNOWN_BIAS
     src = (df.group_by(grp + ["_age_source"]).agg(pl.col("agb").sum().alias("_a"))
-             .sort(grp + ["_a", "_age_source"], descending=[False] * len(grp) + [True, False], nulls_last=True)
-             .unique(subset=grp, keep="first")
+             .pipe(pick, grp, ["_a", "_age_source"], descending=[True, False], nulls_last=True)
              .select(grp + [pl.col("_age_source").alias("age_source_major")]))
     df = (df.group_by(grp, maintain_order=True)
             .agg(pl.col("agb").sum().alias("agb"),

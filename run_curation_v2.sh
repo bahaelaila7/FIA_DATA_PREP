@@ -106,6 +106,8 @@ for i in "${!STEPS[@]}"; do
   fi
   if (( n >= 9 )); then mk=(--db "$FIA_SIMB_DB" --curated-db "$FIA_CURATED_DB"); else mk=(--db "$FIA_CURATED_DB"); fi
   nice -n 10 "$PY" -I slim_guard.py mark "${mk[@]}" --step "$n" --script "${STEPS[$i]%% *}"
+  # row-order test (D66): every table is rewritten in a random order before the next step reads it
+  if [[ -n "${FIA_SHUFFLE_SEED:-}" ]]; then "$PY" -I fia_ids.py shuffle --db "$out" --seed "$((FIA_SHUFFLE_SEED + n))"; fi
 done
 
 if [[ -n "$SLIM_OUT" ]] && (( SLIM_STEP >= FROM_STEP && SLIM_STEP <= TO_STEP )); then
