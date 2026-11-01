@@ -513,7 +513,7 @@ def stand_totals(model, seq, n_draws=50, K=100, by=('statecd', 'unitcd', 'county
     every tree-visit gets its expansion (see `expansion`); TPA and basal area (ft2/ac = 0.005454 DIA^2 x expansion) are summed per
     `by` (+ `group_cols`) and summarised over draws (mean, 10 / 90 %). Saplings (DIA below the design's subplot-level threshold, thr_subp)
     and larger trees are reported separately. Slots outside a tree's sampled span contribute nothing (not completed)."""
-    B, _, sq = build(seq, model.vocab)
+    B, _, sq = getattr(model, 'build', build)(seq, model.vocab)
     L = sample_lineages(model, B, n_draws=n_draws, K=K)
     ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
     real = (sq.slot_kind == 'real').to_numpy() & ~(sq.hidden.fillna(False).to_numpy(bool) if 'hidden' in sq else np.zeros(len(sq), bool))
@@ -595,7 +595,7 @@ def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True)
 
 def predictions(model, bb, K=100, w_int=None):
-    B, _, sq = build(bb, model.vocab)
+    B, _, sq = getattr(model, 'build', build)(bb, model.vocab)
     R = impute(model, B, K, w_int=w_int)
     ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
     for k in ('pE', 'pDie', 'pCut', 'lD', 'lH', 'q10', 'q90', 'BA', 'lD_u'): sq[f'nim_{k}'] = R[k][ti, po].numpy()

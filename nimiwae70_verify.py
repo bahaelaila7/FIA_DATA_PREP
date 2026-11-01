@@ -86,4 +86,16 @@ check('sampled lineages have no tree before birth', float(np.nansum(L['exists'][
 Pr = M.impute(young, B8, K=16, nsamp=20)
 lim = torch.sigmoid(A.KAPPA_B * aY[:4].detach())
 check('P(exists) never exceeds the birth step before birth', bool((Pr['pE'][:, :4] <= lim + 1e-5).all()), f'limit by slot {[round(float(x), 5) for x in lim]}')
+# 9. a tree cannot carry tally size before birth
+tall = model(); B9 = batch()
+with torch.no_grad(): tall.bhead.bias.fill_(math.log(math.expm1(3.0))); tall.bhead.weight.zero_()
+zz9 = torch.zeros(1, 6, M.DZ); aa = tall.ages(zz9, B9); neg = (aa < 0) & (B9['v'][None] > 0)
+small = torch.full((1, 6, M.T_MAX), math.log(0.2)); big = torch.full((1, 6, M.T_MAX), math.log(3.0)); mp0 = torch.zeros(6, M.DZ)
+check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, mp0) - tall.extra_lw(big, zz9, B9, mp0)).min()) > 0 or not bool(neg.any()), f'{int(neg.sum())} unborn slots')
+# 10. E1 mask: only slots before the move, only trees first recorded at or after it
+s_ = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1, 2, 2, 2, 3, 3], 'invyr': [2002, 2007, 2012, 2002, 2007, 2012, 2002, 2007],
+                   'slot_kind': ['pre', 'pre', 'real', 'real', 'real', 'post', 'pre', 'real'], 'move_invyr': [2007, 2007, 2007, 2007, 2007, 2007, np.nan, np.nan]})
+check('E1 mask: post-move debut only, slots before the move only', A.e1_mask(s_).tolist() == [True, False, False, False, False, False, False, False])
+# 11. the joint model routes prediction through its own build
+check('prediction uses the joint build', getattr(young, 'build', None) is not M.build and 'build' in A.NIMIWAE70.__dict__)
 print('checks:', sum(o for _, o in RES), 'of', len(RES)); sys.exit(0 if all(o for _, o in RES) else 1)

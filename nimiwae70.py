@@ -5,6 +5,8 @@ Birth     b = t_N - a_N(z, tree), a_N > 0, N = the frame's last slot (known cont
 Existence E_t needs t >= b as well as the size step and t < e: the D55 step is multiplied by sigma(KAPPA_B a_t).
 Curve     log S(a; x) + delta(crown) is shared by lineages and age records. x = species, group, soil, climate normals, region; no SICOND (computed from site trees).
           Monotone in age: alpha(x) + sum_j softplus(w_j(x)) phi_j(log a) with fixed sigmoid phi_j.
+Unborn    a slot before birth is scored below the smallest tally level, so the size path cannot carry a tree that does not exist.
+E1        a microplot debut on a moved plot: slots before the move carry no FALSE label, because that spot was not sampled then (D65 item 2). The birth date decides instead.
 Slots     log D_t ~ N(log S(t - b; x) + delta(cc_t) + v, sigma_S) on slots up to the last visible record with a_t >= 0.5 yr. v = g(z) - g(prior mean), per-tree vigour.
 Records   log DIA_obs ~ N(log S(a_obs + l; x) + delta(cc), sqrt(sigma_meas^2 + sigma_S^2 + tau^2)); l = years to breast height, 0 for TOTAGE; tau replaces v, which a record has no z for.
           Site trees use their own crown class (6), so their selection is a learned offset. Western tally records carry CCLCD, which identifies delta.
@@ -37,7 +39,17 @@ def curve_x(d, cv, west):
     return dict(c_spc=torch.tensor(ids('spcd', cv['spc']), dtype=torch.long), c_grp=torch.tensor(ids('spgrpcd', cv['grp']), dtype=torch.long),
                 c_num=torch.tensor(num, dtype=torch.float32))
 
+def e1_mask(seq):
+    """Slots whose FALSE label is dropped: before the plot's move, for a tree first recorded at or after it."""
+    if 'move_invyr' not in seq: return pd.Series(False, index=seq.index)
+    first = seq[seq.slot_kind == 'real'].groupby(M.K_).invyr.min().rename('_first')
+    deb = seq.join(first, on=M.K_)._first.to_numpy(float)
+    mv = seq.move_invyr.to_numpy(float); iy = seq.invyr.to_numpy(float)
+    return pd.Series((iy < mv) & (deb >= mv), index=seq.index)
+
 def build(seq, vocab=None, cv=None):
+    seq = seq.copy()
+    seq['drop_false'] = (seq.drop_false.fillna(False).astype(bool) if 'drop_false' in seq else False) | e1_mask(seq)
     B, vocab, sq = M.build(seq, vocab)
     if '_curve' not in vocab: vocab['_curve'] = cv
     st = sq.drop_duplicates('_tid').sort_values('_tid')
@@ -83,6 +95,7 @@ class AgeCurve(nn.Module):
         return F.softplus(tok[..., -1])
 
 class NIMIWAE70(M.NIMIWAE56):
+    build = staticmethod(lambda seq, vocab: build(seq, vocab))                             # predictions and stand totals use the joint build
     def __init__(s, nsp, nl3, nmaj, nfty, nspc, nc_spc, nc_grp, age=True):
         super().__init__(nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=False, prior_ctx=False)
         s.age = age
@@ -115,7 +128,9 @@ class NIMIWAE70(M.NIMIWAE56):
         m = (B['v'][None] > 0) & (ar <= B['l'][None, :, None]) & (a >= 0.5)
         mu = ls + s.curve.delta(cc)[None, ..., 0] + v_
         sd = torch.exp(s.lsS)
-        return ((-0.5 * ((lDp - mu) / sd) ** 2 - s.lsS - 0.5 * math.log(2 * math.pi)) * m).sum(-1)
+        fit = ((-0.5 * ((lDp - mu) / sd) ** 2 - s.lsS - 0.5 * math.log(2 * math.pi)) * m).sum(-1)
+        unborn = (F.logsigmoid(-M.KAPPA * (lDp - B['lex'][None])) * ((a < 0) & (B['v'][None] > 0))).sum(-1)
+        return fit + unborn
     def rec_ll(s, R):
         """log likelihood per age record [m]; touches only the curve and its two scale parameters."""
         tok = s.curve.token(R); l = s.curve.years_bh(tok)
@@ -142,6 +157,8 @@ def predict_age(model, R, grid=None):
     return torch.cat(out)
 
 def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True):
+    assert set(tr.split.unique()) <= {'train'} and set(rec.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
+    assert rec.first_of_tree.all(), 'one age record per tree in fitting; repeats test the step'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     cv = curve_vocab(tr, rec); B, vocab, _ = build(tr, cv=cv); n = B['v'].shape[0]; R = build_rec(rec, cv); nr = R['lD'].shape[0]
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees

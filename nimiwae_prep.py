@@ -90,8 +90,9 @@ def load54(db: str) -> pl.DataFrame:
                   {", ".join(f"sum(wt * (len(list_filter(trt, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) trt_s{c}" for c in (10, 20, 30, 40, 50))},
                   {", ".join(f"sum(wt * (len(list_filter(dst, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) dst_s{c}" for c in (10, 20, 30, 40, 50, 60, 70, 80, 90))}
            FROM bw GROUP BY ALL),
-    pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, INVYR invyr, DESIGNCD designcd FROM PLOT)
-    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr, f.measdate, pc.designcd,
+    pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, INVYR invyr, DESIGNCD designcd FROM PLOT),
+    mv AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, max(INVYR) move_invyr FROM procedural_breaks WHERE is_microplot_move GROUP BY ALL)
+    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr, f.measdate, pc.designcd, mv.move_invyr,
            CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' WHEN f.measdate <= f.d1 THEN 'gap' ELSE 'post' END slot_kind,
            CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
            t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
@@ -114,6 +115,7 @@ def load54(db: str) -> pl.DataFrame:
     LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, invyr)
     LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.invyr = f.invyr
     LEFT JOIN sa USING (statecd, unitcd, countycd, plot, subp, invyr)
+    LEFT JOIN mv ON mv.statecd = f.statecd AND mv.unitcd = f.unitcd AND mv.countycd = f.countycd AND mv.plot = f.plot
     ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr"""
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df
