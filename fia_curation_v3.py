@@ -93,9 +93,8 @@ def sql_base_measurements(con, scope: str = ""):
         (C.TRTCD1 = 40 OR C.TRTCD2 = 40 OR C.TRTCD3 = 40) AS natural_regen,
         (C.TRTCD1 = 50 OR C.TRTCD2 = 50 OR C.TRTCD3 = 50) AS silvicultural
     FROM PLOT P
-    JOIN SURVEY SRV
-        ON P.SRV_CN = SRV.CN
-        AND SRV.ANN_INVENTORY = 'Y'
+    JOIN ANNUAL_INV SRV
+        ON SRV.STATECD = P.STATECD AND SRV.INVYR = P.INVYR
         AND P.STATECD <= 56 AND P.STATECD NOT IN (2, 15)
     JOIN SUBPLOT SUBP
         ON  SUBP.STATECD  = P.STATECD
@@ -214,27 +213,29 @@ def _sql_procedural_breaks(con, scope: str = ""):
     _retally_saplings (every previous-visit live sapling with its next-visit status)."""
     con.execute(f"""
     CREATE OR REPLACE TEMP TABLE _pv AS
-    SELECT P.CN AS PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.MANUAL,
+    SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.MANUAL,
            P.PLOT_STATUS_CD,
            MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS MEASDATE
-    FROM PLOT P JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
+    FROM PLOT P JOIN ANNUAL_INV SRV ON SRV.STATECD = P.STATECD AND SRV.INVYR = P.INVYR
     WHERE P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope};
     CREATE OR REPLACE TEMP TABLE _pv2 AS
-    SELECT *, LEAD(PLT_CN) OVER w AS next_cn, LEAD(MEASDATE) OVER w AS next_md,
+    SELECT *, LEAD(INVYR) OVER w AS next_invyr, LEAD(MEASDATE) OVER w AS next_md,
               LEAD(MANUAL) OVER w AS next_manual, LEAD(PLOT_STATUS_CD) OVER w AS next_ps
     FROM _pv WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY MEASDATE, INVYR);
     CREATE OR REPLACE TEMP TABLE _retally_saplings AS
     SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.SUBP, T.TREE, v.MEASDATE, v.next_md,
-           v.MANUAL AS prev_manual, v.next_manual, (T2.CN IS NULL) AS unrecorded,
+           v.MANUAL AS prev_manual, v.next_manual, (T2.TREE IS NULL) AS unrecorded,
            T2.STATUSCD AS next_statuscd, CAST(T2.RECONCILECD AS INTEGER) AS next_rc
     FROM TREE T
-    JOIN _pv2 v ON v.PLT_CN = T.PLT_CN
-    JOIN COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
-    JOIN SUBPLOT SN ON SN.PLT_CN = v.next_cn AND SN.SUBP = T.SUBP AND SN.SUBP_STATUS_CD = 1
-    LEFT JOIN TREE T2 ON T2.PLT_CN = v.next_cn AND T2.SUBP = T.SUBP AND T2.TREE = T.TREE
+    JOIN _pv2 v ON v.STATECD = T.STATECD AND v.UNITCD = T.UNITCD AND v.COUNTYCD = T.COUNTYCD AND v.PLOT = T.PLOT AND v.INVYR = T.INVYR
+    JOIN COND C ON C.STATECD = T.STATECD AND C.UNITCD = T.UNITCD AND C.COUNTYCD = T.COUNTYCD AND C.PLOT = T.PLOT AND C.INVYR = T.INVYR AND C.CONDID = T.CONDID
+    JOIN SUBPLOT SN ON SN.STATECD = T.STATECD AND SN.UNITCD = T.UNITCD AND SN.COUNTYCD = T.COUNTYCD AND SN.PLOT = T.PLOT
+         AND SN.INVYR = v.next_invyr AND SN.SUBP = T.SUBP AND SN.SUBP_STATUS_CD = 1
+    LEFT JOIN TREE T2 ON T2.STATECD = T.STATECD AND T2.UNITCD = T.UNITCD AND T2.COUNTYCD = T.COUNTYCD AND T2.PLOT = T.PLOT
+         AND T2.INVYR = v.next_invyr AND T2.SUBP = T.SUBP AND T2.TREE = T.TREE
     WHERE T.STATUSCD = 1 AND T.DIA < 5 AND T.TPA_UNADJ > 0 AND T.SUBP <= 4
       AND C.COND_STATUS_CD = 1 AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
-      AND v.PLOT_STATUS_CD < 3 AND v.next_cn IS NOT NULL AND v.next_ps < 3;
+      AND v.PLOT_STATUS_CD < 3 AND v.next_invyr IS NOT NULL AND v.next_ps < 3;
     """)
     con.execute(f"""
     DROP TABLE IF EXISTS retally_transitions;
@@ -366,9 +367,9 @@ def sql_excluded_trees(con, scope: str = ""):
            CAST(T.RECONCILECD AS INTEGER) AS RC, T.PREVDIA,
            T.TREE AS TREE_RAW, CAST(T.CN AS VARCHAR) AS CN, T.SPCD
     FROM TREE T
-    JOIN PLOT P ON P.CN = T.PLT_CN
-    JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
-    JOIN COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
+    JOIN PLOT P ON P.STATECD = T.STATECD AND P.UNITCD = T.UNITCD AND P.COUNTYCD = T.COUNTYCD AND P.PLOT = T.PLOT AND P.INVYR = T.INVYR
+    JOIN ANNUAL_INV SRV ON SRV.STATECD = P.STATECD AND SRV.INVYR = P.INVYR
+    JOIN COND C ON C.STATECD = T.STATECD AND C.UNITCD = T.UNITCD AND C.COUNTYCD = T.COUNTYCD AND C.PLOT = T.PLOT AND C.INVYR = T.INVYR AND C.CONDID = T.CONDID
     WHERE T.STATUSCD = 0 AND T.SUBP <= 4
       AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
       AND P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope}
@@ -406,15 +407,15 @@ def sql_excluded_trees(con, scope: str = ""):
            MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) AS exit_measdate,
            -- r6 D26: this live record is linked back (PREV_TRE_CN) to a dead record (PREV_STATUS_CD 2):
            -- a misrecorded death whose tree then left forest land
-           CASE WHEN T.PREV_STATUS_CD = 2 AND T.PREV_TRE_CN IS NOT NULL THEN
+           CASE WHEN T.PREV_STATUS_CD = 2 THEN
                MAKE_DATE(P.MEASYEAR, COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15))
            END AS linked_live_after_dead_md,
-           T.TREE AS TREE_RAW, CAST(T.CN AS VARCHAR) AS CN, CAST(T.PREV_TRE_CN AS VARCHAR) AS PREV_TRE_CN,
+           T.TREE AS TREE_RAW, CAST(T.CN AS VARCHAR) AS CN,
            T.PREV_STATUS_CD
     FROM TREE T
-    JOIN PLOT P ON P.CN = T.PLT_CN
-    JOIN SURVEY SRV ON P.SRV_CN = SRV.CN AND SRV.ANN_INVENTORY = 'Y'
-    JOIN COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
+    JOIN PLOT P ON P.STATECD = T.STATECD AND P.UNITCD = T.UNITCD AND P.COUNTYCD = T.COUNTYCD AND P.PLOT = T.PLOT AND P.INVYR = T.INVYR
+    JOIN ANNUAL_INV SRV ON SRV.STATECD = P.STATECD AND SRV.INVYR = P.INVYR
+    JOIN COND C ON C.STATECD = T.STATECD AND C.UNITCD = T.UNITCD AND C.COUNTYCD = T.COUNTYCD AND C.PLOT = T.PLOT AND C.INVYR = T.INVYR AND C.CONDID = T.CONDID
     WHERE T.STATUSCD = 1 AND T.SUBP <= 4 AND C.COND_STATUS_CD IN (2, 3, 4)
       AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'
       AND P.STATECD <= 56 AND P.STATECD NOT IN (2, 15) {scope}
@@ -461,9 +462,9 @@ def sql_rc7_withdrawn_visits(con, scope: str = ""):
         SELECT CAST(P.CN AS VARCHAR) AS PLT_CN, T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR, CSY.MEASDATE,
                (r7.rc7_md IS NOT NULL AND CSY.MEASDATE < r7.rc7_md) AS withdrawn
         FROM TREE T
-        JOIN PLOT P ON P.CN = T.PLT_CN
+        JOIN PLOT P ON P.STATECD = T.STATECD AND P.UNITCD = T.UNITCD AND P.COUNTYCD = T.COUNTYCD AND P.PLOT = T.PLOT AND P.INVYR = T.INVYR
         JOIN REF_SPECIES SP ON SP.SPCD = T.SPCD
-        JOIN COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
+        JOIN COND C ON C.STATECD = T.STATECD AND C.UNITCD = T.UNITCD AND C.COUNTYCD = T.COUNTYCD AND C.PLOT = T.PLOT AND C.INVYR = T.INVYR AND C.CONDID = T.CONDID
         JOIN clean_subplot_years CSY ON CSY.STATECD = T.STATECD AND CSY.UNITCD = T.UNITCD
              AND CSY.COUNTYCD = T.COUNTYCD AND CSY.PLOT = T.PLOT AND CSY.INVYR = T.INVYR AND CSY.SUBP = T.SUBP
         LEFT JOIN r7 ON r7.STATECD = T.STATECD AND r7.UNITCD = T.UNITCD AND r7.COUNTYCD = T.COUNTYCD
@@ -487,7 +488,7 @@ def sql_product_visits(con):
     CREATE TABLE product_visits AS
     SELECT DISTINCT CAST(P.CN AS VARCHAR) AS PLT_CN, P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, CSY.MEASDATE
     FROM PLOT P
-    JOIN SURVEY SRV ON SRV.CN = P.SRV_CN AND SRV.ANN_INVENTORY = 'Y'
+    JOIN ANNUAL_INV SRV ON SRV.STATECD = P.STATECD AND SRV.INVYR = P.INVYR
     JOIN (SELECT DISTINCT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, MEASDATE FROM clean_subplot_years) CSY
       ON CSY.STATECD = P.STATECD AND CSY.UNITCD = P.UNITCD AND CSY.COUNTYCD = P.COUNTYCD
      AND CSY.PLOT = P.PLOT AND CSY.INVYR = P.INVYR
@@ -644,25 +645,25 @@ def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
     the old id's censoring.
     """
     d = df.sort(TREE_ID + ["MEASDATE"]).with_columns([
-        pl.col("CN").cast(pl.Utf8).shift(1).over(TREE_ID).alias("_pcn"),
         pl.col("STATUSCD").shift(1).over(TREE_ID).alias("_pst"),
         pl.col("MEASDATE").shift(1).over(TREE_ID).alias("_pmd"),
     ])
-    no_link = pl.col("prev_tre_cn").is_null()
+    # D59: FIA records PREV_STATUS_CD on a remeasured tree; a same-number record without one is a new
+    # tree (equals the CN link on all 2.76M same-number successors of the 8 states)
+    no_link = pl.col("prev_status_cd").is_null()
     r_dead = no_link & pl.col("_pst").is_in([2, 3])
-    r_other = pl.col("prev_tre_cn").is_not_null() & (pl.col("prev_tre_cn") != pl.col("_pcn"))
     r_newrc = no_link & pl.col("RECONCILECD").cast(pl.Int32).is_in(list(NEW_TREE_RC))
-    has_prev = pl.col("_pcn").is_not_null()
+    has_prev = pl.col("_pst").is_not_null()
     d = d.with_columns([(has_prev & r).fill_null(False).alias(n) for n, r in
-                        (("_s_dead", r_dead), ("_s_other", r_other), ("_s_newrc", r_newrc))])
-    new_seg = pl.any_horizontal("_s_dead", "_s_other", "_s_newrc")
+                        (("_s_dead", r_dead), ("_s_newrc", r_newrc))])
+    new_seg = pl.any_horizontal("_s_dead", "_s_newrc")
     d = d.with_columns(new_seg.cast(pl.Int64).cum_sum().over(TREE_ID).alias("_seg"))
     d = d.with_columns((pl.col("_seg").max().over(TREE_ID) > 0).alias("tree_key_split"))
     n_split = d.filter(pl.col("_seg") > 0).select(TREE_ID).unique().height
     n_rec = d.filter(pl.col("_seg") > 0).height
-    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_other", "_s_newrc")]).row(0, named=True)
+    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_newrc")]).row(0, named=True)
     d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(
-        ["_pcn", "_pst", "_pmd", "_seg", "_s_dead", "_s_other", "_s_newrc"])
+        ["_pst", "_pmd", "_seg", "_s_dead", "_s_newrc"])
     print(f"[step4s] tree-number reuse: {n_split:,} keys split, {n_rec:,} records moved to a new tree id; "
           f"segment starts by rule (a record may meet several): {why}")
     return d.sort(TREE_ID + ["MEASDATE"])
@@ -1005,24 +1006,15 @@ def classify_tree_fate(df: pl.DataFrame, landuse_exits: pl.DataFrame | None = No
     # (PREV_TRE_CN set, PREV_STATUS_CD = 2) is a MISRECORDED death: kept, flagged
     # misrecorded_death (tree_fate 'misrecorded_death'), and excluded from every fate / event /
     # dead-record set; the tree continues
-    res_md = (pl.when((pl.col("STATUSCD") == 1) & (pl.col("prev_status_cd") == 2).fill_null(False)
-                      & pl.col("prev_tre_cn").is_not_null()).then(pl.col("MEASDATE"))
+    res_md = (pl.when((pl.col("STATUSCD") == 1) & (pl.col("prev_status_cd") == 2).fill_null(False)).then(pl.col("MEASDATE"))
               .max().over(TREE_ID))
     df = df.sort(TREE_ID + ["MEASDATE"]).with_columns(res_md.alias("_res_md"))
     # ... or by a linked live record on a now-nonforest condition (tree_landuse_exits: the live
     # rule keeps it out of the curated records, but FIA's link is the same evidence)
     if landuse_exits is not None and "linked_live_after_dead_md" in landuse_exits.columns:
-        if "PREV_TRE_CN" in landuse_exits.columns:
-            # r7 D44 (F7-12): the exit record belongs to the tree whose record its PREV_TRE_CN
-            # names (the PREV_TRE_CN -> CN link), not to whatever shares the tree number
-            lx = (landuse_exits.filter(pl.col("linked_live_after_dead_md").is_not_null()
-                                       & pl.col("PREV_TRE_CN").is_not_null())
-                  .select(pl.col("PREV_TRE_CN").cast(pl.Utf8).alias("_lcn"), "linked_live_after_dead_md")
-                  .join(df.select(TREE_ID + [pl.col("CN").cast(pl.Utf8).alias("_lcn")]), on="_lcn", how="inner")
-                  .group_by(TREE_ID).agg(pl.col("linked_live_after_dead_md").max().alias("_res_lx")))
-        else:
-            lx = (landuse_exits.filter(pl.col("linked_live_after_dead_md").is_not_null())
-                  .group_by(TREE_ID).agg(pl.col("linked_live_after_dead_md").max().alias("_res_lx")))
+        # (rekey_tree_events already moved each exit to its post-split tree id)
+        lx = (landuse_exits.filter(pl.col("linked_live_after_dead_md").is_not_null())
+              .group_by(TREE_ID).agg(pl.col("linked_live_after_dead_md").max().alias("_res_lx")))
         df = (df.join(lx, on=TREE_ID, how="left")
                 .with_columns(pl.max_horizontal("_res_md", "_res_lx").alias("_res_md")).drop("_res_lx"))
     # r7 D44 (F7-4): polars joins do not guarantee row order; the cum_sum below needs it
@@ -2614,10 +2606,10 @@ def add_age_stratum(df: pl.DataFrame) -> pl.DataFrame:
 
 def add_raw_plot_keys(con, df: pl.DataFrame, st: int) -> pl.DataFrame:
     """r5 M-2: the as-recorded plot key of each record (the stages see the canonical key)."""
-    raw = con.execute(f"""SELECT CAST(T.CN AS VARCHAR) AS _cn, m.UNITCD_RAW, m.COUNTYCD_RAW, m.PLOT_RAW
-        FROM fia.main.TREE T JOIN plot_canon_map m ON m.CN = CAST(T.PLT_CN AS VARCHAR)
-        WHERE T.STATECD = {int(st)}""").pl()
-    d = df.with_columns(pl.col("CN").cast(pl.Utf8).alias("_cn")).join(raw, on="_cn", how="left")
+    raw = con.execute(f"""SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, UNITCD_RAW, COUNTYCD_RAW, PLOT_RAW
+        FROM plot_canon_map WHERE STATECD = {int(st)}""").pl()
+    raw = raw.with_columns([pl.col(c).cast(df.schema[c]) for c in PLOT_INVYR])
+    d = df.join(raw, on=PLOT_INVYR, how="left")
     n = d.filter(pl.col("PLOT_RAW").is_not_null()).height
     print(f"[step4p] canonical plot key: {n:,} records on renumbered plot visits "
           f"({d.filter(pl.col('PLOT_RAW').is_not_null()).select(['STATECD','UNITCD','COUNTYCD','PLOT']).unique().height} plots)")
@@ -2625,7 +2617,7 @@ def add_raw_plot_keys(con, df: pl.DataFrame, st: int) -> pl.DataFrame:
         pl.coalesce("UNITCD_RAW", "UNITCD").cast(pl.Int64).alias("unitcd_raw"),
         pl.coalesce("COUNTYCD_RAW", "COUNTYCD").cast(pl.Int64).alias("countycd_raw"),
         pl.coalesce("PLOT_RAW", "PLOT").cast(pl.Int64).alias("plot_raw"),
-    ).drop(["_cn", "UNITCD_RAW", "COUNTYCD_RAW", "PLOT_RAW"])
+    ).drop(["UNITCD_RAW", "COUNTYCD_RAW", "PLOT_RAW"])
 
 
 def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
@@ -2657,6 +2649,12 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
     # duplicate visits any more)
     con.execute("CREATE OR REPLACE TABLE plot_key_remap AS SELECT * FROM plot_canon_map ORDER BY ALL")
     con.execute("CREATE OR REPLACE TABLE plot_location AS SELECT * FROM plot_loc_visit")
+    # D59: identity provenance. plot_renumber = every key-changing FIA link with its tree evidence;
+    # id_quarantine = rows excluded because CN and natural id disagree (views in dbconn)
+    con.execute("CREATE OR REPLACE TABLE plot_renumber AS SELECT * FROM TEMP.plot_renumber ORDER BY ALL")
+    nq = dbconn.write_id_quarantine(con, dbconn.state_filter(states, col="t.STATECD"))
+    print(f"[identity] id_quarantine: {nq:,} rows; plot_renumber: " + str(con.execute(
+        "SELECT count(*), count(*) FILTER (WHERE accepted) FROM plot_renumber").fetchone()) + " links (all, accepted)")
 
     sql_base_measurements(con, scope)
     sql_clean_subplot_years(con)
@@ -2695,8 +2693,7 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
         rekey_tree_events(con, df, st)
         df = attach_censor_columns(con, df, st)
         landuse_exits = con.execute(f"""
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate, linked_live_after_dead_md,
-                   PREV_TRE_CN
+            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate, linked_live_after_dead_md
             FROM tree_landuse_exits WHERE STATECD = {int(st)}""").pl()
         df = _polars_steps(con, df, estage_raw, all_subplot_years, landuse_exits)
         df = add_raw_plot_keys(con, add_age_stratum(df), st)
