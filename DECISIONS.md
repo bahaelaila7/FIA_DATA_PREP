@@ -1624,3 +1624,20 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 
 - **Dead graduates rarely leave a candidate:** new dead subplot records (RC 1, 3, 7) are about 2 % of the size of live RC 1 debuts, while about 22 % of tracked 4.5+ in graduates are dead. A sapling that crossed 5 in and died is usually never tallied, which fits "stayed under 5 in or died". The signal is broken by hidden live graduates, so the alive column is the one that matters.
 - **Unchanged:** apply the no-candidate signal under 4 in only (91.7 % of no-candidate trees at the next visit), soft, and test later visits first.
+
+**D65 amendment 5 (2026-11-01; user: why 4 in, test later visits, check those). A pseudo-move with truth.** On each plot's first OFFSET visit with a later visit (23,664 plots, 167,707 saplings), every microplot sapling is treated as closed and its number hidden. A tree's first live record ≥ 5 in joins the subplot debut pool; dead graduates do not, because they are rarely tallied in a real move. The same filters and one-to-one assignment run through visits +1, +2, +3.
+- **"4 in" was chosen by eye** from the am. 3 and am. 4 tables. Bar now: hidden live graduates ≤ 0.05, the cap on the model's label noise (RHO_MAX).
+- **P(live graduate | no candidate):**
+
+| Size at closure | +1 | +2 | +3 |
+|---|---|---|---|
+| < 2 in | 0.005 | 0.004 | 0.006 |
+| 2–3 in | 0.008 | 0.009 | 0.013 |
+| 3–3.5 in | 0.010 | 0.015 | 0.025 |
+| 3.5–4 in | 0.014 | 0.025 | 0.035 |
+| 4–4.5 in | 0.027 | 0.045 | 0.063 |
+| 4.5+ in | 0.071 | 0.101 | 0.119 |
+
+- **Rule:** under 4 in passes at all three visits. 4–4.5 in passes through +2. 4.5+ in never passes. Keep 4 in as the single limit. Visit +4 is not tested.
+- **Caveat:** the pseudo-move assumes every live graduate is re-tallied, so these are lower bounds. The placebo estimates of am. 4 (24–30 % at 4.5+ in) are higher, but species clustering affects them. Real and pseudo candidate shares agree in pattern, real lower by about a quarter (4.5+ in 0.49 vs 0.57) at every size, including sizes with almost no graduates.
+- **Matching is worse than the placebo suggested:** matched pairs are right 13 % overall (35–41 % at 4.5+ in), and 31 % of live graduates get their true debut. This replaces the 45–48 % of am. 4. It confirms no renumbering on species, size and height. Any soft link weight must come from these rates.
