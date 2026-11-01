@@ -1658,3 +1658,12 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Finding:** relinking inflates graduation by about 7 points (17 vs 10, 3.7× under 2 in, 1.5× at 3–4 in), because false links outnumber misses. Early mortality matches. Moved plots run through the same relink come out 1.5–1.9 points below normal, so the relink bias looks the same in both and could be calibrated by size from normal plots. Moved vs normal is 4–6 points lower at 2–5 in, unexplained.
 - **Silent moves:** 566 KY saplings on 118 plots with a 10–15 yr horizon. Relinked from the previous visit 26.9 vs KY + TN normal plots relinked the same way 21.2, true 8.3. Too few to read, and the link spans an extra interval.
 - **AZIMUTH / DIST:** in neither FIADB.duckdb nor SQLite_FIADB_ENTIRE.db; FVS_TREEINIT DISTANCE is empty on 2,000,000 rows checked. Scrambling cannot be tested from local data. The guide's fuzzing and swapping covers plot LAT / LON only.
+
+**D65 amendment 7 (2026-11-01; user: more constraints to suppress the graduation inflation).** Tested on the 10–15 yr setup of am. 6, scored against tree numbers.
+- **Hard limits barely help.** Graduated, normal plots, true 9.9: base 17.1; size and wood growth limit (p99 of tracked saplings) 15.8; plus height growth limits 15.7; plus under 5 in at the previous visit 15.7. Precision only 0.16 to 0.18. Most debuts are ordinary ingrowth from outside the microplot and pass any plausibility test, because the circle is about 8 % of the subplot.
+- **A calibrated link probability works.** Gradient boosting on pair features (sapling size, debut size and height, growth, interval, wood, rival counts), trained on half of the normal plots (1,149 true pairs of 12,770), tested on the other half and on the after-move group.
+  - Calibration, predicted vs true, after-move group: 0.02 / 0.02, 0.15 / 0.15, 0.36 / 0.35, 0.63 / 0.65, 0.84 / 0.90.
+  - Soft graduated, each pair weighted by its probability and capped one-to-one: after-move 9.1 vs true 10.3; held-out normal 12.2 vs 13.3. It runs low by about 1 point; dead graduates can't be found.
+  - Hard links: p ≥ 0.5 precision 0.75–0.77, recall 0.26–0.30; p ≥ 0.7 precision 0.87, recall 0.18.
+  - Moved plots: soft graduated 8.2, against the 9 implied in am. 6.
+- **Assumption:** training plots have every live graduate re-tallied. Moved plots may not, and cannot be checked there.
