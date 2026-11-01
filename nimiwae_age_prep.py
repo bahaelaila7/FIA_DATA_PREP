@@ -24,13 +24,14 @@ VISIT = """JOIN f.main.PLOT P ON P.STATECD = R.STATECD AND P.UNITCD = R.UNITCD A
 def records(c):
     st = lambda x: ",".join(map(str, x))
     common = f"R.STATECD statecd, R.UNITCD unitcd, R.COUNTYCD countycd, R.PLOT plot, R.INVYR invyr, {MD} measdate, R.SPCD spcd, R.DIA::DOUBLE dia, R.HT::DOUBLE ht"
-    site = f"""SELECT 'site' source, {common}, NULL::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.AGEDIA AS DOUBLE) a_obs
-        FROM f.main.SITETREE R {VISIT} WHERE R.STATECD IN ({st(R4)}) AND TRY_CAST(R.AGEDIA AS DOUBLE) > 0 AND R.DIA > 0
-          AND NOT EXISTS (SELECT 1 FROM f.main.SITETREE E WHERE E.STATECD = R.STATECD AND E.UNITCD = R.UNITCD AND E.COUNTYCD = R.COUNTYCD AND E.PLOT = R.PLOT
-                          AND E.TREE = R.TREE AND E.SPCD = R.SPCD AND E.INVYR < R.INVYR AND E.AGEDIA = R.AGEDIA AND E.DIA = R.DIA AND E.HT = R.HT)"""
-    tally = lambda src, col: f"""SELECT '{src}' source, {common}, R.CCLCD::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.{col} AS DOUBLE) a_obs
+    # carried forward = the same plot, number, species, age, DIA and height at an earlier visit: keep the earliest visit of each such group
+    site_r = f"""(SELECT * FROM f.main.SITETREE WHERE STATECD IN ({st(R4)})
+                  QUALIFY INVYR = min(INVYR) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, TREE, SPCD, AGEDIA, DIA, HT))"""
+    site = f"""SELECT 'site' AS source, {common}, NULL::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.AGEDIA AS DOUBLE) a_obs
+        FROM {site_r} R {VISIT} WHERE TRY_CAST(R.AGEDIA AS DOUBLE) > 0 AND R.DIA > 0"""
+    tally = lambda src, col: f"""SELECT '{src}' AS source, {common}, R.CCLCD::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.{col} AS DOUBLE) a_obs
         FROM f.main.TREE R {VISIT} WHERE R.STATECD IN ({st(WEST)}) AND V.RSCD IN (22, 26) AND R.STATUSCD = 1 AND TRY_CAST(R.{col} AS DOUBLE) > 0 AND R.DIA > 0 AND R.DIAHTCD = 1"""
-    return c.execute(f"{site} UNION ALL {tally('tot', 'TOTAGE')} UNION ALL {tally('bha', 'BHAGE')}").pl()
+    return pl.concat([c.execute(q).pl() for q in (site, tally('tot', 'TOTAGE'), tally('bha', 'BHAGE'))], how='vertical_relaxed')
 
 
 def attach(df, c, prism, solus):
