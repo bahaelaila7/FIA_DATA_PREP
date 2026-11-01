@@ -1804,3 +1804,10 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - **Effect, GA 13:87 / KY 21:175, steps 1-10:** no live record, DIA or `estimated_age` changes. Closure dead records 68 (29 cut) / 8 (4 cut). `censored_procedural` trees 164 to 96 / 27 to 19, and dead plus cut rise by the same count. Breaks 23 to 56 / 11 to 18, all new ones moves. Tree phantoms 444 to 417 / 368 to 351. Sim B rows identical; `procedural_break` changes on 81 / 76 rows, and `subp_has_dstrb` on 10 rows in GA. Drops: 645 and 152 rows before and after.
 - **Verifier:** re-derives closures and moves from raw (`rm`, CLOSURE_RAW) in n17, n18, n20, n21, n23. GA and KY give the same results as before the change. Only the county-scope checks fail: no planted rows in GA and KY; KY needs a state TreeAge fit.
 - **Not applied here, belongs to the NIMIWAE retrain:** the no-candidate signal under 4 in and the link weights of am. 1, 4 and 13. They are frame inputs, and the sampled draws are untested. E1 (no FALSE labels on the spot before a move, item 2) stays the user's decision.
+
+## D70 — NIMIWAE predicts age jointly with measured ages (user, 2026-11-01)
+- **Design (user):** NIMIWAE and age modelling are not separate; they constrain each other. Each tally tree has one birth date, so its predicted age advances exactly with elapsed time. A tree predicted 12 yr old at a visit cannot be established more than 12 yr back, which bounds the E1 slots. Soil is an input.
+- **Age targets (user):** source measurements only: SITETREE.AGEDIA, TOTAGE, BHAGE. STDAGE and estimates are never targets or inputs.
+- **Data (user):** RSCD 22 and 26 tally ages are used for this model. R4 curation and products stay R4-only; those records are loaded for the model and are not curated into a truth DB.
+- **Site trees tied to tally records (user):** usable as an extra anchor if the link is reliable. `age_anchor_audit.py` measures it. **Bar, set before the first run:** a tier needs estimated precision >= 0.95 by the DIA-shift placebo, and dominant or codominant share well above placebo. Ages are never used to choose or score a link.
+
