@@ -183,7 +183,11 @@ con.execute("""CREATE TABLE f.main._ap AS SELECT P.CN, P.PREV_PLT_CN, P.STATECD,
     FROM fraw.main.PLOT P JOIN fraw.main.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'""")
 def _canon_walk():
     con.execute("""CREATE OR REPLACE TABLE f.main._walk AS
-    WITH RECURSIVE ed AS (SELECT a.CN c, a.PREV_PLT_CN p FROM f.main._ap a SEMI JOIN f.main._ap b ON b.CN = a.PREV_PLT_CN),
+    WITH RECURSIVE ev AS (SELECT T.PLT_CN c, count(*) n, count(*) FILTER (WHERE abs(T.PREVDIA - O.DIA) <= 0.05) ok
+                          FROM fraw.main.TREE T JOIN fraw.main.TREE O ON O.CN = T.PREV_TRE_CN WHERE T.PREVDIA IS NOT NULL GROUP BY 1),
+    ed AS (SELECT a.CN c, a.PREV_PLT_CN p FROM f.main._ap a JOIN f.main._ap b ON b.CN = a.PREV_PLT_CN LEFT JOIN ev ON ev.c = a.CN
+           -- D59: a changed plot key is accepted only on tree evidence (here FIA's own tree links, independent of dbconn's natural-key pairs)
+           WHERE (a.UNITCD, a.COUNTYCD, a.PLOT) IS NOT DISTINCT FROM (b.UNITCD, b.COUNTYCD, b.PLOT) OR COALESCE(ev.n >= 2 AND ev.ok >= 0.9 * ev.n, FALSE)),
     roots AS (SELECT CN FROM f.main._ap ANTI JOIN ed ON ed.c = CN),
     walk(CN, root, depth) AS (SELECT CN, CN, 0 FROM roots UNION ALL
                               SELECT ed.c, w.root, w.depth + 1 FROM walk w JOIN ed ON ed.p = w.CN WHERE w.depth < 200)
@@ -693,16 +697,25 @@ con.execute(f"""
 CREATE TEMP TABLE myseg AS
 WITH r AS (SELECT CAST(c.CN AS VARCHAR) cn, c.STATECD, c.UNITCD, c.COUNTYCD, c.PLOT, c.SUBP, c.TREE ptree, c.MEASDATE md,
                   c.tree_key_split pflag, T.TREE rtree, T.STATUSCD st, T.SPCD sp, T.DIA dia,
-                  CAST(T.PREV_TRE_CN AS VARCHAR) ptc, CAST(T.RECONCILECD AS INTEGER) rc, CAST(T.PLT_CN AS VARCHAR) pcn
+                  CAST(T.PREV_TRE_CN AS VARCHAR) ptc, CAST(T.RECONCILECD AS INTEGER) rc, CAST(T.PLT_CN AS VARCHAR) pcn,
+                  c.INVYR invyr
            FROM new.curated_trees c JOIN f.TREE T ON CAST(T.CN AS VARCHAR) = CAST(c.CN AS VARCHAR) WHERE {scope('c')}),
+vb AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM (
+         SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.KINDCD, P.DESIGNCD,
+                lag(P.DESIGNCD) OVER w pd, row_number() OVER w k
+         FROM f.PLOT P JOIN f.SURVEY SV ON SV.CN = P.SRV_CN AND SV.ANN_INVENTORY = 'Y'
+         WINDOW w AS (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY P.MEASYEAR, P.INVYR))
+       WHERE k > 1 AND (KINDCD IN (1, 3) OR DESIGNCD IS DISTINCT FROM pd)),
 q AS (SELECT r.*, lag(cn) OVER w qcn, lag(st) OVER w qst, lag(sp) OVER w qsp, lag(dia) OVER w qdia, lag(md) OVER w qmd
       FROM r WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree ORDER BY md, cn)),
 s AS (SELECT q.*,
         COALESCE(qst IN (2,3) AND ptc IS NULL, FALSE) s_dead,
         COALESCE(ptc IS NOT NULL AND ptc <> qcn, FALSE) s_other,
-        COALESCE(ptc IS NULL AND rc IN (1,2,3,4), FALSE) s_newrc
+        COALESCE(ptc IS NULL AND rc IN (1,2,3,4), FALSE) s_newrc,
+        EXISTS (SELECT 1 FROM vb WHERE vb.STATECD = q.STATECD AND vb.UNITCD = q.UNITCD AND vb.COUNTYCD = q.COUNTYCD
+                AND vb.PLOT = q.PLOT AND vb.INVYR = q.invyr) s_visit
       FROM q),
-g AS (SELECT s.*, qcn IS NOT NULL AND (s_dead OR s_other OR s_newrc) newseg FROM s)
+g AS (SELECT s.*, qcn IS NOT NULL AND (s_dead OR s_other OR s_newrc OR s_visit) newseg FROM s)
 SELECT g.*, CAST(sum(newseg::INT) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree ORDER BY md, cn
                                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS BIGINT) seg
 FROM g""")

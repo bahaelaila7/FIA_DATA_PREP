@@ -21,7 +21,7 @@ local copy `/workspace/wo-v9-4_Aug2025_UG_FIADB_database_description_NFI.pdf` (�
 | **F1** | `fia_curation_v3.detect_condition_resets`, `assign_stdage` (`COND_ID = STATECD, UNITCD, COUNTYCD, PLOT, CONDID`, no INVYR) | A condition is followed across visits by its CONDID: an "STDAGE drop since the condition's previous visit", live-tree / BA loss, `cond_ever_reset`, `stdage_cond_first_reset_measdate` | §2.5.8 CONDID: "each sampled condition class must have a unique number that **can change at remeasurement** to reflect new conditions on the plot". Cross-visit linkage is SUBP_COND_CHNG_MTRX (§2.9: CONDID ↔ PREVCOND per subplot with SUBPTYP_PROP_CHNG) or TREE.PREVCOND | FIA's change matrix (8 states, annual): **6.4 %** of current conditions have no area that carried the same CONDID at the previous visit; **12.7 %** of condition area maps to a different previous CONDID. D40 patched only the tree count for re-delineation | Reset detection, hence STDAGE eligibility of post-reset trees (the planted / reset age chain). The `STDAGE trajectory anomalies` block (≈ l. 2320) makes the same pairing but is a printed diagnostic only |
 | F2 | NIMIWAE prep `load54` (not curation) | A borrowed nearest-record CONDID at visits without a record | §2.5.8 as above | — | **Fixed: D55 am. 7** |
 | F3 | NIMIWAE `build` (not curation) | RC9 (nonsampled) absence treated as informative after the record | §3.1.82 RC9 "now in a nonsampled condition" | 10,543 trees | **Fixed: D55 am. 5** |
-| F4 | `verify_curation_v2` check (k) (verification only) | SITETREE linked to TREE first by PLT_CN + SUBP + TREE (same SPCD, \|ΔDIA\| ≤ 1 in) | §3.10.10 SITETREE.TREE: "for tallied site trees, this number is **not necessarily the same** as the actual tally tree number" | 72–92 % of links already use the proxy route (D13) | Age-truth check only; drop the by-number route (or treat it as a proxy) |
+| ~~F4~~ | `verify_curation_v2` check (k) | **Withdrawn 2026-11-01: not a bug.** r7 E28 already removed the by-number SITETREE link; only the proxy link (same plot + condition + species + DIA) remains. A stale comment above it misled this audit | §3.10.10 | — | Stale comment only |
 
 ## Approximations / decisions to confirm (consistent with the manual's letter, contestable in substance)
 
@@ -60,7 +60,7 @@ local copy `/workspace/wo-v9-4_Aug2025_UG_FIADB_database_description_NFI.pdf` (�
 ## Recommended fixes
 
 1. **F1.** Link condition-visits with SUBP_COND_CHNG_MTRX, or define resets per tree: the tree's condition at this visit vs its previous condition through TREE.PREVCOND, with STDAGE drop + loss measured on the conditions FIA links. Re-run curation steps 1–11 (8 states) and the verifier, then rebuild the downstream products (slim, NIMIWAE prep).
-2. **F4.** Check (k): drop the by-number SITETREE route.
+2. ~~F4~~ (withdrawn).
 3. **A5 / A7.** Explicit guards: no lineage across KINDCD 1 / 3 visits or DESIGNCD changes. Zero effect here; protects other regions.
 4. **A1, A2.** User decision: species-matched STDAGE; the harvest vs silvicultural-death label.
 

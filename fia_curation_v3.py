@@ -652,7 +652,20 @@ TREE_SPLIT_OFFSET = 100_000   # R4 TREE numbers are < 61,000
 NEW_TREE_RC = (1, 2, 3, 4)   # r7 D36: RECONCILECD new-tree codes (ingrowth, through-growth, missed live / dead)
 
 
-def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
+def lineage_break_visits(con, st: int) -> pl.DataFrame:
+    """D59 / audit A5, A7: visits a tree number does not carry across. KINDCD 3 = replacement plot, KINDCD 1
+    = (re)installation, "not used for remeasurement" (guide §2.4.16); a DESIGNCD change voids tree-number
+    tracking (§3.1.10). A plot's first visit is not a break."""
+    return con.execute(f"""
+        WITH v AS (SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.KINDCD, P.DESIGNCD,
+                          lag(P.DESIGNCD) OVER (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY P.MEASYEAR, P.INVYR) AS pd,
+                          row_number() OVER (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY P.MEASYEAR, P.INVYR) AS k
+                   FROM PLOT P JOIN ANNUAL_INV A ON A.STATECD = P.STATECD AND A.INVYR = P.INVYR WHERE P.STATECD = {int(st)})
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, TRUE AS _brk FROM v
+        WHERE k > 1 AND (KINDCD IN (1, 3) OR DESIGNCD IS DISTINCT FROM pd)""").pl()
+
+
+def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.DataFrame:
     """
     r3 M3 — tree-number reuse. A tree key (STATECD..SUBP, TREE) can be re-used for a new tree,
     e.g. a dead tree's number given to a new RC1 tree. Following the PREV_TRE_CN chain, a record
@@ -669,7 +682,8 @@ def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
     segment they belong to afterwards (rekey_tree_events, r7 D36), so a split tree never inherits
     the old id's censoring.
     """
-    d = df.sort(TREE_ID + ["MEASDATE"]).with_columns([
+    d = (df.join(breaks.with_columns([pl.col(c).cast(df.schema[c]) for c in PLOT_INVYR]), on=PLOT_INVYR, how="left")
+         .with_columns(pl.col("_brk").fill_null(False))).sort(TREE_ID + ["MEASDATE"]).with_columns([
         pl.col("STATUSCD").shift(1).over(TREE_ID).alias("_pst"),
         pl.col("MEASDATE").shift(1).over(TREE_ID).alias("_pmd"),
     ])
@@ -680,15 +694,15 @@ def split_reused_tree_numbers(df: pl.DataFrame) -> pl.DataFrame:
     r_newrc = no_link & pl.col("RECONCILECD").cast(pl.Int32).is_in(list(NEW_TREE_RC))
     has_prev = pl.col("_pst").is_not_null()
     d = d.with_columns([(has_prev & r).fill_null(False).alias(n) for n, r in
-                        (("_s_dead", r_dead), ("_s_newrc", r_newrc))])
-    new_seg = pl.any_horizontal("_s_dead", "_s_newrc")
+                        (("_s_dead", r_dead), ("_s_newrc", r_newrc), ("_s_visit", pl.col("_brk")))])
+    new_seg = pl.any_horizontal("_s_dead", "_s_newrc", "_s_visit")
     d = d.with_columns(new_seg.cast(pl.Int64).cum_sum().over(TREE_ID).alias("_seg"))
     d = d.with_columns((pl.col("_seg").max().over(TREE_ID) > 0).alias("tree_key_split"))
     n_split = d.filter(pl.col("_seg") > 0).select(TREE_ID).unique().height
     n_rec = d.filter(pl.col("_seg") > 0).height
-    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_newrc")]).row(0, named=True)
+    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_newrc", "_s_visit")]).row(0, named=True)
     d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(
-        ["_pst", "_pmd", "_seg", "_s_dead", "_s_newrc"])
+        ["_pst", "_pmd", "_seg", "_s_dead", "_s_newrc", "_s_visit", "_brk"])
     print(f"[step4s] tree-number reuse: {n_split:,} keys split, {n_rec:,} records moved to a new tree id; "
           f"segment starts by rule (a record may meet several): {why}")
     return d.sort(TREE_ID + ["MEASDATE"])
@@ -2707,7 +2721,7 @@ def run_pipeline(con, estage_dir: str = None, states=None, counties=None):
         """).pl()
         # r7 D36: split reused tree numbers first, then key every event by the post-split id and
         # attach the censor columns from those events
-        df = split_reused_tree_numbers(df)
+        df = split_reused_tree_numbers(df, lineage_break_visits(con, st))
         rekey_tree_events(con, df, st)
         df = attach_censor_columns(con, df, st)
         landuse_exits = con.execute(f"""
