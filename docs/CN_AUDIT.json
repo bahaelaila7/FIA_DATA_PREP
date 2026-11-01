@@ -1,0 +1,276 @@
+{
+ "R4": {
+  "previous_visit_annual": {
+   "summary": {
+    "n": 209100,
+    "same": 155413,
+    "both_none": 53651,
+    "differ": 2,
+    "natural_only": 1,
+    "link_only": 33
+   },
+   "mismatches": [
+    [
+     "differ",
+     "key changed",
+     "annual-annual",
+     2
+    ],
+    [
+     "link_only",
+     "key changed",
+     "annual-annual",
+     32
+    ],
+    [
+     "link_only",
+     "target not in scope",
+     "periodic-annual",
+     1
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "annual-annual",
+     1
+    ]
+   ]
+  },
+  "previous_visit_all": {
+   "summary": {
+    "n": 376737,
+    "same": 258779,
+    "both_none": 114632,
+    "differ": 3,
+    "natural_only": 1436,
+    "link_only": 1887
+   },
+   "mismatches": [
+    [
+     "differ",
+     "key changed",
+     "annual-annual",
+     2
+    ],
+    [
+     "differ",
+     "key changed",
+     "periodic-annual",
+     1
+    ],
+    [
+     "link_only",
+     "key changed",
+     "periodic-periodic",
+     1751
+    ],
+    [
+     "link_only",
+     "target not in scope",
+     "periodic-periodic",
+     104
+    ],
+    [
+     "link_only",
+     "key changed",
+     "annual-annual",
+     31
+    ],
+    [
+     "link_only",
+     "target not in scope",
+     "periodic-annual",
+     1
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "periodic-annual",
+     1338
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "periodic-periodic",
+     97
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "annual-annual",
+     1
+    ]
+   ]
+  },
+  "previous_status": {
+   "n": 3659053,
+   "agree": 2895129,
+   "disagree": 0,
+   "status_no_record": 31410,
+   "record_no_status": 5,
+   "new_tree": 732509
+  },
+  "renumbered": {
+   "fia_links": 34,
+   "natural_hits": 27,
+   "also_fia_links": 27
+  },
+  "conditions": {
+   "conditions_matrix": 212549,
+   "with_tree_link": 124288,
+   "dominant_agree": 120275
+  }
+ },
+ "all_states": {
+  "previous_visit_annual": {
+   "summary": {
+    "n": 1221386,
+    "same": 828119,
+    "both_none": 355180,
+    "differ": 28,
+    "natural_only": 3625,
+    "link_only": 34434
+   },
+   "mismatches": [
+    [
+     "differ",
+     "same key",
+     "annual-annual",
+     26
+    ],
+    [
+     "differ",
+     "key changed",
+     "annual-annual",
+     2
+    ],
+    [
+     "link_only",
+     "target not in scope",
+     "periodic-annual",
+     34384
+    ],
+    [
+     "link_only",
+     "key changed",
+     "annual-annual",
+     43
+    ],
+    [
+     "link_only",
+     "key changed",
+     "periodic-annual",
+     7
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "annual-annual",
+     3625
+    ]
+   ]
+  },
+  "previous_visit_all": {
+   "summary": {
+    "n": 1952101,
+    "same": 972561,
+    "both_none": 829438,
+    "differ": 50,
+    "natural_only": 113785,
+    "link_only": 36267
+   },
+   "mismatches": [
+    [
+     "differ",
+     "same key",
+     "annual-annual",
+     26
+    ],
+    [
+     "differ",
+     "target not in scope",
+     "periodic-annual",
+     21
+    ],
+    [
+     "differ",
+     "key changed",
+     "annual-annual",
+     2
+    ],
+    [
+     "differ",
+     "key changed",
+     "periodic-annual",
+     1
+    ],
+    [
+     "link_only",
+     "target not in scope",
+     "periodic-annual",
+     34363
+    ],
+    [
+     "link_only",
+     "key changed",
+     "periodic-periodic",
+     1751
+    ],
+    [
+     "link_only",
+     "target not in scope",
+     "periodic-periodic",
+     104
+    ],
+    [
+     "link_only",
+     "key changed",
+     "annual-annual",
+     42
+    ],
+    [
+     "link_only",
+     "key changed",
+     "periodic-annual",
+     7
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "periodic-periodic",
+     105322
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "periodic-annual",
+     4838
+    ],
+    [
+     "natural_only",
+     "target not in scope",
+     "annual-annual",
+     3625
+    ]
+   ]
+  },
+  "previous_status": {
+   "n": 12456968,
+   "agree": 10262768,
+   "disagree": 124,
+   "status_no_record": 75762,
+   "record_no_status": 16266,
+   "new_tree": 2102048
+  },
+  "renumbered": {
+   "fia_links": 45,
+   "natural_hits": 34,
+   "also_fia_links": 34
+  },
+  "conditions": {
+   "conditions_matrix": 985921,
+   "with_tree_link": 410429,
+   "dominant_agree": 398296
+  }
+ }
+}
