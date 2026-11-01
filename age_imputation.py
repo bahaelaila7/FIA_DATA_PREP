@@ -820,8 +820,8 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
 # Rule: (age_domain value, STATECD, planted?, age sources, minimum DIA, fit scopes, maximum DIA
 # (exclusive; None = no upper bound)). planted = the tree's age_stratum (r5 M-5).
 #   (known_bias_ky_natural_treeage: retired by D13 — natural (k) is INFO by wood group)
-#   (known_bias_fl_planted_model_10plus: retired by D47 — under the D40 / D46 age model the pooled
-#    FL 10-15 in cell passes (-2.9 yr); only 15+ in stays excepted)
+#   (known_bias_fl_planted_model_10plus: retired by D47 for the 12,21,28 pool, where FL 10-15 in
+#    passes (-2.9 yr); back for the R4 scope, D60)
 # r8 D47.5, re-measured 2026-10-28 on the D40 / D46 model ((j) model minus mapped TreeAge; only
 # trees without a TreeAge record take the model age, so the flags mark MODEL ages):
 #   known_bias_fl_planted_model_15plus   FL planted, DIA >= 15 in: pooled 12,21,28 -4.3 yr,
@@ -830,10 +830,15 @@ def fit_age_model(train: pl.DataFrame, est=None) -> tuple:
 #                                        (D46 raw-TreeAge residual), pooled +4.2 yr (sign flips
 #                                        with the fit scope: not stable to the training set)
 #   known_bias_tn_planted_model_15plus   TN planted, DIA >= 15 in: single-state 47 -3.1 yr
+#   D60 (R4 fit scope, 2026-11-01; the one-DB-per-region fit is new, so the cells are re-measured, D14):
+#   known_bias_fl_planted_model_10plus   FL planted, DIA >= 10 in: -3.6 (10-15) / -4.9 (15+) yr
+#   known_bias_ky_planted_model_5to10    KY planted, 5 <= DIA < 10 in: -4.4 yr
 KNOWN_BIAS_FLAGS = [
     ("known_bias_fl_planted_model_15plus", 12, True, ("model",), 15.0, ("12", "12,21,28"), None),
     ("known_bias_ky_planted_model_10to15", 21, True, ("model",), 10.0, ("21", "12,21,28"), 15.0),
     ("known_bias_tn_planted_model_15plus", 47, True, ("model",), 15.0, ("47",), None),
+    ("known_bias_fl_planted_model_10plus", 12, True, ("model",), 10.0, ("1,12,13,21,28,37,45,47",), None),
+    ("known_bias_ky_planted_model_5to10", 21, True, ("model",), 5.0, ("1,12,13,21,28,37,45,47",), 10.0),
 ]
 FIT_SCOPE = None   # set in __main__ from the DB's states
 

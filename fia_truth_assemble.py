@@ -33,11 +33,11 @@ def write_raw_schema(con, states):
     con.execute("CREATE SCHEMA raw")
     con.execute(f"""CREATE TABLE raw.PLOT AS
         SELECT t.* REPLACE ({natural_visit_id('t')} AS CN, {natural_visit_id('o')} AS PREV_PLT_CN), t.CN AS FIA_CN
-        FROM fia.main.PLOT t LEFT JOIN fia.main.PLOT o ON o.CN = t.PREV_PLT_CN WHERE t.STATECD IN ({st})""")
+        FROM fia.main.PLOT t LEFT JOIN fia.main.PLOT o ON o.CN = t.PREV_PLT_CN WHERE t.STATECD IN ({st}) -- cn-boundary""")
     for t in RAW_SCHEMA_TABLES:
         con.execute(f"""CREATE TABLE raw."{t}" AS SELECT t.* REPLACE ({natural_visit_id('t')} AS PLT_CN), t.PLT_CN AS FIA_PLT_CN
             FROM fia.main."{t}" t WHERE t.STATECD IN ({st})
-              AND EXISTS (SELECT 1 FROM fia.main.PLOT q WHERE {dbconn.nk('q', 't')} AND q.CN = t.PLT_CN)""")
+              AND EXISTS (SELECT 1 FROM fia.main.PLOT q WHERE {dbconn.nk('q', 't')} AND q.CN = t.PLT_CN) -- cn-boundary""")
     for t in ("SURVEY", "REF_SPECIES", "data_plot_eco"):
         con.execute(f'CREATE TABLE raw."{t}" AS SELECT * FROM fia.main."{t}"')
     dup = con.execute("SELECT count(*) - count(DISTINCT CN) FROM raw.PLOT").fetchone()[0]

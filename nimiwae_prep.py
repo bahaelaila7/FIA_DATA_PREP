@@ -21,62 +21,7 @@ def split_of(key: str) -> str:
     h = zlib.crc32(key.encode()) % 100
     return 'train' if h < 70 else 'val' if h < 85 else 'test'
 
-def load(db: str) -> pl.DataFrame:
-    """D53 slot frame: EVERY clean visit of a tree's subplot (curation's clean_subplot_years) up to the tree's last real record, so which
-    visits are missing no longer depends on the rule's phantom rows (dropped). slot_kind: 'real' (tallied), 'pre' (before the first real
-    record: existence unknown), 'gap' (a visit inside the tree's record without a real row: exists, size missing). Per slot: whether the
-    tree's plot type was sampled at the visit (forested subplot / microplot condition), the subplot competition from the real rows, the
-    condition (COND via the PLOT CN at that date; the tree's condid where it has a row, else its first condid, else 1); per tree: the first
-    record's RECONCILECD (1 ingrowth, 3 missed live, ...) and statics from the first real record."""
-    c = duckdb.connect(db, read_only=True)
-    q = """
-    WITH real AS (SELECT * FROM tree_trajectories WHERE intro_type = 'real'),
-    sub AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, sum(ba) sub_ba, sum(tpa) sub_tpa FROM real GROUP BY ALL),
-    ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, CCLCD cclcd, RECONCILECD rcd
-           FROM curated_trees WHERE STATUSCD = 1),
-    tr AS (SELECT r.statecd, r.unitcd, r.countycd, r.plot, r.subp, r.tree, min(r.measdate) d0, max(r.measdate) d1,
-                  arg_min(r.condid, r.measdate) condid0, arg_min(r.species_symbol, r.measdate) species_symbol, arg_min(r.spgrpcd, r.measdate) spgrpcd,
-                  arg_min(r.major_spgrpcd, r.measdate) major_spgrpcd, arg_min(r.sftwd_hrdwd, r.measdate) sftwd_hrdwd,
-                  arg_min(r.epa_l3, r.measdate) epa_l3, arg_min(r.epa_l4, r.measdate) epa_l4, arg_min(r.land_use, r.measdate) land_use
-           FROM real r GROUP BY ALL),
-    rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING (statecd, unitcd, countycd, plot, subp, tree)
-           WHERE ct.measdate = tr.d0),
-    vis AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, MEASDATE measdate,
-                   forest_subpcond_prop, forest_micrcond_prop FROM clean_subplot_years),
-    fr AS (SELECT tr.*, vis.measdate, vis.forest_subpcond_prop, vis.forest_micrcond_prop FROM tr
-           JOIN vis USING (statecd, unitcd, countycd, plot, subp) WHERE vis.measdate <= tr.d1
-           UNION ALL                                              -- real rows on visits missing from the clean list (kept)
-           SELECT tr.*, r.measdate, NULL, NULL FROM tr JOIN real r USING (statecd, unitcd, countycd, plot, subp, tree)
-           WHERE NOT EXISTS (SELECT 1 FROM vis v WHERE v.statecd = r.statecd AND v.unitcd = r.unitcd AND v.countycd = r.countycd
-                             AND v.plot = r.plot AND v.subp = r.subp AND v.measdate = r.measdate)),
-    pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, make_date(MEASYEAR::INT, MEASMON::INT, MEASDAY::INT) md,
-                  max(CN) cn FROM PLOT GROUP BY ALL)   -- tree_trajectories.plt_cn is the plot key, not the FIA CN
-    SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate,
-           CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' ELSE 'gap' END slot_kind,
-           CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
-           t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
-           f.species_symbol, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use, rc.rcd0,
-           f.forest_subpcond_prop, f.forest_micrcond_prop,
-           coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
-           coalesce(c1.SICOND, c0.SICOND) sicond, coalesce(c1.SITECLCD, c0.SITECLCD) siteclcd, coalesce(c1.PHYSCLCD, c0.PHYSCLCD) physclcd,
-           coalesce(c1.SLOPE, c0.SLOPE) slope, coalesce(c1.ASPECT, c0.ASPECT) aspect,
-           coalesce(c1.TRTCD1, c0.TRTCD1) trtcd1, coalesce(c1.DSTRBCD1, c0.DSTRBCD1) dstrbcd1,
-           coalesce(c1.STDAGE, c0.STDAGE) stdage, coalesce(c1.FLDAGE, c0.FLDAGE) fldage, coalesce(c1.BALIVE, c0.BALIVE) balive,
-           coalesce(c1.FORTYPCD, c0.FORTYPCD) fortypcd, coalesce(c1.STDSZCD, c0.STDSZCD) stdszcd, coalesce(c1.ALSTK, c0.ALSTK) alstk,
-           coalesce(c1.LIVE_CANOPY_CVR_PCT, c0.LIVE_CANOPY_CVR_PCT) canopy_pct, coalesce(c1.STDORGCD, c0.STDORGCD) stdorgcd
-    FROM fr f
-    LEFT JOIN real t USING (statecd, unitcd, countycd, plot, subp, tree, measdate)
-    LEFT JOIN ct USING (statecd, unitcd, countycd, plot, subp, tree, measdate)
-    LEFT JOIN rc USING (statecd, unitcd, countycd, plot, subp, tree)
-    LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
-    LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.md = f.measdate
-    LEFT JOIN COND c1 ON c1.PLT_CN = pc.cn AND c1.CONDID = coalesce(t.condid, f.condid0)
-    LEFT JOIN COND c0 ON c0.PLT_CN = pc.cn AND c0.CONDID = 1
-    ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate"""
-    df = pl.from_arrow(c.execute(q).arrow()); c.close()
-    return df
-
-def load54(db: str, fiadb: str = None) -> pl.DataFrame:
+def load54(db: str) -> pl.DataFrame:
     """D54 lineage frame. Counted plot visits = at least one subplot with a forested condition; a subplot's span = its first to last
     such visit; a tree's lineage = every counted visit in its subplot's span (before its debut, during and after its record).
     slot_kind real / pre / gap / post. Per slot (D55 am. 7): the condition fields are SUBPLOT-level at the visit, area-weighted by
@@ -87,7 +32,6 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
     (date, RC). Stand fields that include the tree itself (BALIVE, ALSTK, STDSZCD) are not loaded. D54 am. 5: resolved species code and a
     "species revised" flag per tree; per real record TREECLCD, ACTUALHT and, from FIADB TREE by CN, DAMAGE_AGENT_CD1-3 (recorded 2013+)."""
     c = duckdb.connect(db, read_only=True)
-    if fiadb: c.execute(f"ATTACH '{fiadb}' AS fdb (READ_ONLY)")
     K = "statecd, unitcd, countycd, plot, subp, tree"
     q = f"""
     WITH real AS (SELECT * FROM tree_trajectories WHERE intro_type = 'real'),
@@ -99,10 +43,12 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
            JOIN pv USING (statecd, unitcd, countycd, plot)
            LEFT JOIN csy USING (statecd, unitcd, countycd, plot, subp, measdate) WHERE pv.measdate BETWEEN sp.s0 AND sp.s1),
     ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, STATUSCD statuscd,
-                  CCLCD cclcd, RECONCILECD rcd, AGENTCD agentcd, CN tcn, TREECLCD treeclcd, ACTUALHT actualht FROM curated_trees),
-    dm AS (SELECT ct.tcn, ft.DAMAGE_AGENT_CD1 dmg1, ft.DAMAGE_AGENT_CD2 dmg2, ft.DAMAGE_AGENT_CD3 dmg3 FROM ct
-           JOIN {"fdb.TREE" if fiadb else "(SELECT NULL CN, NULL STATECD, NULL DAMAGE_AGENT_CD1, NULL DAMAGE_AGENT_CD2, NULL DAMAGE_AGENT_CD3 WHERE false)"} ft
-           ON ft.CN = ct.tcn AND ft.STATECD = ct.statecd WHERE ct.statuscd = 1),
+                  CCLCD cclcd, RECONCILECD rcd, AGENTCD agentcd, INVYR invyr, TREECLCD treeclcd, ACTUALHT actualht,
+                  unitcd_raw, countycd_raw, plot_raw FROM curated_trees),
+    dm AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.measdate,
+                  ft.DAMAGE_AGENT_CD1 dmg1, ft.DAMAGE_AGENT_CD2 dmg2, ft.DAMAGE_AGENT_CD3 dmg3 FROM ct
+           JOIN raw.TREE ft ON ft.STATECD = ct.statecd AND ft.UNITCD = ct.unitcd_raw AND ft.COUNTYCD = ct.countycd_raw AND ft.PLOT = ct.plot_raw
+                AND ft.INVYR = ct.invyr AND ft.SUBP = ct.subp AND ft.TREE = ct.tree % 100000 WHERE ct.statuscd = 1),   -- as-recorded key; curated TREE = raw number + 100000 k after a reuse split
     tr AS (SELECT {K}, min(measdate) d0, max(measdate) d1, arg_min(condid, measdate) condid0,
                   arg_min(species_symbol, measdate) species_symbol, arg_min(spgrpcd, measdate) spgrpcd, arg_min(major_spgrpcd, measdate) major_spgrpcd,
                   arg_min(sftwd_hrdwd, measdate) sftwd_hrdwd, arg_min(epa_l3, measdate) epa_l3, arg_min(epa_l4, measdate) epa_l4,
@@ -143,7 +89,7 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
                   {", ".join(f"sum(wt * (len(list_filter(dst, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) dst_s{c}" for c in (10, 20, 30, 40, 50, 60, 70, 80, 90))}
            FROM bw GROUP BY ALL),
     pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, make_date(MEASYEAR::INT, MEASMON::INT, MEASDAY::INT) md,
-                  max(CN) cn, any_value(DESIGNCD) designcd FROM PLOT GROUP BY ALL)
+                  any_value(DESIGNCD) designcd FROM PLOT GROUP BY ALL)
     SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate, pc.designcd,
            CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' WHEN f.measdate <= f.d1 THEN 'gap' ELSE 'post' END slot_kind,
            CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
@@ -161,7 +107,8 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
     FROM fr f
     LEFT JOIN real t USING ({K}, measdate)
     LEFT JOIN ct USING ({K}, measdate)
-    LEFT JOIN dm ON dm.tcn = ct.tcn AND t.tree IS NOT NULL
+    LEFT JOIN dm ON dm.statecd = f.statecd AND dm.unitcd = f.unitcd AND dm.countycd = f.countycd AND dm.plot = f.plot AND dm.subp = f.subp
+         AND dm.tree = f.tree AND dm.measdate = f.measdate AND t.tree IS NOT NULL
     LEFT JOIN rc USING ({K}) LEFT JOIN dr USING ({K}) LEFT JOIN s0 USING ({K})
     LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
     LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.md = f.measdate
@@ -255,14 +202,13 @@ def main():
     ap.add_argument('--from-seq', help='re-split an existing seq.parquet instead of reading the DBs')
     ap.add_argument('--scheme', default='d49', choices=['d49', 'r2', 'r3'])
     ap.add_argument('--prism', help='PRISM L4 yearly DB: add the D51 climate drivers')
-    ap.add_argument('--frame', default='d53', choices=['d53', 'd54'])
-    ap.add_argument('--fiadb', help='FIADB (read-only) for DAMAGE_AGENT_CD1-3 by tree CN (D54 amendment 5)'); a = ap.parse_args()
+    a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']
     if a.from_seq:
         df = pl.read_parquet(a.from_seq)
     else:
-        df = pl.concat([(load54(d, a.fiadb) if a.frame == 'd54' else load(d)) for d in a.dbs], how='vertical_relaxed')
+        df = pl.concat([load54(d) for d in a.dbs], how='vertical_relaxed')
         df = df.with_columns(
             pl.concat_str([pl.col(c).cast(pl.Utf8) for c in k[:4]], separator='_').alias('plot_key'),
             (pl.col('intro_type') == 'real').alias('obs'),

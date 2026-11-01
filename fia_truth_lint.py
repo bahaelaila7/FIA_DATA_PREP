@@ -19,12 +19,11 @@ def scan(path, name, findings):
         if allow and allow[0] in ln: inside = True
         if allow and allow[1] in ln: inside = False
         s = ln.split("#")[0]
-        if not inside and JOIN.search(s) and ("JOIN" in s.upper() or " ON " in s.upper() or "=" in s) and '"' not in s.split("=")[0][-1:]:
+        if not inside and "cn-boundary" not in ln and JOIN.search(s) and ("JOIN" in s.upper() or " ON " in s.upper() or "=" in s) and '"' not in s.split("=")[0][-1:]:
             findings.append(f"L1 {name}:{i}: {ln.strip()[:110]}")
-        m = re.search(r"\[[^\]]*\"CONDID\"[^\]]*\]", s)
-        if m and "INVYR" not in m.group(0) and "MEASDATE" not in m.group(0) and ("COND_ID" in s or "over(" in s):
-            if not re.search(r"COND_ID\s*\+\s*\[\s*\"MEASDATE\"", " ".join(txt[i - 1:i + 2])):
-                findings.append(f"L2 {name}:{i}: {ln.strip()[:110]}")
+        # COND_ID (plot key + CONDID) is a condition only together with its visit
+        if re.search(r"(over|group_by|shift|partition_by)\(\s*COND_ID\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
+            findings.append(f"L2 {name}:{i}: {ln.strip()[:110]}")
 
 
 def main():

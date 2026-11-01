@@ -692,17 +692,20 @@ def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.Data
     no_link = pl.col("prev_status_cd").is_null()
     r_dead = no_link & pl.col("_pst").is_in([2, 3])
     r_newrc = no_link & pl.col("RECONCILECD").cast(pl.Int32).is_in(list(NEW_TREE_RC))
+    # PREV_STATUS_CD 0: the number's previous record is a STATUSCD 0 closure (dropped from this table), so this
+    # record continues nothing here: a new tally on the closed number (5 records in R4: one plot re-tallied after RC9)
+    r_closed = pl.col("prev_status_cd") == 0
     has_prev = pl.col("_pst").is_not_null()
     d = d.with_columns([(has_prev & r).fill_null(False).alias(n) for n, r in
-                        (("_s_dead", r_dead), ("_s_newrc", r_newrc), ("_s_visit", pl.col("_brk")))])
-    new_seg = pl.any_horizontal("_s_dead", "_s_newrc", "_s_visit")
+                        (("_s_dead", r_dead), ("_s_newrc", r_newrc), ("_s_closed", r_closed), ("_s_visit", pl.col("_brk")))])
+    new_seg = pl.any_horizontal("_s_dead", "_s_newrc", "_s_closed", "_s_visit")
     d = d.with_columns(new_seg.cast(pl.Int64).cum_sum().over(TREE_ID).alias("_seg"))
     d = d.with_columns((pl.col("_seg").max().over(TREE_ID) > 0).alias("tree_key_split"))
     n_split = d.filter(pl.col("_seg") > 0).select(TREE_ID).unique().height
     n_rec = d.filter(pl.col("_seg") > 0).height
-    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_newrc", "_s_visit")]).row(0, named=True)
+    why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_newrc", "_s_closed", "_s_visit")]).row(0, named=True)
     d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(
-        ["_pst", "_pmd", "_seg", "_s_dead", "_s_newrc", "_s_visit", "_brk"])
+        ["_pst", "_pmd", "_seg", "_s_dead", "_s_newrc", "_s_closed", "_s_visit", "_brk"])
     print(f"[step4s] tree-number reuse: {n_split:,} keys split, {n_rec:,} records moved to a new tree id; "
           f"segment starts by rule (a record may meet several): {why}")
     return d.sort(TREE_ID + ["MEASDATE"])

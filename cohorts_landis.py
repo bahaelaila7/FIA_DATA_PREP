@@ -1107,7 +1107,7 @@ def plot_land_use_sql(con) -> str:
     """r7 D44 (C F10) / D43: THE 2-way land_use per plot, for every table (Sim A, _stdorg, Sim B,
     tree_trajectories): 'artificial' iff any condition of the plot's PRODUCT visits has
     STDORGCD = 1, else 'natural' (plots without any STDORGCD get no row -> NULL land_use).
-    Only the COND rows whose PLT_CN is a visit of the curated product count (`product_visits`,
+    Only the COND rows of a visit of the curated product count (`product_visits`,
     step 1; the same visit set export_reference_tables copies): a periodic plot that reused the
     key (KY 1986-88) no longer flips natural plots to artificial (D43).
     Columns: statecd, unitcd, countycd, plot, land_use."""
@@ -1119,7 +1119,8 @@ def plot_land_use_sql(con) -> str:
                CASE WHEN MAX(c.STDORGCD) = 1 THEN 'artificial' ELSE 'natural' END AS land_use
         FROM COND c
         WHERE c.STATECD IN ({st}) AND c.STDORGCD IS NOT NULL
-          AND CAST(c.PLT_CN AS VARCHAR) IN (SELECT PLT_CN FROM product_visits)
+          AND EXISTS (SELECT 1 FROM product_visits v WHERE v.STATECD = c.STATECD AND v.UNITCD = c.UNITCD
+                      AND v.COUNTYCD = c.COUNTYCD AND v.PLOT = c.PLOT AND v.INVYR = c.INVYR)
         GROUP BY ALL"""
 
 

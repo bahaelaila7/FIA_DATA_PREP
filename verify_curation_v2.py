@@ -110,6 +110,8 @@ _KY_D46 = ("KY: D46 rejected every TreeAge mapping curve, so planted estage is r
            "those ages are not stable to the training set (D47; deferred DIA-class model, D46 option d)")
 _TN_RTM = ("TN: model vs mapped TreeAge regression to the mean at 15+ in planted (266 trees); only trees WITHOUT a "
            "TreeAge record take the model age (D47)")
+_R4_RTM = ("model vs mapped TreeAge under the regional fit: regression to the mean toward the regional planted bulk (loblolly-"
+           "dominated); only trees WITHOUT a TreeAge record take the model age (D60)")
 KNOWN_EXCEPTIONS = {
     ("12,21,28", "j", 12, "planted", "15+"): dict(
         observed=-4.3, limit=3.0, flag="known_bias_fl_planted_model_15plus", reason=_FL_RTM),
@@ -122,6 +124,15 @@ KNOWN_EXCEPTIONS = {
         observed=-4.9, limit=3.0, flag="known_bias_ky_planted_model_10to15", reason=_KY_D46),
     ("47", "j", 47, "planted", "15+"): dict(
         observed=-3.1, limit=3.0, flag="known_bias_tn_planted_model_15plus", reason=_TN_RTM),
+    # D60: the R4 regional fit (one DB per region, D59) re-measured; model ages only, 86 FL + 123 KY live records
+    ("1,12,13,21,28,37,45,47", "j", 12, "planted", "10-15"): dict(
+        observed=-3.6, limit=3.0, flag="known_bias_fl_planted_model_10plus", reason=_R4_RTM),
+    ("1,12,13,21,28,37,45,47", "j", 12, "planted", "15+"): dict(
+        observed=-4.9, limit=3.0, flag="known_bias_fl_planted_model_10plus", reason=_R4_RTM),
+    ("1,12,13,21,28,37,45,47", "j", 21, "planted", "5-10"): dict(
+        observed=-4.4, limit=3.0, flag="known_bias_ky_planted_model_5to10", reason=_R4_RTM),
+    ("1,12,13,21,28,37,45,47", "h", 21, "planted"): dict(
+        observed=5.6, limit=4.4, flag="none", reason="KY planted: 31 condition-visits, below the reliability floor (D60)"),
     # (d): value = number of species tested for "empty"; the largest median inversion (yr) for a species
     ("21", "d", "planted", "empty"): dict(
         observed=0.0, limit=0.0, flag="none",
@@ -1615,8 +1626,10 @@ _kb_rules = {   # r8 D47.5 (age_imputation.KNOWN_BIAS_FLAGS, re-derived here)
                                            ("21", "12,21,28")),
     "known_bias_tn_planted_model_15plus": ("STATECD=47 AND age_stratum='planted' AND age_source='model' AND DIA>=15",
                                            ("47",)),
-    # retired (D47): a stale flag must not appear in any scope
-    "known_bias_fl_planted_model_10plus": ("FALSE", ()),
+    "known_bias_fl_planted_model_10plus": ("STATECD=12 AND age_stratum='planted' AND age_source='model' AND DIA>=10",
+                                           ("1,12,13,21,28,37,45,47",)),
+    "known_bias_ky_planted_model_5to10": ("STATECD=21 AND age_stratum='planted' AND age_source='model' AND DIA>=5 AND DIA<10",
+                                          ("1,12,13,21,28,37,45,47",)),
 }
 for flag_, (rule_, scopes_) in _kb_rules.items():
     if FIT_SCOPE not in scopes_:
