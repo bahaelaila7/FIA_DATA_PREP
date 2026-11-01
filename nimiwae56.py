@@ -226,6 +226,10 @@ class NIMIWAE56(nn.Module):
             s.lsu = nn.Parameter(torch.full((2,), math.log(0.3)))                                     # σ_D, σ_H (log)
             s.u_net = nn.Sequential(nn.Linear(d + DZ, d), nn.GELU(), nn.Linear(d, 4))               # per slot: μ_u (2), log σ²_u (2)
             with torch.no_grad(): s.u_net[-1].weight.zero_(); s.u_net[-1].bias.zero_()                # starts at the prior
+    def born_gate(s, lp1, lp0, z, B):
+        return lp1, lp0, torch.ones_like(lp1, dtype=torch.bool)
+    def extra_lw(s, lDp, z, B, mp):
+        return 0.0
     def enc_params(s):
         mods = (s.st_q, s.ercd, s.ecc, s.qin, s.qtr, s.qout) + ((s.u_net,) if s.noise else ())
         return [p for m in mods for p in m.parameters()]
@@ -308,6 +312,7 @@ class NIMIWAE56(nn.Module):
         lDp, lHp = torch.log(D.clamp(min=1e-3)), torch.log(H.clamp(min=1.0))
         xe = KAPPA * (lDp - B['lex'][None])                                                             # qualifies at the smallest level
         lp1, lp0 = F.logsigmoid(xe), F.logsigmoid(-xe)
+        lp1, lp0, born = s.born_gate(lp1, lp0, z, B)                                                    # D70 hook; base model: no gate
         nl = lambda x, mu, ls: -0.5 * ((x - mu) / torch.exp(ls)) ** 2 - ls - c2
         rho = RHO_MAX * torch.sigmoid(s.lrho); lr, l1r = torch.log(rho), torch.log(1 - rho)
         v, real, ev, mode = B['v'][None], B['real'][None], B['ev'][None], B['mode'][None]
@@ -341,7 +346,7 @@ class NIMIWAE56(nn.Module):
         lle = Ca + Cg                                                                                    # [K, n, E = T+1]
         l, nv = B['l'][None, :, None], B['v'].sum(1).long()[None, :, None]
         with torch.no_grad():
-            exists = (xe > 0) & (v > 0)
+            exists = (xe > 0) & (v > 0) & born
             a_ = torch.where(exists.any(-1), torch.argmax(exists.float(), -1), B['f'][None].expand(K, -1))
             a_ = torch.minimum(a_, B['f'][None].expand(K, -1))[..., None]
         lsv, ldie, lcut = lend[..., 0], lend[..., 1], lend[..., 2]
@@ -366,15 +371,16 @@ class NIMIWAE56(nn.Module):
         lrec = lcr + lcc + ldm + lbk + lcl
         lpz = (-0.5 * (z - mp) ** 2 / torch.exp(lp) - 0.5 * lp - c2).sum(-1)
         lqz = (-0.5 * (z - mq) ** 2 / torch.exp(lq) - 0.5 * lq - c2).sum(-1)
-        lw = lpx + lrec + lpz - lqz + lpu - lqu
-        out = dict(lw=lw, lpost=lj - lpx[..., None, None], D=D, H=H, p1=torch.exp(lp1), lsdisc=s.lsdisc, z=z, u=u)
+        lxt = s.extra_lw(lDp, z, B, mp)                                                                 # D70 hook; base model: 0
+        lw = lpx + lrec + lpz - lqz + lpu - lqu + lxt
+        out = dict(lw=lw, lpost=lj - lpx[..., None, None], D=D, H=H, p1=torch.exp(lp1), lsdisc=s.lsdisc, z=z, u=u, born=born)
         if dreg:
             mqd, lqd = mq.detach(), lq.detach()
             lqu_d = 0.0
             if s.noise:                                                                               # stop-gradient on encoder-2 weights and slot states; z keeps its path
                 muu_d, lvu_d = s.qu(hs.detach(), z, params={k: v.detach() for k, v in s.u_net.named_parameters()})
                 lqu_d = ((-0.5 * (u - muu_d) ** 2 / torch.exp(lvu_d) - 0.5 * lvu_d - c2) * B['v'][None, :, :, None]).sum((-1, -2))
-            out['lw_dreg'] = lpx + lrec + lpz - (-0.5 * (z - mqd) ** 2 / torch.exp(lqd) - 0.5 * lqd - c2).sum(-1) + lpu - lqu_d
+            out['lw_dreg'] = lpx + lrec + lpz - (-0.5 * (z - mqd) ** 2 / torch.exp(lqd) - 0.5 * lqd - c2).sum(-1) + lpu - lqu_d + lxt
         return out
 
 def make_model(vocab, censor='known', growth='flex', noise=True, prior_ctx=False):
@@ -475,7 +481,7 @@ def sample_lineages(model, B, n_draws=10, K=100, bs=512):
         nv = b['v'].sum(1).long()[:, None, None]
         thr = torch.exp(b['lex'][:, :1])[:, None]                                                      # smallest-level threshold (- 0.05)
         # one contiguous existence interval: from the first slot at the level OR with a visible record, until the end
-        cand = (Dp >= thr) | ((b['real'] > 0)[:, None].expand(-1, n_draws, -1))
+        cand = ((Dp >= thr) & o['born'][k_, nidx]) | ((b['real'] > 0)[:, None].expand(-1, n_draws, -1))   # D70: not before birth
         first = torch.where(cand.any(-1), torch.argmax(cand.float(), -1), torch.full_like(e_, T_MAX))
         ex = (ar[None, None] >= first[..., None]) & ((ar[None, None] < e_[..., None]) | (e_[..., None] == T_MAX)) & (ar[None, None] < nv)
         lDp = torch.log(Dp.clamp(min=1e-3)); lHp = torch.log(Hp.clamp(min=1.0))

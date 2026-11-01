@@ -1835,3 +1835,18 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 
 **D70 amendment 3 (2026-11-01; user, after seeing the bias risks: do not use structured growth). Replaces am. 2.** The joint model keeps flexible growth, the D55 and D56 selection, with no per-interval noise (D56 selected the base arm). The gap am. 2 was meant to close is closed by scoring the shared age-size curve at every slot: log D_t ~ N(log S(t - b; species, site, soil, climate, v(z)), sigma_S). Age stays exact through b. The tie between age and size is soft, so a suppressed or released tree can leave the curve at a cost, and sigma_S is learned and monitored so it cannot swallow the constraint.
 
+**D70 amendment 4 (2026-11-01): build notes and bars, set before any training.** `nimiwae70.py`, `nimiwae70_verify.py`, `nimiwae_age_prep.py`.
+- **Birth anchor:** b = t_N - a_N, a_N > 0, N the frame's last slot. The first version anchored at the first slot, which forced birth before every slot and made the E1 bound impossible; the verifier now tests birth inside a lineage. t_N is known context, so the birth date cannot leak the tree's record pattern.
+- **Western ages go through the curve, not lineages.** Those regions have no curated lineages (D70), so TOTAGE and BHAGE records train and test the curve as site trees do. R4 lineages reach age only through the curve.
+- **Crown class in the curve:** delta(cc), with site trees as their own class. Western CCLCD identifies the crown effect; the site-tree class is its selection offset. Years to breast height come from the curve, TOTAGE none.
+- **Frame fix:** cut closures (STATUSCD 3, 11,918 records) had no dead date in the frame; `dr` now reads STATUSCD 2 and 3.
+- **Bars (VAL for choices; TEST once). All must pass before these ages replace `estimated_age`.**
+  - G1 site-tree age, linked held-out trees: MAE at or below the current `estimated_age` on the same trees; |median bias| <= 2 yr. Linked = exact DIA and exact height tier, scoring only, because the anchor decision is open.
+  - G2 curve age on held-out records, by source: |median bias| <= 3 yr; tally trees by crown class: overtopped |median bias| <= 5 yr.
+  - G3 small trees, RSCD 22 and 26 held-out, 1-5 in: |median bias| <= 3 yr.
+  - G4 stability: two seeds, natural saplings under 5 in: mean age differs by <= 0.2 yr (the current imputation moves 0.58 yr with a redraw).
+  - G5 calibration: 80 % interval of predicted age on G1 trees covers 0.75-0.85.
+  - G6 no harm to completion, against age off on the same data: size MAE log DIA at most 5 % worse; E2 and E3 Brier at most 0.005 worse.
+  - G7 sigma_S stays between 0.05 and 0.5, the range where the curve neither forces the path nor stops constraining it. Reported every epoch.
+  - G8 E1: on the hidden-number benchmark, E1 Brier at least 0.005 better than age off. If this fails the age bound stays off E1; the ages may still pass the rest.
+
