@@ -16,13 +16,13 @@ KV = "STATECD, UNITCD, COUNTYCD, PLOT, INVYR"
 R4 = (1, 12, 13, 21, 28, 37, 45, 47)
 SHIFTS = (-5, -4, -3, -2, 2, 3, 4, 5)    # tenths of an inch; +-1 is left out as a near miss rather than chance
 BAR = 0.95                               # D70, set before the first run: estimated precision a tier needs to be an anchor
-TIERS = {"dia": "TRUE", "dia_subp": "subp_same", "dia_ht": "ht_near", "dia_subp_ht": "subp_same AND ht_near"}
+TIERS = {"dia": "TRUE", "dia_subp": "subp_same", "dia_ht": "ht_near", "dia_subp_ht": "subp_same and ht_near", "dia_exact_ht": "dht == 0", "dia_subp_exact_ht": "subp_same and dht == 0"}   # the last two added after the first run (D70 am. 1)
 
 
 def links(c, shift):
     """one-to-one site tree <-> tally matches with tally DIA moved by `shift` tenths of an inch"""
     return c.execute(f"""
-      WITH m AS (SELECT s.scn, t.tid, t.CCLCD cc, (s.SUBP = t.SUBP) subp_same, COALESCE(abs(s.HT - t.HT) <= 5, FALSE) ht_near, s.HT - t.HT dht
+      WITH m AS (SELECT s.scn, t.tid, t.CCLCD cc, COALESCE(s.SUBP = t.SUBP, FALSE) subp_same, COALESCE(abs(s.HT - t.HT) <= 5, FALSE) ht_near, s.HT - t.HT dht
                  FROM st s JOIN tt t USING ({KV}, CONDID, SPCD) WHERE s.d10 = t.d10 + ({shift})),
       u AS (SELECT * FROM m QUALIFY count(*) OVER (PARTITION BY scn) = 1 AND count(*) OVER (PARTITION BY tid) = 1)
       SELECT * FROM u""").df()
@@ -39,7 +39,9 @@ def tier_table(c):
         n = len(r); prec = 1 - chance / n if n else None
         out[name] = dict(links=n, placebo_mean=round(chance, 1), precision=round(prec, 4) if prec is not None else None, passes_bar=bool(prec is not None and prec >= BAR),
                          dom_codom_real=cc(r), dom_codom_placebo=cc(__import__("pandas").concat(pool)) if pool else None,
-                         median_abs_dht=float(r.dht.abs().median()) if n and r.dht.notna().any() else None)
+                         median_abs_dht=float(r.dht.abs().median()) if n and r.dht.notna().any() else None,
+                         exact_ht_real=float((r.dht == 0).mean()) if n else None,      # diagnostic only: not part of the D70 bar
+                         exact_ht_placebo=float((__import__("pandas").concat(pool).dht == 0).mean()) if pool else None)
     return out
 
 
@@ -71,7 +73,13 @@ def coverage(c):
         SELECT RSCD, count(*) FILTER (WHERE a > 0) n, count(*) FILTER (WHERE a > 0 AND STATUSCD = 1) live, count(*) FILTER (WHERE a > 0 AND DIA < 1) lt1, count(*) FILTER (WHERE a > 0 AND DIA >= 1 AND DIA < 3) d1_3,
                count(*) FILTER (WHERE a > 0 AND DIA >= 3 AND DIA < 5) d3_5, count(*) FILTER (WHERE a > 0 AND DIA >= 5) ge5, count(*) FILTER (WHERE a > 0 AND CCLCD IN (1, 2, 3)) open_dom_cod,
                count(*) FILTER (WHERE a > 0 AND CCLCD = 4) intermediate, count(*) FILTER (WHERE a > 0 AND CCLCD = 5) overtopped, {pv} FROM r GROUP BY 1 ORDER BY 1""").df().to_dict("records")
-    return dict(TOTAGE=q("T.TOTAGE"), BHAGE=q("T.BHAGE"))
+    step = lambda col, pc: c.execute(f"""WITH r AS (SELECT s.RSCD, TRY_CAST({col} AS DOUBLE) a, TRY_CAST({pc} AS DOUBLE) pa, P.REMPER m
+                                              FROM f.main.TREE T JOIN f.main.PLOT P ON P.CN = T.PLT_CN JOIN f.main.SURVEY s ON s.CN = P.SRV_CN
+                                              WHERE s.ANN_INVENTORY = 'Y' AND s.RSCD IN (22, 26) AND T.STATUSCD = 1)
+        SELECT RSCD, count(*) n, round(median(a - pa), 1) med_step, round(median(m), 1) med_remper, count(*) FILTER (WHERE a = pa) same,
+               count(*) FILTER (WHERE abs(a - pa - m) <= 1) within1, count(*) FILTER (WHERE abs(a - pa - m) <= 3) within3, count(*) FILTER (WHERE a < pa) younger
+        FROM r WHERE a > 0 AND pa > 0 AND m > 0 GROUP BY 1 ORDER BY 1""").df().to_dict("records")
+    return dict(TOTAGE=q("T.TOTAGE"), BHAGE=q("T.BHAGE"), step_totage=step("T.TOTAGE", "T.PREV_TOTAGE_RMRS"), step_bhage=step("T.BHAGE", "T.PREV_BHAGE_RMRS"))
 
 
 def selftest():
@@ -84,8 +92,8 @@ def selftest():
                   ({v}, 4, 4, 'd', 30, 5, 123)""")
     r = links(c, 0)
     ok = [set(r.scn) == {1}, r.tid.tolist() == ["a"]]                 # 2 is ambiguous, 3 has no DIA match, 4 is another condition
-    s = links(c, -3)                                                  # d: 123 - 3 = 120 is now also a candidate of site tree 2, still ambiguous
-    ok.append(2 not in set(s.scn))
+    s = links(c, -3)                                                  # d: 123 - 3 = 120 is the only tally at site tree 2's DIA once shifted
+    ok.append(set(s.scn) == {2})
     s2 = links(c, 30)                                                 # 120 + 30 = 150: tallies b and c both match site tree 3, ambiguous
     ok.append(3 not in set(s2.scn))
     t = tier_table(c)

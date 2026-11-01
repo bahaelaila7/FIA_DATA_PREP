@@ -1811,3 +1811,10 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - **Data (user):** RSCD 22 and 26 tally ages are used for this model. R4 curation and products stay R4-only; those records are loaded for the model and are not curated into a truth DB.
 - **Site trees tied to tally records (user):** usable as an extra anchor if the link is reliable. `age_anchor_audit.py` measures it. **Bar, set before the first run:** a tier needs estimated precision >= 0.95 by the DIA-shift placebo, and dominant or codominant share well above placebo. Ages are never used to choose or score a link.
 
+**D70 amendment 1 (2026-11-01): `age_anchor_audit.py`, `docs/AGE_ANCHOR_AUDIT.json`.** R4 annual, 78,366 site-tree rows that are not carried forward.
+- **Links:** by estimated precision, DIA only 0.826 (28,014); + SUBP 0.944 (9,876); + height within 5 ft 0.888 (26,639); both 0.959 (9,776). Added after the first run: exact height 0.984 (24,718); SUBP and exact height 0.994 (9,565).
+- **The bar is not met as written.** The crown-class clause fails on every tier: dominant or codominant share is 97-98 % on real links and 96-98 % on placebo links, because any tally tree within 0.5 in of a site tree's size is already large. The clause does not discriminate. It is not dropped or replaced without the user; no link is used yet.
+- **Exact height, a diagnostic added after the first run:** among DIA-only links 88.2% have the site tree's height exactly, against 8.0% of placebo links.
+- **Coverage, RSCD 22 and 26, annual, live:** TOTAGE 127,683 records, of which 36,230 are 1-3 in, 6,979 are 3-5 in, 9,141 overtopped. BHAGE 521,650, of which 20,283 are 1-3 in, 25,084 are 3-5 in, 39,666 overtopped. No age under 1 in.
+- **Repeat ages, RSCD 22 only:** TOTAGE 47,386 pairs, 96.1 % step within 1 yr of REMPER; BHAGE 77,153 pairs, 96.4 %. Median step and REMPER 10 yr. Under 1 % go backwards. Some of these may be computed by adding the interval rather than re-cored; the audit cannot tell.
+
