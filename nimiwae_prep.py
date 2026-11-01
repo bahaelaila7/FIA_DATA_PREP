@@ -79,9 +79,11 @@ def load(db: str) -> pl.DataFrame:
 def load54(db: str, fiadb: str = None) -> pl.DataFrame:
     """D54 lineage frame. Counted plot visits = at least one subplot with a forested condition; a subplot's span = its first to last
     such visit; a tree's lineage = every counted visit in its subplot's span (before its debut, during and after its record).
-    slot_kind real / pre / gap / post. Per slot: the tree's spot condition = the CONDID of its nearest real record, with that
-    condition's COND_STATUS_CD at the visit (1 = forest = sampled for trees) and its site / treatment / disturbance fields; microplot
-    forested share. Per tree: first-record RECONCILECD, curated terminal_fate, first dead record (date, AGENTCD), first status-0 event
+    slot_kind real / pre / gap / post. Per slot (D55 am. 7): the condition fields are SUBPLOT-level at the visit, area-weighted by
+    SUBPCOND_PROP over the subplot's accessible-forest conditions (all its conditions when it has none): weighted means (SICOND, SLOPE,
+    canopy; ASPECT circular), area-dominant classes (FORTYPCD, SITECLCD, PHYSCLCD, STDORGCD), the area share carrying each treatment /
+    disturbance code group (trt_s*, dst_s*). No CONDID is carried between visits (CONDIDs are per visit in FIADB); the subplot / microplot
+    forested shares give the sampling probability. Per tree: first-record RECONCILECD, curated terminal_fate, first dead record (date, AGENTCD), first status-0 event
     (date, RC). Stand fields that include the tree itself (BALIVE, ALSTK, STDSZCD) are not loaded. D54 am. 5: resolved species code and a
     "species revised" flag per tree; per real record TREECLCD, ACTUALHT and, from FIADB TREE by CN, DAMAGE_AGENT_CD1-3 (recorded 2013+)."""
     c = duckdb.connect(db, read_only=True)
@@ -120,10 +122,26 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
            SELECT tr.*, r.measdate, NULL, NULL FROM tr JOIN real r USING ({K})
            WHERE NOT EXISTS (SELECT 1 FROM sv WHERE sv.statecd = r.statecd AND sv.unitcd = r.unitcd AND sv.countycd = r.countycd
                              AND sv.plot = r.plot AND sv.subp = r.subp AND sv.measdate = r.measdate)),
-    nr AS (SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate,
-                  arg_min(r.condid, abs(date_diff('day', r.measdate, f.measdate))) condid_nr
-           FROM fr f JOIN real r USING ({K}) GROUP BY ALL),
     sub AS (SELECT statecd, unitcd, countycd, plot, subp, measdate, sum(ba) sub_ba, sum(tpa) sub_tpa FROM real GROUP BY ALL),
+    bc AS (SELECT b.STATECD statecd, b.UNITCD unitcd, b.COUNTYCD countycd, b.PLOT plot, b.SUBP subp, b.MEASDATE measdate,
+                  b.COND_STATUS_CD cs, coalesce(b.SUBPCOND_PROP, 0) sp, b.SICOND, b.SLOPE, b.ASPECT, b.FORTYPCD, b.SITECLCD, b.STDORGCD,
+                  cd.PHYSCLCD, cd.LIVE_CANOPY_CVR_PCT canopy, [b.TRTCD1, b.TRTCD2, b.TRTCD3] trt, [b.DSTRBCD1, b.DSTRBCD2, b.DSTRBCD3] dst
+           FROM base_subplot_cond b LEFT JOIN COND cd ON cd.STATECD = b.STATECD AND cd.UNITCD = b.UNITCD AND cd.COUNTYCD = b.COUNTYCD
+                AND cd.PLOT = b.PLOT AND cd.INVYR = b.INVYR AND cd.CONDID = b.CONDID),
+    bw AS (SELECT *, CASE WHEN sum(CASE WHEN cs = 1 THEN sp ELSE 0 END) OVER w > 0 THEN (CASE WHEN cs = 1 THEN sp ELSE 0 END) ELSE sp END wt
+           FROM bc WINDOW w AS (PARTITION BY statecd, unitcd, countycd, plot, subp, measdate)),
+    sa AS (SELECT statecd, unitcd, countycd, plot, subp, measdate,
+                  sum(wt * SICOND) FILTER (WHERE SICOND IS NOT NULL) / nullif(sum(wt) FILTER (WHERE SICOND IS NOT NULL), 0) sicond,
+                  sum(wt * SLOPE) FILTER (WHERE SLOPE IS NOT NULL) / nullif(sum(wt) FILTER (WHERE SLOPE IS NOT NULL), 0) slope,
+                  CASE WHEN sum(wt) FILTER (WHERE ASPECT IS NOT NULL) > 0 THEN
+                       (degrees(atan2(sum(wt * sin(radians(ASPECT))) FILTER (WHERE ASPECT IS NOT NULL),
+                                      sum(wt * cos(radians(ASPECT))) FILTER (WHERE ASPECT IS NOT NULL))) + 360) % 360 END aspect,
+                  sum(wt * canopy) FILTER (WHERE canopy IS NOT NULL) / nullif(sum(wt) FILTER (WHERE canopy IS NOT NULL), 0) canopy_pct,
+                  arg_max(FORTYPCD, wt) FILTER (WHERE FORTYPCD IS NOT NULL) fortypcd, arg_max(SITECLCD, wt) FILTER (WHERE SITECLCD IS NOT NULL) siteclcd,
+                  arg_max(PHYSCLCD, wt) FILTER (WHERE PHYSCLCD IS NOT NULL) physclcd, arg_max(STDORGCD, wt) FILTER (WHERE STDORGCD IS NOT NULL) stdorgcd,
+                  {", ".join(f"sum(wt * (len(list_filter(trt, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) trt_s{c}" for c in (10, 20, 30, 40, 50))},
+                  {", ".join(f"sum(wt * (len(list_filter(dst, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) dst_s{c}" for c in (10, 20, 30, 40, 50, 60, 70, 80, 90))}
+           FROM bw GROUP BY ALL),
     pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, make_date(MEASYEAR::INT, MEASMON::INT, MEASDAY::INT) md,
                   max(CN) cn, any_value(DESIGNCD) designcd FROM PLOT GROUP BY ALL)
     SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate, pc.designcd,
@@ -134,24 +152,20 @@ def load54(db: str, fiadb: str = None) -> pl.DataFrame:
            CASE WHEN t.tree IS NOT NULL THEN ct.treeclcd END treeclcd, CASE WHEN t.tree IS NOT NULL THEN ct.actualht END actualht,
            dm.dmg1, dm.dmg2, dm.dmg3,
            rc.rcd0, f.terminal_fate, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc,
-           f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, c1.COND_STATUS_CD cond_status,
+           f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, NULL::INT cond_status,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
-           coalesce(c1.SICOND, c0.SICOND) sicond, coalesce(c1.SITECLCD, c0.SITECLCD) siteclcd, coalesce(c1.PHYSCLCD, c0.PHYSCLCD) physclcd,
-           coalesce(c1.SLOPE, c0.SLOPE) slope, coalesce(c1.ASPECT, c0.ASPECT) aspect,
-           coalesce(c1.TRTCD1, c0.TRTCD1) trtcd1, coalesce(c1.TRTCD2, c0.TRTCD2) trtcd2, coalesce(c1.TRTCD3, c0.TRTCD3) trtcd3,
-           coalesce(c1.DSTRBCD1, c0.DSTRBCD1) dstrbcd1, coalesce(c1.DSTRBCD2, c0.DSTRBCD2) dstrbcd2, coalesce(c1.DSTRBCD3, c0.DSTRBCD3) dstrbcd3,
-           coalesce(c1.FORTYPCD, c0.FORTYPCD) fortypcd, coalesce(c1.LIVE_CANOPY_CVR_PCT, c0.LIVE_CANOPY_CVR_PCT) canopy_pct,
-           coalesce(c1.STDORGCD, c0.STDORGCD) stdorgcd
+           sa.sicond, sa.siteclcd, sa.physclcd, sa.slope, sa.aspect, sa.fortypcd, sa.canopy_pct, sa.stdorgcd,
+           NULL::INT trtcd1, NULL::INT trtcd2, NULL::INT trtcd3, NULL::INT dstrbcd1, NULL::INT dstrbcd2, NULL::INT dstrbcd3,
+           sa.trt_s10, sa.trt_s20, sa.trt_s30, sa.trt_s40, sa.trt_s50,
+           sa.dst_s10, sa.dst_s20, sa.dst_s30, sa.dst_s40, sa.dst_s50, sa.dst_s60, sa.dst_s70, sa.dst_s80, sa.dst_s90
     FROM fr f
     LEFT JOIN real t USING ({K}, measdate)
     LEFT JOIN ct USING ({K}, measdate)
     LEFT JOIN dm ON dm.tcn = ct.tcn AND t.tree IS NOT NULL
     LEFT JOIN rc USING ({K}) LEFT JOIN dr USING ({K}) LEFT JOIN s0 USING ({K})
-    LEFT JOIN nr USING ({K}, measdate)
     LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, measdate)
     LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.md = f.measdate
-    LEFT JOIN COND c1 ON c1.PLT_CN = pc.cn AND c1.CONDID = coalesce(t.condid, nr.condid_nr, f.condid0)
-    LEFT JOIN COND c0 ON c0.PLT_CN = pc.cn AND c0.CONDID = 1
+    LEFT JOIN sa USING (statecd, unitcd, countycd, plot, subp, measdate)
     ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.measdate"""
     df = pl.from_arrow(c.execute(q).arrow()); c.close()
     return df

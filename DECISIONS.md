@@ -1461,3 +1461,18 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
     - 9 nonsampled area, "(a) … now in a nonsampled condition, or (b) … previously not sampled". This confirms am. 5.
   - **STATUSCD 0:** "not presently in the sample" (incorrectly tallied before, procedural change, or nonsampled condition).
 - **Verification:** D56 verifier 64 / 64, incl. B12 (psamp = the share, recomputed independently of build) and C1 (the brute force uses the mixture). N1 compares with D55 on identical tensors with the share binarised (Δ = 0). Retrain under am. 5 + 6.
+
+**D55 amendment 7 (2026-11-01; user: "how could you take CONDID as a persistent numbering over the visits — a rookie mistake"): no CONDID is carried between visits; condition fields are subplot-level.**
+- **The mistake.** Since D54, `load54` gave every slot without a record the CONDID of the tree's nearest-in-time real record (falling back to the first record's, then CONDID 1) and read that CONDID's COND row at the visit: status, SICOND, SITECLCD, PHYSCLCD, SLOPE, ASPECT, TRTCD1–3, DSTRBCD1–3, FORTYPCD, LIVE_CANOPY_CVR_PCT, STDORGCD.
+  - FIADB assigns CONDIDs per visit (conditions split / merge / are remapped), and only a tree record ties a tree to a condition.
+  - Not checked against the User Guide when written. The verifiers checked the code against my rules, not the rules against FIADB semantics.
+- **Exposure** (3,256,382 no-record slots): the subplot has > 1 condition at the visit on 6.63 %, where the tree's condition is unknowable; the plot has > 1 condition on 43.52 %, where the borrowed CONDID may point at a condition on another subplot. Fields drive the treatment / disturbance channels of the end hazards and the context of E1.
+- **Fix:** condition fields per subplot-visit from `base_subplot_cond` (+ COND for PHYSCLCD / canopy), area-weighted by SUBPCOND_PROP over the subplot's accessible-forest conditions (all conditions when it has none):
+  - weighted means: SICOND, SLOPE, canopy; ASPECT circular;
+  - area-dominant classes: FORTYPCD, SITECLCD, PHYSCLCD, STDORGCD;
+  - per code group the AREA SHARE carrying a treatment (trt_s10–50) or disturbance (dst_s10–90), replacing the borrowed 0 / 1 flags.
+  - Applied at every slot, records included. Using the tree's own condition at record slots only would let the decoder tell record from no-record slots by the covariates' form (a leak).
+  - Per-tree statics: `planted` is plot-level (curation land_use), unaffected.
+- **Code:** nimiwae_prep.load54 (nearest-record CONDID CTE removed; cond_status deprecated, NULL); nimiwae56.build reads the shares (legacy frames unchanged). The D53 `load` keeps the old logic (legacy, unused).
+- **Data rebuilt as d54d.** KY check: same 363,138 slots; null shares SICOND 25 %, canopy 53 % (older inventories), others < 0.3 %.
+- **All models so far predate am. 5–7:** retrain on d54d.

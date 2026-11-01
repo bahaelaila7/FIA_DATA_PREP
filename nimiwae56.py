@@ -125,8 +125,9 @@ def build(seq: pd.DataFrame, vocab=None):
                nbp=seq.nb_inc_plt.to_numpy(float) * 10, mnbp=seq.nb_inc_plt.notna().to_numpy(float),
                nbn=np.log1p(seq.nb_n_plt.fillna(0).to_numpy(float)) / 3,
                can=seq.canopy_pct.to_numpy(float) / 100, mcan=seq.canopy_pct.notna().to_numpy(float), tyr=t.to_numpy() / 20, dt=dt / 10,
-               **{f'trt{c}': ((tr_ >= c) & (tr_ < c + 10)).any(1).astype(float) for c in TRT},
-               **{f'dst{c}': ((ds_ >= c) & (ds_ < c + 10)).any(1).astype(float) for c in DST})
+               # D55 am. 7: subplot area share carrying each code group (prep trt_s* / dst_s*); legacy frames: the slot's own codes, 0 / 1
+               **{f'trt{c}': (seq[f'trt_s{c}'].fillna(0).to_numpy(float) if f'trt_s{c}' in seq else ((tr_ >= c) & (tr_ < c + 10)).any(1).astype(float)) for c in TRT},
+               **{f'dst{c}': (seq[f'dst_s{c}'].fillna(0).to_numpy(float) if f'dst_s{c}' in seq else ((ds_ >= c) & (ds_ < c + 10)).any(1).astype(float)) for c in DST})
     # completion span (user): unsampled visits are completed only when sandwiched between the tree's sampled visits
     sfirst = per_tree_minmax(sampled, 'min'); slast = per_tree_minmax(sampled, 'max')
     in_span = (pos >= sfirst[tid]) & (pos <= slast[tid])
