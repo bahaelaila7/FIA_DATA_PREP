@@ -1516,3 +1516,14 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **After NIMIWAE, because some of it moves to completed data:** the interval-product rebuilds for HBAD v2, HBAD3P and HBAD4P, and the genveg table run.
 - **After NIMIWAE:** the Forest Explorer restart; the explorer will move to completed data.
 - **FVS stays on direct FIA for now** (D61): it is calibrated on it.
+
+## D64 — Does conditioning on crown class explain sapling growth stalls? (diagnostic, 2026-11-01; nothing changed)
+- **Test:** VAL only; checkpoints d58_ep12 (no noise, 12 epochs), d56_base and d56_noise (4 epochs), on d54c, so before am. 5–7.
+  - Forecast: the tree's records hidden from its third record on.
+  - Back-cast: 4,678 debuts ≥ 1.5 in with a clean pre-debut FALSE label, label hidden, scored as P(exists) at that visit.
+- **Forward, already-suppressed trees: sufficient.** d58_ep12 mean rate, in/yr, predicted vs actual: canopy classes 0.224 vs 0.213; intermediate / overtopped 0.062 vs 0.056. The residual is within ±0.012 across the main crown classes.
+- **Fast saplings that stall: not captured.** Of 1,970 fast trees, 163 stalled (8.3 %); predicted rate 0.206 vs actual 0.052. Predicted stall share 2.9 %. AUC 0.749. Part of this is unknowable forward, because the crown class at the interval's end is hidden.
+- **Back-cast: crown class barely matters.** d58_ep12 P(exists) at the labelled-absent visit, debuts with early rate > 2× later rate: already suppressed 0.901, fell out of the canopy 0.863, stayed in the canopy 0.915; unflagged debuts 0.507. The later growth rate drives it, not the crown history.
+- **Process noise did not fix it.** d56_noise: 0.900 / 0.859 / 0.952, unflagged 0.787 (d56_base 0.718); E1 0.131 vs base 0.113. Trained for 4 epochs only.
+- **Mechanism:** crown class and damage reach growth only through one per-tree z (encoder input, decoder output). There is no per-interval state in the no-noise model, and Gaussian u_t is not tied to crown class in the noise model, so a change of phase is not representable.
+- **Proposed for the retrain (not applied):** a per-slot competitive-status state that drives growth and emits CCLCD, compared with the current model on VAL by a pre-registered rule. This replaces the D57 "size-dependent or heavy-tailed noise" proposal as first choice.
