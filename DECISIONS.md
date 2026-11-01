@@ -1532,3 +1532,22 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
   - z responds to crown class in the direction of the stunted scenario: rewriting records to overtopped vs codominant moves P(exists) by a mean absolute 0.12 per tree (p90 0.37), higher when overtopped.
   - VAL matches the trees seen in training (fell out, hidden: 0.731 vs 0.746), so this is not overfitting. Training used 150,000 trees, about an eighth of the train split.
 - **Decision:** no structural change. Finish training on the full train split with am. 5–7, then re-measure these groups. Revisit only if they plateau. Watch the learned ρ: 0.007, 0.020, 0.032 over 1, 12 and 24 epochs against a cap of 0.05, because it bounds the FALSE label's cost at about 3 nats per slot.
+
+## D65 — The "re-tally" at MANUAL 1.0 is a microplot move, not a re-census (diagnostic, 2026-11-01; nothing changed yet)
+- **Finding:** PLOT.MICROPLOT_LOC goes CENTER → OFFSET at the end of MANUAL 1.0 (guide §2.4: the offset center is 12 ft due east of subplot center). All 28,295 MANUAL 1.0 visits are CENTER; no later one is. Saplings after the move stand on different ground.
+- **Coverage:** 13,334 of 13,653 detected breaks (97.7 %) are moves, as are 13,737 visits in total.
+  - 403 moves are not in `procedural_breaks` (1,531 saplings).
+  - 319 breaks are not moves (2,385 saplings, 80 % continuing).
+- **Census at moves:** 100,378 old live saplings: 8,201 continue (5,063 past 5 in, 3,138 still saplings, 3.1 % of the old list), 89,259 closed RC8, 2,406 unrecorded. New microplot list 97,583. Circles of 6.8 ft radius 12 ft apart overlap on 4.8 % of their area.
+- **Relinking rejected.** AZIMUTH and DIST are withheld from FIADB (guide §3.1.12–13, available from FIA SDS), so only species, size and height remain.
+  - Same-visit test: 60,585 closed trees were measured at the move. A same-species new tree within 0.2 in and 4 ft: 10 % on the own subplot, 4–5 % on the plot's other subplots. The excess of about 6 % is the size of the overlap.
+  - Growth candidates: 30 % vs 17–18 %. Spatial autocorrelation of species also inflates the own subplot, so these are upper bounds.
+  - Matcher on normal visits with numbers hidden: a unique candidate is right 82 % of the time, where the truth is available. At a move it mostly is not.
+  - KY beech: T8 was on the CENTER microplot in 2000, T10 on the OFFSET one in 2010. "Very likely the same tree" is withdrawn. They are probably two trees.
+- **Consequences:** both lists are real trees, so per-tree fills are legitimate; the pre-debut FALSE label is unjustified because the spot was not sampled; RC 3 at a move does not mean missed. Keeping both lists at the 75 TPA expansion gives 1.97 × the old sapling count after a move, against 1.05 with one list.
+- **Proposed (not applied; needs the user's approval for the E1 truth change):**
+  1. Identify moves from MICROPLOT_LOC, not from the break heuristics.
+  2. At microplot level, treat the spot of a post-move debut as not sampled before the move (no FALSE label, no cutoff, no soft TRUE from RC 3), for debuts of every code.
+  3. Stand and cohort tables of completed data use one list per visit: the list on the microplot sampled at that visit.
+  4. Consider the 60,585 closure measurements as real last sizes; curation drops them.
+- **Supersedes** the cut-lineages proposal: lineages stay; only the stand-table membership changes.
