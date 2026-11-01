@@ -66,7 +66,7 @@ def build(seq: pd.DataFrame, vocab=None):
     lo = seq.lo_in.to_numpy(float) if 'lo_in' in seq else np.full(N, np.nan)
     cst = seq.cond_status.to_numpy(float)
     fsp, fmp = seq.forest_subpcond_prop.to_numpy(float), seq.forest_micrcond_prop.to_numpy(float)
-    sampled = real | np.where(np.isnan(cst), np.nan_to_num(fsp, nan=0) > 0, cst == 1)              # hidden records: from the condition, like any slot
+    sampled = real | (np.where(np.isnan(cst), True, cst == 1) & (np.nan_to_num(fsp, nan=0) > 0))   # D55 am. 6: the tree's condition AND its own subplot (forested share > 0); hidden records: from these too
     fate = seq.terminal_fate.fillna('').to_numpy(str)
     end_hidden = seq.end_hidden.fillna(False).to_numpy(bool) if 'end_hidden' in seq else np.zeros(N, bool)
     dead_md = pd.to_datetime(seq.dead_md); s0_md = pd.to_datetime(seq.s0_md); md = pd.to_datetime(seq.measdate)

@@ -49,7 +49,8 @@ def brute(model, b, D, H, lend):
                             if real[t]: ll += lsg(xt)
                             elif smp[t]:
                                 mo = int(mode[t])
-                                if mo == M.MODE['cutoff'] and (llim[t] > lex + 1e-6 or t > l): ll += lsg(-xt)
+                                ps = float(b['psamp'][i, t])
+                                if mo == M.MODE['cutoff'] and (llim[t] > lex + 1e-6 or t > l): ll += lsg(-xt) if ps >= 1 else math.log(ps * sig(-xt) + 1 - ps)
                                 elif mo == M.MODE['missed']: ll += lsg(xt)
                                 elif mo == M.MODE['interval']: ll += lsg(-xt)
                     else:
@@ -221,6 +222,18 @@ def gen_inputs(seq):
     check('B10 prior / decoder inputs invariant to hiding the tree\'s own records (statics token, context, padding)', max(d_tok, d_cov, d_v) < 1e-6,
           f'max |Δ| token {d_tok:.1e} cov {d_cov:.1e} v {d_v:.1e} over {len(mm)} instances (encoder statics may differ: {d_q:.2f})')
 
+def psamp_rule(seq):
+    """B12 (D55 am. 6): P(spot sampled) at no-record slots = the forested share of the tally area (microplot for microplot-level slots, else
+    subplot), independent of any condition id; 1 at real records; the sampled flag is psamp > 0."""
+    x = seq[seq.plot_key.isin(seq.plot_key.drop_duplicates().sample(300, random_state=14))]
+    B, _, sq = M.build(x); ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
+    ps = B['psamp'][ti, po].numpy(); real = B['real'][ti, po].numpy() > 0; ll = np.exp(B['llim'][ti, po].numpy()) + M.HALF_UNIT
+    share = np.where(ll <= sq.thr_micro.to_numpy() + 1e-6, sq.forest_micrcond_prop.fillna(0).clip(0, 1), sq.forest_subpcond_prop.fillna(0).clip(0, 1))
+    want = np.where(real, 1.0, share)
+    ok = np.abs(ps - want).max() < 1e-6 and bool(((B['sampled'][ti, po].numpy() > 0) == (want > 0)).all())
+    check('B12 P(sampled) at no-record slots = forested share of the tally area (no condition id); sampled = psamp > 0', ok,
+          f'max |Δ| {np.abs(ps - want).max():.1e}; mixed slots {int(((want > 0) & (want < 1)).sum())} of {len(want)}')
+
 def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 
 def noise_off(seq):
@@ -230,16 +243,16 @@ def noise_off(seq):
     for censor, growth in (('known', 'flex'), ('mar', 'struct')):
         torch.manual_seed(3); m55 = M55.make_model(vocab, censor=censor, growth=growth); m55.eval()
         m56 = M.make_model(vocab, censor=censor, growth=growth, noise=False); m56.load_state_dict(m55.state_dict(), strict=True); m56.eval()
-        B, _, _ = M.build(x, vocab)
+        B, _, _ = M55.build(x, vocab); B['psamp'] = B['sampled'].float()                    # same tensors; the share binarised (am. 6 differs by design)
         with torch.no_grad():
             torch.manual_seed(0); a_ = m55.joint(B, 4); torch.manual_seed(0); b_ = m56.joint(B, 4)
         d = max(float((a_['lw'] - b_['lw']).abs().max()), float((torch.exp(a_['lpost']) - torch.exp(b_['lpost'])).abs().max()))
-        check(f'[{censor}+{growth}] N1 noise off reproduces D55 exactly', d < 1e-5, f'max |Δ| {d:.1e}')
+        check(f'[{censor}+{growth}] N1 noise off reproduces D55 exactly (same tensors, binary sampling)', d < 1e-5, f'max |Δ| {d:.1e}')
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); a = ap.parse_args()
     torch.set_num_threads(4); seq = pd.read_parquet(f'{a.data}/seq.parquet')
-    mode_rules(seq); end_bench(seq); gen_inputs(seq); noise_off(seq)
+    mode_rules(seq); end_bench(seq); gen_inputs(seq); noise_off(seq); psamp_rule(seq)
     for censor in ('known', 'mar'):
         for growth in ('flex', 'struct'): run(seq, censor, growth); outputs(seq, censor, growth)
     run(seq, 'known', 'flex', prior_ctx=True)

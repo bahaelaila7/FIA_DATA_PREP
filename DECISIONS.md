@@ -1437,3 +1437,27 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 - **Fix:** censored_nonsampled added to the ignore-after fates (nimiwae54 / 55 / 56 `build`) and to B7's written rule. D56 verifier 63 / 63.
 - **Unchanged, deliberate:** diverted_landuse (2,752) keeps the informative absence. The land left forest, so the tree is gone: the end is real, the cause inferred.
 - **Consequence:** every model trained so far (D55–D58, the D56-base NCV) carried this bug; the D58b budget runs still running too. Retrain under am. 5 before the next comparison or NCV.
+
+**D55 amendment 6 (2026-11-01; user: "how do you know the tree's own condition without a record tying it to that condition?"): sampling at a no-record visit is known only at subplot / microplot level.**
+- **The flaw.** `build` took the CONDID of the tree's nearest-in-time real record and its COND_STATUS at the no-record visit. FIADB assigns CONDIDs per visit (conditions split / merge / are remapped), and only a tree record ties a tree to a condition (TREE.CONDID). This FIADB build has no TREE DIST / AZIMUTH, so the tree cannot be located against the mapped boundaries.
+- **The evidence** (3,256,382 no-record slots):
+  - subplot fully forest 95.68 %; the borrowed condition wrongly said unsampled on 0.76 %, discarding real absences;
+  - mixed subplot 3.95 % (median forested share 0.69); the borrowed condition guessed sampled on 3.45 %;
+  - subplot share 0 on 0.25 % (the borrowed condition said sampled on 0.10 %); share missing 0.13 %.
+- **Options:** (a) keep the borrowed condition; (b) subplot share only, and ignore absences on mixed subplots; (c) **P(spot sampled) = the forested share of the tree's tally area** (microplot for microplot-level slots, else subplot; 1 at real records); an absence enters as share · P(below the limit) + (1 − share). **Chosen (c)**, the stated fallback being (b) if the user prefers.
+  - The pre-debut FALSE labels already required a fully forested microplot (unchanged).
+  - "Sampled" for modes / span / labels is share > 0; the encoder receives the share.
+  - (An intermediate patch, condition AND share > 0, was superseded the same day; legacy D54 / D55 keep it.)
+- **FIADB v9.4 User Guide checks** (local copy `/workspace/wo-v9-4_Aug2025_UG_FIADB_database_description_NFI.pdf`):
+  - **Share column.** SUBP_COND.SUBPCOND_PROP / MICRCOND_PROP = the proportion of the subplot / microplot in the condition. COND_STATUS_CD 1 = accessible forest land (2 nonforest, 3 / 4 water, 5 nonsampled). The curated `forest_subpcond_prop` = Σ SUBPCOND_PROP over COND_STATUS_CD = 1 per subplot-visit (fia_curation_v3 `sql_clean_subplot_years`). Subplot-visits with SUBP_STATUS_CD 3 (nonsampled) are not in the scaffold, so share = 0 → unsampled.
+  - **RECONCILECD** (§3.1.82), all consistent with the D54 rules and am. 5:
+    - 1 ingrowth, incl. "a new tree on land that was formerly nonforest": safe, because FALSE labels need a fully forested microplot at the previous visit;
+    - 2 through growth ("grew from seedling to ≥ 5 in between cycles");
+    - 3 missed live (retired from MANUAL 9.0, then 7 / 8);
+    - 5 shrank;
+    - 6 physical movement;
+    - 7 cruiser error, (b) "erroneously not tallied (missed tree)";
+    - 8 procedural change, "regardless of d.b.h. at the previous inventory";
+    - 9 nonsampled area, "(a) … now in a nonsampled condition, or (b) … previously not sampled". This confirms am. 5.
+  - **STATUSCD 0:** "not presently in the sample" (incorrectly tallied before, procedural change, or nonsampled condition).
+- **Verification:** D56 verifier 64 / 64, incl. B12 (psamp = the share, recomputed independently of build) and C1 (the brute force uses the mixture). N1 compares with D55 on identical tensors with the share binarised (Δ = 0). Retrain under am. 5 + 6.

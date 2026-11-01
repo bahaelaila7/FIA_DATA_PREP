@@ -68,7 +68,10 @@ def build(seq: pd.DataFrame, vocab=None):
     lo = seq.lo_in.to_numpy(float) if 'lo_in' in seq else np.full(N, np.nan)
     cst = seq.cond_status.to_numpy(float)
     fsp, fmp = seq.forest_subpcond_prop.to_numpy(float), seq.forest_micrcond_prop.to_numpy(float)
-    sampled = real | np.where(np.isnan(cst), np.nan_to_num(fsp, nan=0) > 0, cst == 1)              # hidden records: from the condition, like any slot
+    # D55 am. 6 (user): a no-record visit's sampling is known only at subplot / microplot level (no record ties the tree to a condition):
+    # psamp = the forested share of the tree's tally area (microplot for microplot-level slots, else subplot); 1 at real records
+    psamp = np.where(real, 1.0, np.clip(np.nan_to_num(np.where(micro, fmp, fsp), nan=0.0), 0.0, 1.0))
+    sampled = psamp > 0
     fate = seq.terminal_fate.fillna('').to_numpy(str)
     end_hidden = seq.end_hidden.fillna(False).to_numpy(bool) if 'end_hidden' in seq else np.zeros(N, bool)
     dead_md = pd.to_datetime(seq.dead_md); s0_md = pd.to_datetime(seq.s0_md); md = pd.to_datetime(seq.measdate)
@@ -140,7 +143,7 @@ def build(seq: pd.DataFrame, vocab=None):
     X = dict(lD=mat(lgD), lH=mat(lgH),
              mD=mat(mD), mH=mat(mH), cr=mat(np.where(mcr, seq.cr.to_numpy(float) / 100, 0)), mcr=mat(mcr),
              cc=mat(np.where(mcc, seq.cclcd.to_numpy(float), 0)), mcc=mat(mcc), v=mat(np.ones(N)), hid=mat(hid), real=mat(real),
-             sampled=mat(sampled), llim=mat(np.log(limit - HALF_UNIT)), llo=mat(np.log(lo - HALF_UNIT), -20.0), fmp=mat(fmp),
+             sampled=mat(sampled), psamp=mat(psamp), llim=mat(np.log(limit - HALF_UNIT)), llo=mat(np.log(lo - HALF_UNIT), -20.0), fmp=mat(fmp),
              lex=mat(np.log(thr_micro - HALF_UNIT)),                                                   # existence = qualifies at the smallest level
              ev=mat(ev), mode=mat(mode), cov=np.stack([mat(cov[c]) for c in COV], -1),
              in_span=mat(in_span),
@@ -236,7 +239,7 @@ class NIMIWAE56(nn.Module):
         m = B['mD']; cc = s.ecc(B['cc'].long().clamp(0, 5)) * B['mcc'][..., None]
         haslo = (B['mode'] == MODE['interval']).float()
         T = T_MAX; ar = torch.arange(T)[None]
-        x = torch.cat([B['cov'], torch.stack([B['lD'] * m, m, B['lH'] * B['mH'], B['mH'], B['cr'], B['mcr'], B['mcc'], B['real'], B['sampled'],
+        x = torch.cat([B['cov'], torch.stack([B['lD'] * m, m, B['lH'] * B['mH'], B['mH'], B['cr'], B['mcr'], B['mcc'], B['real'], B['psamp'],
                                               B['llim'], haslo, B['llo'].clamp(min=-1) * haslo, (ar == B['f'][:, None]).float(),
                                               (ar == B['l'][:, None]).float(), B['v']], -1),
                        F.one_hot(B['ev'], len(EV)).float(), F.one_hot(B['mode'], len(MODE)).float(),
@@ -324,8 +327,11 @@ class NIMIWAE56(nn.Module):
             post_ = (ar[None] > B['l'][:, None])                                                        # after the last visible record
             above_ex = ((B['llim'] > B['lex'] + 1e-6) | post_)[None]   # pre-debut microplot level: the soft FALSE label carries it
             unrec = (1 - real) * B['sampled'][None]
+            ps = B['psamp'][None].expand_as(xt)                                                          # am. 6: P(the tree's spot was sampled)
+            psc = ps.clamp(1e-6, 1 - 1e-6)                                                               # both where-branches finite (gradients)
+            lcut = torch.where(ps >= 1, F.logsigmoid(-xt), torch.logaddexp(torch.log(psc) + F.logsigmoid(-xt), torch.log1p(-psc)))
             cens = (real * F.logsigmoid(xt)                                                             # tallied: at or above the limit
-                    + unrec * torch.where((mode == MODE['cutoff']) & above_ex, F.logsigmoid(-xt), torch.zeros_like(xt))   # not tallied: below
+                    + unrec * torch.where((mode == MODE['cutoff']) & above_ex, lcut, torch.zeros_like(xt))   # not tallied: below (if the spot was sampled)
                     + unrec * torch.where(mode == MODE['missed'], F.logsigmoid(xt), torch.zeros_like(xt))                  # missed: at / above
                     + unrec * torch.where(mode == MODE['interval'], F.logsigmoid(-xt), torch.zeros_like(xt)))             # benchmark interval
         la = (meas + ev_alive + cens) * v; lg = ev_gone * v
