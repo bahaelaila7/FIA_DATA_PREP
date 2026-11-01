@@ -58,7 +58,7 @@ def load54(db: str) -> pl.DataFrame:
     rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING ({K})
            WHERE ct.invyr = tr.y0 AND ct.statuscd = 1),
     dr AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.invyr) dead_invyr, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
-           FROM ct JOIN tr USING ({K}) WHERE ct.statuscd = 2 AND ct.measdate > tr.d1 GROUP BY ALL),
+           FROM ct JOIN tr USING ({K}) WHERE ct.statuscd IN (2, 3) AND ct.measdate > tr.d1 GROUP BY ALL),   -- 3: cut closures (D65 am. 14)
     s0 AS (SELECT e.STATECD statecd, e.UNITCD unitcd, e.COUNTYCD countycd, e.PLOT plot, e.SUBP subp, e.TREE tree,
                   min(e.MEASDATE) s0_md, arg_min(e.RC, e.MEASDATE) s0_rc, arg_min(e.DIA, e.MEASDATE) s0_dia, arg_min(e.HT, e.MEASDATE) s0_ht,
                   arg_min(e.closure_kind, e.MEASDATE) s0_kind
@@ -181,6 +181,14 @@ def add_climate(df: pl.DataFrame, prism: str) -> pl.DataFrame:
                                    FROM a JOIN nrm n ON n.l4 = a.l4""").arrow())
     return df.join(cl, on=k + ['invyr'], how='left')
 
+SOIL = ['clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'cec', 'depth_restriction', 'rock_frag', 'depth_bedrock']
+
+def add_soil(df: pl.DataFrame, solus: str) -> pl.DataFrame:
+    """D70: SOLUS100 at the plot (as extracted by plot key); a renumbered plot's canonical key may have no row: soil_ok false."""
+    so = pl.read_parquet(solus).select(['statecd', 'unitcd', 'countycd', 'plot'] + SOIL).rename({c: f'soil_{c}' for c in SOIL})
+    so = so.with_columns([pl.col(c).cast(df.schema[c]) for c in ('statecd', 'unitcd', 'countycd', 'plot')]).with_columns(pl.lit(True).alias('soil_ok'))
+    return df.join(so, on=['statecd', 'unitcd', 'countycd', 'plot'], how='left').with_columns(pl.col('soil_ok').fill_null(False))
+
 def resplit_r2(split: str, key: str) -> str:
     """D50 fresh split: the old TEST is retired (-> train); the new TEST = old-train plots with crc32(key|r2) % 100 < 22; VAL unchanged."""
     if split == 'test': return 'train'
@@ -203,6 +211,7 @@ def main():
     ap.add_argument('--from-seq', help='re-split an existing seq.parquet instead of reading the DBs')
     ap.add_argument('--scheme', default='d49', choices=['d49', 'r2', 'r3'])
     ap.add_argument('--prism', help='PRISM L4 yearly DB: add the D51 climate drivers')
+    ap.add_argument('--solus', help='SOLUS plot extract: add the D70 soil columns')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']
@@ -225,6 +234,7 @@ def main():
         df = add_design_levels(df, k)
         df = add_neighbours(df)
     if a.prism: df = add_climate(df, a.prism)
+    if a.solus: df = add_soil(df, a.solus)
     if a.scheme in ('r2', 'r3'):
         fn = resplit_r2 if a.scheme == 'r2' else resplit_r3
         keys = df.select('plot_key', 'split').unique()
