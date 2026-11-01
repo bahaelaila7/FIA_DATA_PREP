@@ -1822,3 +1822,12 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 
 **D66 amendment 2 (2026-11-01): float aggregates in sorted order.** The final regional pair differed on one `cohort_disturbance` row: `would_be` sat on a 6-decimal rounding boundary, so summing in another order rounded it the other way (6949585.934721 vs 6949585.93472). Rounding had only made this rare. Every float sum, mean and std in a keyed aggregate now sorts first (SQL `SUM(... ORDER BY ...)` for the forest proportions). Lint L8 rejects the unsorted form.
 
+## D71 — Live R4 DB replaced: natural ids, no CN logic, closure fix (2026-11-01)
+- **Build:** commit acab08f, all 8 states, one fit scope. `FIA/truth/fia_truth_r4.duckdb` replaced once; the previous DB is kept as `fia_truth_r4.pre_d69.duckdb` until the user drops it.
+- **Checks passed:** verifier 219 pass, 0 fail, 4 KNOWN cells; plain and shuffled builds at different thread counts identical on all 40 tables; lint clean; `retally_audit.py` reproduces 392 of 395 values, and the other 3 are break coverage, with moves not in breaks going from 403 to 0.
+- **Skipped:** the verifier's subset two-thread-count section (e, D40); the full-region pair covers more.
+- **Old vs new, R4:** curated_trees 4,496,120 to 4,522,556 (26,436 closure dead records, 11,918 cut); live records and DIA unchanged, 3,729,318 in both. Trajectories 4,845,688 to 4,838,871. Sim A 3,940,757 to 3,934,023; phantom rows 211,439 to 204,705. Sim B 2,293,491 to 2,293,520. Drops 263,183 to 263,200. Breaks 13,734 to 24,212. cond_link 238,106 to 131,311. Disturbed subplots 73,581 to 74,184 of 129,227.
+- **Tree fates:** censored_procedural 91,021 to 64,585; dead 269,851 to 284,370; silvicultural_death 350,102 to 360,511; diverted_landuse 36,647 to 38,156; disappeared_inferred_removal 48 to 21.
+- **Ages:** mean change +0.04 yr, 0.12 absolute. Model ages +0.15 yr, estage ages +0.0003 yr. Part of this is the D66 revision, which the previous live DB did not have; the rest is the redraw of D69 am. 2.
+- **Not run on the new DB:** any consumer, calibration or training; `nimiwae56_verify`. Results on the old DB are not comparable with new ones.
+

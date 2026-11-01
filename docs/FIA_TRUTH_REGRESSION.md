@@ -48,3 +48,7 @@ Truth DB vs `/workspace/FIA/curated_r8`, one previous DB per state.
 - **Likely cause:** one age fit over 8 states replaces 8 single-state fits. F1 and A1 are too small to explain it (KY 0.14 yr), but this was not isolated by refitting with one change at a time.
 - **Which is right:** unknown. Natural-stand saplings have no field-age truth, so the verifier checks ordering, not level. Age monotonicity and the natural (h) step hold in all 8 states; (h) is INFO there, not enforced.
 - **Phantom rows:** Sim A phantoms fall 8–29 % per state, the expected result of younger debuts, since a phantom needs a prior age of at least 1. Real Sim A rows are unchanged at each state's live count. Trajectory and cohort tables shrink accordingly.
+
+## 2026-11-01 replacement (D71)
+Natural ids (D69), no CN logic (D67), closure and move rules (D65), sorted float aggregates (D66 am. 2). Figures and checks are in DECISIONS.md D71. Previous DB: `FIA/truth/fia_truth_r4.pre_d69.duckdb`.
+

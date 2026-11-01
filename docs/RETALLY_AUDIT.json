@@ -57,10 +57,10 @@
    ]
   ],
   "coverage": {
-   "move_and_break": 13334,
-   "move_not_break": 403,
+   "move_and_break": 13737,
+   "move_not_break": 0,
    "break_not_move": 319,
-   "all_breaks": 13734
+   "all_breaks": 24212
   }
  },
  "table": {
