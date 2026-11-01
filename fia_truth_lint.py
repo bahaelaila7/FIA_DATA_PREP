@@ -29,7 +29,7 @@ def scan(path, name, findings):
         if re.search(r"\.(first|last)\(\)\.alias", s) and "sort_by" not in s:
             findings.append(f"L4 {name}:{i}: {ln.strip()[:110]}")
         # D68: INVYR is part of the natural id and may order a plot's visits; it never enters a time calculation
-        if "invyr-ok" not in ln and re.search(r"\bINVYR\s*[-+*/]|[-+*/]\s*[a-z_.]*INVYR\b|year_diff\([^)]*INVYR|date_diff\([^)]*INVYR", s):
+        if "invyr-ok" not in ln and re.search(r"\bINVYR\s+[-+]\s+\w|\w\s+[-+]\s+[a-z_.]*INVYR\b|year_diff\([^)]*INVYR|date_diff\([^)]*INVYR", s):
             findings.append(f"L5 {name}:{i}: {ln.strip()[:110]}")
         # COND_ID (plot key + CONDID) is a condition only together with its visit
         if re.search(r"(over|group_by|shift|partition_by)\(\s*(COND_ID|cond_id_cols)\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
