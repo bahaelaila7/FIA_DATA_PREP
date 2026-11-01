@@ -1607,3 +1607,20 @@ The rule still selects **V1** (tie at 3 bars with V3, V4; lowest Σ ratio). E2 b
 
   The lower end of each range uses the estimate as measured; the upper end removes the species-clustering uplift seen in the small classes. Found is above 1 under 4 in, which is that same uplift. Widening the filters gains little (0.79 to 0.82 at 4.5+ in).
 - **Consequence:** the no-candidate signal is safe under about 4 in and biased above it. Apply it for closures under 4 in (92 % of no-candidate trees at the next visit) as a soft signal with label noise, and keep `ignore` at 4 in and over. Tested at the next visit only; not tested for later visits, where the tree's size is unknown.
+
+**D65 amendment 4 (2026-11-01; user: dead trees ≥ 5 in count unless there is evidence the tree died before the sapling's last live record; a subplot candidate can serve only one sapling). Replaces the numbers of am. 1 and am. 3.**
+- **Method:** a graduate is alive, dead or cut at ≥ 5 in. Dead candidates dropped only on evidence: RC 4 (dead at the previous visit) or crew MORTYR more than 1 yr before the closure (1,115 of 8,956 pairs; the margin because MORTYR is an estimate). Closures with an agent are finished and are not sources. One-to-one assignment per subplot: most pairs, then the most probable sources.
+- **Rates by start size (< 2 / 2–3 / 3–4 / 4–4.5 / 4.5+ in):** normal 0.007 / 0.027 / 0.096 / 0.286 / 0.657; OFFSET list after the move 0.007 / 0.025 / 0.105 / 0.284 / 0.670 (standardised 0.985). CENTER list before the move 0.007 / 0.027 / 0.093 / 0.245 / 0.516 (0.85): the gap at 4 in and over is dead trees, which close without a size there; live rates match (0.508 vs 0.512).
+- **Sized closures with a later visit, 58,340. One-to-one candidates, species and 0–0.6 in/yr:** next visit 7,697 (placebo 3,982; excess 3,715; expected 4,652 with dead, 3,730 live). All later visits 16,565 (placebo 9,147; excess at most 7,418). About 45–48 % of paired candidates are real, so the two-representations scale is about 3,700 at the next visit and at most 7,400 overall.
+- **No candidate after assignment:** next visit 50,643 (87 %); all later visits 41,775 (72 %).
+- **Hidden graduates among no-candidate trees at the next visit, as measured and after removing the clustering uplift of about 0.03:**
+
+| Size at closure | Any status | Alive only |
+|---|---|---|
+| Under 3 in | ≤ 2 % | ≤ 2 % |
+| 3–4 in | 0 to 12 % | 0 to 12 % |
+| 4–4.5 in | 10–14 % | 7–11 % |
+| 4.5+ in | 56–62 % | 24–30 % |
+
+- **Dead graduates rarely leave a candidate:** new dead subplot records (RC 1, 3, 7) are about 2 % of the size of live RC 1 debuts, while about 22 % of tracked 4.5+ in graduates are dead. A sapling that crossed 5 in and died is usually never tallied, which fits "stayed under 5 in or died". The signal is broken by hidden live graduates, so the alive column is the one that matters.
+- **Unchanged:** apply the no-candidate signal under 4 in only (91.7 % of no-candidate trees at the next visit), soft, and test later visits first.
