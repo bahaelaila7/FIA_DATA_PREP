@@ -222,9 +222,9 @@ def compute(df, timber_only: bool = False, scaffold=None):
     coh = (
         pair.group_by(COHORT_ID + ["vrank"])
         .agg([
-            pl.col("counted_would_be").sum().alias("would_be_disturbed"),
-            pl.col("counted_dropped").sum().alias("dropped"),
-            pl.col("noncounted_live_w").sum().alias("live_w"),
+            pl.col("counted_would_be").sort().sum().alias("would_be_disturbed"),
+            pl.col("counted_dropped").sort().sum().alias("dropped"),
+            pl.col("noncounted_live_w").sort().sum().alias("live_w"),
             pl.col("counted").sum().alias("n_disturbed"),
             pl.col("is_survivor").sum().alias("n_survivors"),
         ])

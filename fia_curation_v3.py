@@ -141,9 +141,9 @@ def sql_clean_subplot_years(con):
     CREATE TABLE clean_subplot_years AS
     SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE,
            BOOL_OR(COND_STATUS_CD = 3)                                   AS has_cond_status3,
-           -- rounded: a float sum depends on the summation order (thread count)
-           ROUND(SUM(CASE WHEN COND_STATUS_CD = 1 THEN SUBPCOND_PROP ELSE 0 END), 9) AS forest_subpcond_prop,
-           ROUND(SUM(CASE WHEN COND_STATUS_CD = 1 THEN MICRCOND_PROP ELSE 0 END), 9) AS forest_micrcond_prop
+           -- a float sum depends on the summation order: sum in sorted order
+           ROUND(SUM(CASE WHEN COND_STATUS_CD = 1 THEN SUBPCOND_PROP ELSE 0 END ORDER BY SUBPCOND_PROP), 9) AS forest_subpcond_prop,
+           ROUND(SUM(CASE WHEN COND_STATUS_CD = 1 THEN MICRCOND_PROP ELSE 0 END ORDER BY MICRCOND_PROP), 9) AS forest_micrcond_prop
     FROM base_subplot_cond
     GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, INVYR, SUBP, MEASDATE, CYCLE
     """)
@@ -1359,8 +1359,8 @@ def detect_condition_resets(df: pl.DataFrame, link: pl.DataFrame):
                                       pl.col("cond_stdage").alias("_pstd"), pl.col("n_live").alias("_pn"), pl.col("ba_live").alias("_pba")]),
                 on=prev_keys, how="inner"))
     prev = lk.group_by(CV).agg(
-        (pl.col("_share") * pl.col("_pn")).sum().alias("_prev_n"),
-        (pl.col("_share") * pl.col("_pba")).sum().alias("_prev_ba"),
+        (pl.col("_share") * pl.col("_pn")).sort().sum().alias("_prev_n"),
+        (pl.col("_share") * pl.col("_pba")).sort().sum().alias("_prev_ba"),
         pl.col("_pstd").sort_by(["prop", "PREV_CONDID"], descending=[True, False]).first().alias("_prev_stdage"))
     cv = cv.join(prev, on=CV, how="left").with_columns(
         (((pl.col("_prev_n") > 0) & (pl.col("n_live") <= (1 - RESET_LOSS_FRAC) * pl.col("_prev_n"))) |
@@ -2198,10 +2198,10 @@ def build_snapshots(df: pl.DataFrame, scaffold: pl.DataFrame) -> pl.DataFrame:
                              "estimated_age", "age_source"]
         )
         .agg([
-            pl.col("biomass_contrib").sum().round(6).alias("biomass_per_acre_lbs"),
+            pl.col("biomass_contrib").sort().sum().round(6).alias("biomass_per_acre_lbs"),
             pl.len().alias("n_trees"),
-            pl.col("DIA").mean().round(6).alias("mean_dia"),
-            pl.col("HT").mean().round(6).alias("mean_ht"),
+            pl.col("DIA").sort().mean().round(6).alias("mean_dia"),
+            pl.col("HT").sort().mean().round(6).alias("mean_ht"),
         ])
     )
 

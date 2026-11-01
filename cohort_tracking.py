@@ -181,9 +181,9 @@ def build_cohort_measurements(df: pl.DataFrame) -> pl.DataFrame:
         .group_by(["cohort_id", "INVYR"])
         .agg([
             pl.len().alias("n_trees_live"),
-            pl.col("_bio").sum().round(6).alias("biomass_per_acre"),          # D66: rounded, so a float sum does not carry the row order
-            pl.col("estimated_age").mean().round(6).alias("estimated_age_mean"),
-            pl.col("estimated_age").std().round(6).alias("estimated_age_sd"),
+            pl.col("_bio").sort().sum().round(6).alias("biomass_per_acre"),          # D66: rounded, so a float sum does not carry the row order
+            pl.col("estimated_age").sort().mean().round(6).alias("estimated_age_mean"),
+            pl.col("estimated_age").sort().std().round(6).alias("estimated_age_sd"),
         ])
     )
 

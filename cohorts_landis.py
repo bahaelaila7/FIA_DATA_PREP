@@ -563,18 +563,18 @@ def estimate_sapling_growth_rates(df: pl.DataFrame, basis: str, tag: str | None 
 
     sp_rates = (
         tree_rates.group_by(["species_symbol", "epa_l3"])
-        .agg([pl.col("rel_rate").mean().alias("rate"),
+        .agg([pl.col("rel_rate").sort().mean().alias("rate"),
               pl.len().alias("_n")])
         .filter(pl.col("_n") >= MIN_RATE_TREES)
         .drop("_n")
     )
     grp_rates = (
         tree_rates.group_by(["spgrpcd", "epa_l3"])
-        .agg(pl.col("rel_rate").mean().alias("rate"))
+        .agg(pl.col("rel_rate").sort().mean().alias("rate"))
     )
     glb_rates = (
         tree_rates.group_by("spgrpcd")
-        .agg(pl.col("rel_rate").mean().alias("rate"))
+        .agg(pl.col("rel_rate").sort().mean().alias("rate"))
     )
 
     # r2 M2: float means depend on summation order across threads — round for determinism

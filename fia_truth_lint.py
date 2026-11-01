@@ -5,6 +5,7 @@
   L4 no row-order logic;
   L5 no time arithmetic on INVYR;
   L6 no date as a key (D69): MEASDATE and its derivatives order records and measure time, they never join or group them.
+  L8 a float sum or mean in a keyed aggregate is taken in sorted order, because the result depends on row and thread order;
   L7 no pipeline stage reads FIA's CN links (PREV_PLT_CN, PREV_TRE_CN, SUBP_COND_CHNG_MTRX): D67.
 Allowed: the CN validation in dbconn's views, the TreeAge load by CN, fia_truth_assemble's conversion of raw CNs to natural ids
 (cn-boundary), and verify_curation_v2, which uses FIA's CN links on purpose, as an independent check."""
@@ -15,6 +16,7 @@ STAGES = ["fia_curation_v3.py", "age_imputation.py", "cohort_tracking.py", "coho
           "fia_truth_assemble.py", "trees_fvs.py", "nimiwae_prep.py", "dbconn.py"]
 JOIN = re.compile(r"\b\w+\.(PLT_CN|CN|TRE_CN|PREV_PLT_CN|PREV_TRE_CN|SRV_CN)\s*=\s*(CAST\()?\w*\.?\w+|=\s*\w+\.(PLT_CN|TRE_CN|SRV_CN)\b", re.I)
 ALLOW_BLOCK = {}
+FLOAT_AGG = ("cohort_disturbance.py", "cohorts_landis_simB.py", "build_tree_trajectories.py", "cohort_tracking.py", "fia_curation_v3.py", "cohorts_landis.py")
 
 
 def scan(path, name, findings):
@@ -47,6 +49,8 @@ def scan(path, name, findings):
             findings.append(f"L6 {name}:{i}: {ln.strip()[:110]}")
         if name != "fia_truth_assemble.py" and "cn-boundary" not in ln and not ln.lstrip().startswith("#") and re.search(r"\b(PREV_PLT_CN|PREV_TRE_CN|SUBP_COND_CHNG_MTRX)\b", ln) and '"""' not in ln:
             findings.append(f"L7 {name}:{i}: {ln.strip()[:110]}")
+        if name in FLOAT_AGG and "order-ok" not in ln and re.search(r'pl\.col\("(agb|ba|sp_ba|_precut_ba|_precut_age|_bio|estimated_age|biomass_contrib|DIA|HT|rel_rate|counted_would_be|counted_dropped|noncounted_live_w)"\)\.(sum|mean|std)\(\)', s):
+            findings.append(f"L8 {name}:{i}: {ln.strip()[:110]}")
         # COND_ID (plot key + CONDID) is a condition only together with its visit
         if re.search(r"(over|group_by|shift|partition_by)\(\s*(COND_ID|cond_id_cols)\s*\)|on\s*=\s*COND_ID\s*[,)]", s):
             findings.append(f"L2 {name}:{i}: {ln.strip()[:110]}")

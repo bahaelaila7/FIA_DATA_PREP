@@ -79,16 +79,16 @@ def build(con) -> pl.DataFrame:
     grp = [c for c in OUT_COLS if c != "agb"]
     nu = c1.IS_NATURAL_MODEL
     kb = c1.IS_KNOWN_BIAS
-    src = (df.group_by(grp + ["_age_source"]).agg(pl.col("agb").sum().alias("_a"))
+    src = (df.group_by(grp + ["_age_source"]).agg(pl.col("agb").sort().sum().alias("_a"))
              .pipe(pick, grp, ["_a", "_age_source"], descending=[True, False], nulls_last=True)
              .select(grp + [pl.col("_age_source").alias("age_source_major")]))
     df = (df.group_by(grp, maintain_order=True)
-            .agg(pl.col("agb").sum().alias("agb"),
+            .agg(pl.col("agb").sort().sum().alias("agb"),
                  nu.cast(pl.Int64).sum().alias("n_trees_natural_treeage_scale"),
-                 ((pl.col("agb") * nu.cast(pl.Float64)).sum() / pl.col("agb").sum())
+                 ((pl.col("agb") * nu.cast(pl.Float64)).sort().sum() / pl.col("agb").sort().sum())
                  .alias("share_natural_treeage_scale"),
                  kb.cast(pl.Int64).sum().alias("n_trees_known_bias"),
-                 ((pl.col("agb") * kb.cast(pl.Float64)).sum() / pl.col("agb").sum())
+                 ((pl.col("agb") * kb.cast(pl.Float64)).sort().sum() / pl.col("agb").sort().sum())
                  .alias("share_known_bias"))
             # r5 M-3: float sums depend on the summation order -> round for bit-identical reruns
             .with_columns(pl.col("agb").round(6), pl.col("share_natural_treeage_scale").round(9),

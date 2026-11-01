@@ -583,15 +583,15 @@ def classify_cut_events(full: pl.DataFrame) -> pl.DataFrame:
 
     removed = (
         cut.group_by(SUBPLOT_ID + ["cut_invyr", "cut_measdate"])
-        .agg(pl.col("_precut_ba").sum().alias("removed_ba"),
-             pl.col("_precut_age").mean().alias("cut_mean_age"))
+        .agg(pl.col("_precut_ba").sort().sum().alias("removed_ba"),
+             pl.col("_precut_age").sort().mean().alias("cut_mean_age"))
     )
 
     # live BA per (subplot, visit) — denominator is the visit immediately before the cut
     live_ba = (
         full.filter(pl.col("STATUSCD") == 1)
         .group_by(SUBPLOT_ID + ["INVYR", "MEASDATE"])   # date-ok: INVYR is in the key, the date is carried
-        .agg(pl.col("ba").sum().alias("live_ba"))
+        .agg(pl.col("ba").sort().sum().alias("live_ba"))
     )
     denom = (
         removed.join(live_ba, on=SUBPLOT_ID, how="left")
@@ -654,11 +654,11 @@ def derive_land_use(full: pl.DataFrame, events: pl.DataFrame) -> pl.DataFrame:
     # dominant-species live-BA share per subplot (peak purity across visits)
     sp_ba = (
         full.filter(pl.col("STATUSCD") == 1)
-        .group_by(SUBPLOT_ID + ["INVYR", "spcd"]).agg(pl.col("ba").sum().alias("sp_ba"))
+        .group_by(SUBPLOT_ID + ["INVYR", "spcd"]).agg(pl.col("ba").sort().sum().alias("sp_ba"))
     )
     purity = (
         sp_ba.group_by(SUBPLOT_ID + ["INVYR"])
-        .agg((pl.col("sp_ba").max() / pl.col("sp_ba").sum()).alias("_top_share"))
+        .agg((pl.col("sp_ba").max() / pl.col("sp_ba").sort().sum()).alias("_top_share"))
         .group_by(SUBPLOT_ID).agg(pl.col("_top_share").max().round(9).alias("dominant_species_frac"))
     )
 
