@@ -23,7 +23,7 @@ VISIT = """JOIN f.main.PLOT P ON P.STATECD = R.STATECD AND P.UNITCD = R.UNITCD A
 
 def records(c):
     st = lambda x: ",".join(map(str, x))
-    common = f"R.STATECD statecd, R.UNITCD unitcd, R.COUNTYCD countycd, R.PLOT plot, R.INVYR invyr, {MD} measdate, R.SPCD spcd, R.DIA::DOUBLE dia, R.HT::DOUBLE ht"
+    common = f"R.STATECD statecd, R.UNITCD unitcd, R.COUNTYCD countycd, R.PLOT plot, R.INVYR invyr, {MD} measdate, R.SPCD spcd, R.SPGRPCD spgrpcd, R.DIA::DOUBLE dia, R.HT::DOUBLE ht"
     # carried forward = the same plot, number, species, age, DIA and height at an earlier visit: keep the earliest visit of each such group
     site_r = f"""(SELECT * FROM f.main.SITETREE WHERE STATECD IN ({st(R4)})
                   QUALIFY INVYR = min(INVYR) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, TREE, SPCD, AGEDIA, DIA, HT))"""
@@ -35,7 +35,7 @@ def records(c):
 
 
 def attach(df, c, prism, solus):
-    ref = c.execute("SELECT SPCD spcd, SPGRPCD spgrpcd, MAJOR_SPGRPCD major_spgrpcd, SFTWD_HRDWD sftwd_hrdwd FROM f.main.REF_SPECIES").pl()
+    ref = c.execute("SELECT SPCD spcd, MAJOR_SPGRPCD major_spgrpcd, SFTWD_HRDWD sftwd_hrdwd FROM f.main.REF_SPECIES").pl()
     eco = c.execute("SELECT statecd, unitcd, countycd, plot, epa_l3, epa_l4 FROM f.main.data_plot_eco").pl()
     k = ['statecd', 'unitcd', 'countycd', 'plot']
     cast = lambda d, cols: d.with_columns([pl.col(x).cast(df.schema[x]) for x in cols])
