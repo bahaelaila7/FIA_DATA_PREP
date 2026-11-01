@@ -1705,3 +1705,17 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - Precision normal / after, recall on live graduates: p ≥ 0.3 0.64 / 0.65, 0.49 / 0.48; p ≥ 0.5 0.77 / 0.79, 0.37 / 0.36; p ≥ 0.7 0.87 / 0.87, 0.25 / 0.26.
 - Silent (all numbers hidden; 233,876 pairs, 13,282 true): link probability 7.0 vs after-move plots 6.5 (true 8.2) and normal KY + TN 6.3 (true 7.8).
 - Keep this pooled model. Moved plots are the same plots as the after-move list, so it is also the closest training population.
+
+**D65 amendment 12 (2026-11-01; user: stop trusting the numbers, recheck the whole issue). `retally_audit.py` plus `docs/RETALLY_AUDIT.json` are now the only source for these figures; they supersede the figures in am. 1–11.** New SQL implementation from PLOT and TREE, tested on hand-built plots with known answers and on 400 random matching cases against brute force. Tree chains break at a reused number (164 records).
+- **New bug found:** equal-cost matches were broken by column order, and hidden debuts carry negative ids, so tie-breaking depended on the truth. Precision and recall of the plain relink moved in either direction depending on the order. Ties now use a seeded jitter and a hashed column order.
+- **Corrections:**
+  - 36,753 visits are CENTER, all MANUAL 1.0; one MANUAL 1.0 visit is not CENTER. "28,295" was only visits with a following visit.
+  - 23,823 move visits in all; 13,737 have saplings on the old list.
+  - Closures with neither size nor agent among saplings: 2,229, not 2,430, which counted all sizes.
+  - Continuing at moves, alive: 5,016 ≥ 5 in, 3,069 saplings; 116 dead. The earlier 5,063 and 3,138 included dead.
+  - Normal graduation one visit later, any status: 0.007 / 0.028 / 0.098 / 0.291 / 0.678; alive 0.007 / 0.026 / 0.094 / 0.252 / 0.508.
+- **Table, normal / after / moved:** dead 29.0 / 28.0 / 27.4; lost 0.8 / 0.8 / 3.4; graduated true 9.9 / 10.3 / unknown; relinked 16.4 / 16.9 / 15.6; link probability 8.8 / 9.0 / 8.3; not graduated true 60.3 / 60.9 / unknown; relinked 53.8 / 54.3 / 53.6; link probability 61.4 / 62.2 / 60.9.
+- **Accuracy, normal / after, precision then recall on live graduates:** relinked 0.19 / 0.18, 0.57 / 0.55; p ≥ 0.3 0.62 / 0.64, 0.44 / 0.43; p ≥ 0.5 0.76 / 0.79, 0.33 / 0.33; p ≥ 0.7 0.87 / 0.87, 0.22 / 0.23.
+- **Silent:** relinked 24.8, link probability 6.8; normal KY + TN true 7.8, relinked 19.8, probability 6.0; after-move true 8.2, relinked 21.1, probability 6.2.
+- **Reproduced unchanged:** the closure counts (60,585 / 26,445), agents, the no-candidate table within 0.2 points, move and break coverage, early mortality, all true outcomes.
+- **Retired, not re-derived:** the placebo estimates of am. 1, 3, 4 (own subplot vs other subplots). The 24–30 % upper range for hidden graduates at 4.5+ in rests on those and should not be quoted. The curated-fate counts (all but about 10 of 26,445 censored; 125,816 dead sapling records) come from one query and were not rewritten.
