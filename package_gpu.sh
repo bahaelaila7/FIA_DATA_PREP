@@ -17,8 +17,8 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 set -euo pipefail
 D=${1:-cuda}
 python -I nimiwae70_verify.py | tail -1
-python -I nimiwae70_dev.py --data data --out out/d70b_age1 --age 1 --trees 400000 --epochs 12 --device "$D" --threads 8
-python -I nimiwae70_dev.py --data data --out out/d70b_age0 --age 0 --trees 400000 --epochs 12 --device "$D" --threads 8
-python -I nimiwae70_dev.py --data data --out out/d70b_age1_s1 --age 1 --seed 1 --trees 400000 --epochs 12 --device "$D" --threads 8
+python -I nimiwae70_dev.py --data data --out out/d70s_age1 --age 1 --opt sf --trees 400000 --epochs 12 --device "$D" --threads 8
+python -I nimiwae70_dev.py --data data --out out/d70s_age0 --age 0 --opt sf --trees 400000 --epochs 12 --device "$D" --threads 8
+python -I nimiwae70_dev.py --data data --out out/d70s_age1_s1 --age 1 --opt sf --seed 1 --trees 400000 --epochs 12 --device "$D" --threads 8
 R
 tar -cf "$OUT" -C "$W" nimiwae70; rm -rf "$W"; tar -tvf "$OUT" | awk '{printf "%8.1f MB  %s\n", $3/1048576, $NF}'

@@ -122,4 +122,20 @@ s_ = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 
 check('E1 mask: post-move debut only, slots before the move only', A.e1_mask(s_).tolist() == [True, False, False, False, False, False, False, False])
 # 11. the joint model routes prediction through its own build
 check('prediction uses the joint build', getattr(young, 'build', None) is not M.build and 'build' in A.NIMIWAE70.__dict__)
+# 13. Schedule-Free AdamW
+torch.manual_seed(1); p0 = torch.nn.Parameter(torch.tensor([3.0, -2.0])); sf = A.ScheduleFreeAdamW([p0], lr=0.1, beta=0.9, wd=0.0, warmup=1); zs = []; ws = []
+for t_ in range(1, 6):
+    sf.zero_grad(); (0.5 * (p0 ** 2).sum()).backward(); sf.step(); zs.append(sf.z[0].clone()); ws.append(0.1 ** 2)
+xm = sum(w * z_ for w, z_ in zip(ws, zs)) / sum(ws)
+check('x is the weighted average of the z iterates', float((sf.x[0] - xm).abs().max()) < 1e-5, f"{float((sf.x[0] - xm).abs().max()):.1e}")
+check('parameters hold y = beta x + (1 - beta) z while training', float((p0.detach() - (0.9 * sf.x[0] + 0.1 * sf.z[0])).abs().max()) < 1e-6)
+p1 = torch.nn.Parameter(torch.tensor([3.0, -2.0])); p2 = torch.nn.Parameter(torch.tensor([3.0, -2.0])); s1 = A.ScheduleFreeAdamW([p1], lr=0.1, beta=0.9, wd=0.0, warmup=1)
+s2 = torch.optim.Adam([p2], lr=0.1, betas=(0.0, 0.999), eps=1e-8)
+(0.5 * (p1 ** 2).sum()).backward(); s1.step(); (0.5 * (p2 ** 2).sum()).backward(); s2.step()
+check('the first z step equals an Adam step without momentum', float((s1.z[0] - p2.detach()).abs().max()) < 1e-5)
+torch.manual_seed(2); A_ = torch.randn(40, 8); w_ = torch.randn(8); y_ = A_ @ w_ + 0.1 * torch.randn(40); p3 = torch.nn.Parameter(torch.zeros(8)); s3 = A.ScheduleFreeAdamW([p3], lr=0.05, wd=0.0, warmup=20)
+for t_ in range(1500):
+    i_ = torch.randint(0, 40, (8,)); s3.zero_grad(); ((A_[i_] @ p3 - y_[i_]) ** 2).mean().backward(); s3.step()
+s3.finish(); ls_ = torch.linalg.lstsq(A_, y_[:, None]).solution[:, 0]
+check('it converges on noisy least squares; finish() leaves x', float((p3.detach() - ls_).norm()) < 0.1 and float((p3.detach() - s3.x[0]).abs().max()) == 0.0, f"{float((p3.detach() - ls_).norm()):.3f} from the solution")
 print('checks:', sum(o for _, o in RES), 'of', len(RES)); sys.exit(0 if all(o for _, o in RES) else 1)

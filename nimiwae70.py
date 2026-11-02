@@ -169,10 +169,33 @@ def predict_age(model, R, grid=None):
         out.append(a - torch.where(r['src'] == TOT, torch.zeros_like(a), model.curve.years_bh(r['c_grp'])))
     return torch.cat(out)
 
+class ScheduleFreeAdamW:
+    """Schedule-Free AdamW (Defazio et al. 2024, arXiv 2405.15682). Three sequences: z takes the Adam step, x is the weighted average of z and the model to evaluate,
+    y = beta x + (1 - beta) z is where gradients are taken, so the parameters hold y during training. c_t = w_t / W_t, w_t = gamma_t ^ 2, gamma_t = lr with a linear warmup.
+    No inner momentum, no decay schedule. Call finish() once: it leaves x in the parameters."""
+    def __init__(s, params, lr=1e-3, beta=0.9, b2=0.999, eps=1e-8, wd=1e-5, warmup=100):
+        s.ps = [p for p in params]; s.lr, s.beta, s.b2, s.eps, s.wd, s.warmup = lr, beta, b2, eps, wd, warmup
+        s.z = [p.detach().clone() for p in s.ps]; s.x = [p.detach().clone() for p in s.ps]; s.v = [torch.zeros_like(p) for p in s.ps]; s.t, s.W = 0, 0.0
+    def zero_grad(s):
+        for p in s.ps: p.grad = None
+    @torch.no_grad()
+    def step(s):
+        s.t += 1; g_ = s.lr * min(1.0, s.t / max(1, s.warmup)); w = g_ ** 2; s.W += w; c = w / s.W
+        bc = 1 - s.b2 ** s.t
+        for p, z, x, v in zip(s.ps, s.z, s.x, s.v):
+            if p.grad is not None:
+                v.mul_(s.b2).addcmul_(p.grad, p.grad, value=1 - s.b2)
+                z.add_(p, alpha=-g_ * s.wd).addcdiv_(p.grad, torch.sqrt(v / bc) + s.eps, value=-g_)
+            x.lerp_(z, c)
+            p.copy_(s.beta * x + (1 - s.beta) * z)
+    @torch.no_grad()
+    def finish(s):
+        for p, x in zip(s.ps, s.x): p.copy_(x)
+
 def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
-def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu'):
+def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw'):
     assert set(tr.split.unique()) <= {'train'} and set(rec.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
     assert rec.first_of_tree.all() and rec.fit_ok.all(), 'one age record per tree in fitting, within the curve range; repeats test the step'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
@@ -180,10 +203,13 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
     model = make_model(vocab, age=age).to(device)
     phi = model.enc_params(); pid = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in pid]
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     nb_ep = (n + bs - 1) // bs
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * nb_ep, pct_start=0.05, anneal_strategy='cos')
-    log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; age records {nr:,}; K {k} (DReG); age {age}; device {device}')
+    if opt_name == 'sf':                                                                     # warmup = the 5 % of steps OneCycleLR uses
+        opt = ScheduleFreeAdamW(model.parameters(), lr=lr, wd=1e-5, warmup=int(0.05 * epochs * nb_ep)); sched = None
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+        sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * nb_ep, pct_start=0.05, anneal_strategy='cos')
+    log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; age records {nr:,}; K {k} (DReG); age {age}; device {device}; optimizer {opt_name}')
     hist = []
     for ep in range(epochs):
         t0, tot, totr, nb = time.time(), 0.0, 0.0, 0
@@ -199,9 +225,11 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
             gp = torch.autograd.grad(loss_p, phi, allow_unused=True)
             opt.zero_grad()
             for p_, g_ in list(zip(theta, gt)) + list(zip(phi, gp)): p_.grad = g_
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step(); sched.step()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step()
+            if sched is not None: sched.step()
             tot += loss_t.item(); nb += 1
         ess = float((1 / (torch.softmax(o['lw'].detach(), 0) ** 2).sum(0)).median())
         hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=torch.exp(model.bhead(torch.cat([o['z'], model.st_p(b)[None].expand(k, -1, -1)], -1)))[..., 0].std().item() if age else 0.0))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
+    if opt_name == 'sf': opt.finish()                                                        # evaluate and save the averaged weights
     return model.to('cpu'), hist

@@ -1890,3 +1890,5 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - **Crown:** bias runs from +47 yr (CCLCD 2) to -17 yr (CCLCD 5), so a crown offset on the curve does not capture it.
 - **Reading:** age is poorly determined by DIA through an inverted curve; tau 0.43 in log size spreads ages widely. The current imputation stays.
 
+**D70 amendment 11 (2026-11-02; user asked): Schedule-Free AdamW available.** `ScheduleFreeAdamW` in `nimiwae70.py`, `--opt sf` (Defazio et al. 2024, arXiv 2405.15682): lr 1e-3, beta 0.9, warmup the same 5 % of steps, no Polyak step because this loss has no zero floor. Evaluation uses the averaged weights. An optimizer comparison needs both arms on the same optimizer. Bars unchanged. Expected effect: stable late training and anytime stopping; it does not address the design limits of am. 10.
+
