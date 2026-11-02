@@ -201,6 +201,6 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
             nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step(); sched.step()
             tot += loss_t.item(); nb += 1
         ess = float((1 / (torch.softmax(o['lw'].detach(), 0) ** 2).sum(0)).median())
-        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=float(torch.exp(model.bhead(torch.cat([o['z'].detach(), model.st_p(b)[None].expand(k, -1, -1)], -1)))[..., 0].std()) if age else 0.0))
+        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=torch.exp(model.bhead(torch.cat([o['z'], model.st_p(b)[None].expand(k, -1, -1)], -1)))[..., 0].std().item() if age else 0.0))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
     return model.to('cpu'), hist

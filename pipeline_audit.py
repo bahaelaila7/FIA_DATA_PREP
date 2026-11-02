@@ -91,7 +91,7 @@ def model(seq, rec):
     bad = [x for x, v in B.items() if torch.is_floating_point(v) and not torch.isfinite(v).all()]; check('M1 lineage tensors are finite', not bad, bad)
     bad = [x for x, v in R.items() if torch.is_floating_point(v) and not torch.isfinite(v).all()]; check('M2 record tensors are finite', not bad, bad)
     m = A.make_model(vocab); ix = torch.arange(min(256, B['v'].shape[0])); b = M.sub(B, ix); o = m.joint(b, 8, dreg=True)
-    check('M3 log weights are finite on real data', torch.isfinite(o['lw']).all(), float(o['lw'].mean()))
+    check('M3 log weights are finite on real data', torch.isfinite(o['lw']).all(), o['lw'].mean().item())
     loss = -(torch.logsumexp(o['lw'], 0) - np.log(8)).mean() - m.rec_ll(M.sub(R, torch.arange(256))).mean(); loss.backward()
     nog = [n for n, p in m.named_parameters() if p.grad is None and not n.startswith(('st_q', 'qin', 'qtr', 'qout', 'ercd', 'ecc'))]
     bad = [n for n, p in m.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]

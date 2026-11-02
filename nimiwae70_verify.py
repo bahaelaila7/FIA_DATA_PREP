@@ -38,11 +38,12 @@ ls = torch.stack([m.curve.log_s(tok, g.expand(6)) for g in grid], 1)
 check('curve monotone in age', bool((ls[:, 1:] - ls[:, :-1] >= -1e-6).all()))
 # 3. existence gate against the written formula
 lp1 = F.logsigmoid(40 * (torch.randn(4, 6, M.T_MAX))); lp0 = torch.log(-torch.expm1(lp1.clamp(max=-1e-6)))
-l1, l0, born = m.born_gate(lp1, lp0, z, B)
-e = torch.exp(lp1) * torch.sigmoid(A.KAPPA_B * m.ages(z, B))
+with torch.no_grad():
+    l1, l0, born = m.born_gate(lp1, lp0, z, B)
+    e = torch.exp(lp1) * torch.sigmoid(A.KAPPA_B * m.ages(z, B))
 check('P(exists) = P(size step) x sigma(kappa a_t)', float((torch.exp(l1) - e).abs().max()) < 1e-5)
 check('P(exists) + P(not) = 1', float((torch.exp(l1) + torch.exp(l0) - 1).abs().max()) < 1e-4)
-late = (m.ages(z, B) < -2)
+late = (m.ages(z, B).detach() < -2)
 if late.any(): check('no existence 2 yr before birth', float(torch.exp(l1)[late].max()) < 0.02)
 # 4. age off = the base model: same draws, same log weights
 torch.manual_seed(1); b0 = model(age=False); B0 = batch()
