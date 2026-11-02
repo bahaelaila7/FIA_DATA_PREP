@@ -1832,6 +1832,22 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - **Verification:** `nimiwae70_verify.py` 34 / 34, three on the real frame (prior slot is the last visible live record, no hidden slot feeds it, age steps equal dates to 0.0000 yr). 3,729,318 of 3,729,318 real slots have a prior; median age 29.0 yr, median sd 0.282. Two identical site-tree rows naming different conditions keep one row, origin unknown (1,821 rows): `age_rec` keeps its 617,782 rows, no row changed.
 - **Run:** Adam with OneCycle, as d70b, so the comparison changes one thing. Schedule-Free stays a separate test.
 
+**D70 amendment 13 (2026-11-02): the am. 12 run; the prior moves to the first record.** `d70p`, 400k trees, 12 epochs, Adam, VAL, `d70p_report.json`, `nimiwae70_prior_read.py`.
+| Bar | Threshold | d70p | Result |
+|---|---|---|---|
+| G1 linked trees | MAE <= 9.4; bias <= 2; not worse than `f+p` 8.88 | 11.80; -3.28 | **fail** |
+| G4 seeds | <= 0.2 yr | 0.135 | pass |
+| G5 coverage | 0.75-0.85 | 0.709 | **fail** |
+| G6 size, E2, E3 | size <= 5 % worse; Brier <= 0.005 worse | 7.5 % better; +0.0002; +0.0003 | pass |
+| G8 E1 | >= 0.005 better | 0.0126 better (0.0438 vs 0.0564) | pass |
+- **Cause of G1, measured with no lineage model:** `f` is not time-consistent. Its age rises 0.52 yr per year across VAL trees (0.64 on the G1 trees). Reading it at the last record and subtracting elapsed time gives 11.35 / -3.24 on its own; the joint gives 11.81 / -3.09 on the same scoring, so the joint added 0.2 yr and did not cause it. This was a wiring error of am. 12, not a failure of the birth limits.
+- **Readings, G1 trees:** current 9.40 / +0.18; at the scored record 8.88 / -0.71; last 11.35 / -3.24; mean of implied births 9.21 / -1.25; **first 8.24 / +0.25**.
+- **Scored record left out**, so a reading cannot win by being the scored record: from an earlier record 8.53 / +1.23 (bias +0.88 at gaps to 7 yr, +2.02 past 12 yr); from a later record 12.12 / -5.36 (-2.41, then -10.17); mean of the others 9.74 / -1.64.
+- **Decision: read the prior at the first visible record.** The bias stays small over long gaps. `mean_birth` is rejected: it mixes in the backward reading and fails the 8.88 clause. A pace correction to `f` is rejected: it adds a fitted step without evidence the first record needs one.
+- **Consequence:** no visible record can fall before birth, so the born gate acts only on pre-debut slots, as the user's bound asks.
+- **Costs, stated before the run:** chosen on VAL, so TEST stays untouched for the final check. Planted field-age bias worsens at mid sizes: 1-3, 3-5, 5-7, 7-9, 9-15, 15+ in go +2.6, +2.4, +1.3, +0.7, +1.6, +6.5 at the last record to +3.6, +3.9, +2.9, +2.9, +2.8, +4.2 at the first. Prior coverage on G1 trees is 0.777, and d70p lost 0.08 between prior and joint, so G5 may fail again.
+- **Bars unchanged.** `d70q` is the next run.
+
 **D69 amendment 2 (2026-11-01): the id change on the regional fit.** Am. 1 guessed a regional fit would move less. It moved more. Step 2 rerun on the same data with only `natural_record_id` changed: natural saplings under 5 in +0.58 yr mean, 0.84 mean absolute, 3.4 at the 99th percentile (596,563 records); natural 5+ in -0.01, 0.18; planted under 5 in -0.08, 0.34; planted 5+ in 0.00, 0.10. No estage age changes. The data changes of steps 2-3 alone move natural saplings -0.09 yr. Out-of-fold errors are unchanged, because those saplings are not scored. Reading: natural sapling ages sit outside the model's training sizes, so they depend on the bootstrap draw by about half a year. They are not stable values; the joint age model (D70) replaces them.
 
 **D66 amendment 2 (2026-11-01): float aggregates in sorted order.** The final regional pair differed on one `cohort_disturbance` row: `would_be` sat on a 6-decimal rounding boundary, so summing in another order rounded it the other way (6949585.934721 vs 6949585.93472). Rounding had only made this rare. Every float sum, mean and std in a keyed aggregate now sorts first (SQL `SUM(... ORDER BY ...)` for the forest proportions). Lint L8 rejects the unsorted form.

@@ -119,14 +119,15 @@ for t_ in range(1500):
     i_ = torch.randint(0, 40, (8,)); s3.zero_grad(); ((A_[i_] @ p3 - y_[i_]) ** 2).mean().backward(); s3.step()
 s3.finish(); ls_ = torch.linalg.lstsq(A_, y_[:, None]).solution[:, 0]
 check('it converges on noisy least squares; finish() leaves x', float((p3.detach() - ls_).norm()) < 0.1 and float((p3.detach() - s3.x[0]).abs().max()) == 0.0, f"{float((p3.detach() - ls_).norm()):.3f} from the solution")
-# 14. on the real frame: the prior comes from the last visible live record, a hidden record never feeds it, and age steps match the dates
+# 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()
     Bf, vf, sf_ = A.build(f_); ti, po = sf_._tid.to_numpy(), sf_._pos.to_numpy()
-    ok = (sf_.slot_kind == 'real') & sf_.af_mu.notna(); e_ = sf_[ok].assign(ti=ti[ok], po=po[ok]).sort_values(['ti', 'po']).groupby('ti').last()
-    check('frame: la is the last slot with a prior', bool((Bf['la'][e_.index.to_numpy().copy()].numpy() == e_.po.to_numpy()).all()) and abs(float(Bf['af_mu'][e_.index.to_numpy().copy()].mean()) - e_.af_mu.mean()) < 1e-3, f'{len(e_):,} of {Bf["v"].shape[0]:,} trees')
+    ok = (sf_.slot_kind == 'real') & sf_.af_mu.notna(); e_ = sf_[ok].assign(ti=ti[ok], po=po[ok]).sort_values(['ti', 'po']).groupby('ti').first()
+    check('frame: la is the first slot with a prior', bool((Bf['la'][e_.index.to_numpy().copy()].numpy() == e_.po.to_numpy()).all()) and abs(float(Bf['af_mu'][e_.index.to_numpy().copy()].mean()) - e_.af_mu.mean()) < 1e-3, f'{len(e_):,} of {Bf["v"].shape[0]:,} trees')
     bs_ = M.bench_sizes(f_); Bh, _, sh = A.build(bs_, vf); ti, po = sh._tid.to_numpy(), sh._pos.to_numpy(); hi = sh.hidden.fillna(False).to_numpy(bool)
     check('frame: no hidden slot feeds the prior', int(((Bh['af_has'].numpy()[ti[hi]] > 0) & (Bh['la'].numpy()[ti[hi]] == po[hi])).sum()) == 0, f'{int(hi.sum()):,} hidden slots')
+    check('frame: no visible record falls before birth under any draw', bool((Bf['la'] == Bf['f']).all()), f'{int((Bf["la"] == Bf["f"]).sum()):,} trees')
     zf = torch.zeros(1, Bf['v'].shape[0], M.DZ)
     mf = A.make_model(vf); af = mf.ages(zf, Bf).detach()[0].numpy(); ti, po = sf_._tid.to_numpy(), sf_._pos.to_numpy(); sa = sf_.assign(a=af[ti, po], yr=(pd.to_datetime(sf_.measdate) - pd.Timestamp('2000-01-01')) / pd.Timedelta(days=365.25))
     r_ = sa.groupby(M.K_).apply(lambda g: float(((g.a - g.a.iloc[0]) - (g.yr - g.yr.iloc[0])).abs().max()), include_groups=False).max()

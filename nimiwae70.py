@@ -1,6 +1,6 @@
 """D70 — joint NIMIWAE age model: NIMIWAE56 with flexible growth and the known design rule, plus one birth date per tree (design of D70 am. 12; the curve version is nimiwae70_curve.py).
 
-Age       log a_l = af_mu + af_sd z0, z0 ~ N(0, 1) under the prior, at the tree's last visible live measured record l. af_mu and af_sd come from the direct age model
+Age       log a_l = af_mu + af_sd z0, z0 ~ N(0, 1) under the prior, at the tree's first visible live measured record l (am. 13: the direct model's age rises 0.5-0.6 yr per year, so reading a later record and walking back runs young). af_mu and af_sd come from the direct age model
           (nimiwae_age_direct.py), fitted on TRAIN measured ages only and fixed here, so lineages cannot move them. z0 is a true latent, so the width of age is honest: a penalty on a
           function of z would reward collapsing onto af_mu.
 Birth     b = t_l - a_l. Age at a slot is a_t = t - b at every visit, negative before birth, so it advances exactly with elapsed time. Dates, never INVYR.
@@ -40,10 +40,10 @@ def build(seq, vocab=None):
     B['soil'] = torch.tensor(np.stack([np.nan_to_num((st[c].to_numpy(float) - vocab['_soil'][c][0]) / vocab['_soil'][c][1], nan=0.0) for c in SOIL_COLS], 1), dtype=torch.float32)
     n = B['v'].shape[0]; ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
     mu, sd, la = np.full(n, AF_MU0, np.float32), np.full(n, AF_SD0, np.float32), B['l'].clone()
-    if 'af_mu' in sq:                                                                          # the last visible slot with a prior; hidden records never feed it
+    if 'af_mu' in sq:                                                                          # the first visible slot with a prior; hidden records never feed it
         hid = sq.hidden.fillna(False).to_numpy(bool) if 'hidden' in sq else np.zeros(len(sq), bool)
         ok = (sq.slot_kind == 'real').to_numpy() & ~hid & sq.af_mu.notna().to_numpy()
-        o = pd.DataFrame(dict(t=ti[ok], p=po[ok], m=sq.af_mu.to_numpy(float)[ok], s=sq.af_sd.to_numpy(float)[ok])).sort_values(['t', 'p']).groupby('t').last()
+        o = pd.DataFrame(dict(t=ti[ok], p=po[ok], m=sq.af_mu.to_numpy(float)[ok], s=sq.af_sd.to_numpy(float)[ok])).sort_values(['t', 'p']).groupby('t').first()
         mu[o.index.to_numpy()] = o.m.to_numpy(); sd[o.index.to_numpy()] = o.s.to_numpy(); la[torch.tensor(o.index.to_numpy())] = torch.tensor(o.p.to_numpy(), dtype=la.dtype)
         B['af_has'] = torch.zeros(n); B['af_has'][torch.tensor(o.index.to_numpy())] = 1.0
     else:
@@ -77,7 +77,7 @@ class NIMIWAE70(M.NIMIWAE56):
             z = z.clone(); z[..., 0] = 0.0
         return super().decode(z, B, u)
     def ages(s, z, B):
-        """a_t [K, n, T]: one birth date per tree. a_l > 0 at the prior's slot; other slots add elapsed years exactly, so a_t < 0 before birth."""
+        """a_t [K, n, T]: one birth date per tree. a_l > 0 at the prior's slot, the debut or the first visible record; other slots add elapsed years exactly, so a_t < 0 before birth."""
         al = torch.exp((B['af_mu'][None] + B['af_sd'][None] * z[..., 0]).clamp(max=7.0))     # [K, n]; up to about 1100 yr
         t = B['cov'][..., ITYR] * 20.0                                                        # [n, T] years since 2000, from measurement dates
         return al[..., None] + (t - t.gather(1, B['la'][:, None]))[None]
