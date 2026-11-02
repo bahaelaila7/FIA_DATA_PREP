@@ -52,12 +52,13 @@ torch.manual_seed(5); o = b0.joint(B0, 8)
 o2 = None
 b0.born_gate = M.NIMIWAE56.born_gate.__get__(b0); b0.extra_lw = M.NIMIWAE56.extra_lw.__get__(b0)
 torch.manual_seed(5); o2 = b0.joint(B0, 8)
-check('hooks are inert when age is off', float((o['lw'] - o2['lw']).abs().max()) == 0.0)
+with torch.no_grad(): check('hooks are inert when age is off', float((o['lw'] - o2['lw']).abs().max()) == 0.0)
 torch.manual_seed(5); oa = m.joint(B0, 8)
-check('hooks act when age is on', float((oa['lw'] - o['lw']).abs().max()) > 0)
+with torch.no_grad(): check('hooks act when age is on', float((oa['lw'] - o['lw']).abs().max()) > 0)
 # 5. record likelihood against a hand computation
 R = dict(c_spc=torch.ones(3, dtype=torch.long), c_grp=torch.ones(3, dtype=torch.long), c_num=torch.zeros(3, A.NCX), src=torch.tensor([A.TOT, A.BHA, A.SITE]), cc=torch.tensor([1, 5, A.CC_SITE]),
          a_obs=torch.tensor([20., 20., 20.]), lD=torch.log(torch.tensor([6., 6., 6.])))
+torch.set_grad_enabled(False)
 ll = m.rec_ll(R).detach(); tk = m.curve.token(R); l = m.curve.years_bh(R['c_grp'])
 hand = []
 for i in range(3):
@@ -65,13 +66,14 @@ for i in range(3):
     var = 0.02 ** 2 + (0.06 / 6) ** 2 + math.exp(2 * float(m.lsS)) + math.exp(2 * float(m.lstau))
     hand.append(-0.5 * (math.log(6) - mu) ** 2 / var - 0.5 * math.log(var) - 0.5 * math.log(2 * math.pi))
 check('record likelihood = hand formula; TOTAGE gets no breast-height years', float((ll - torch.tensor(hand)).abs().max()) < 1e-4)
+torch.set_grad_enabled(True)
 # 5b. years to breast height: the prior is centred on l0, by species group, with one term per group
 mm = A.NIMIWAE70(3, 3, 3, 3, 3, 3, 3, l0=[5.0, 2.0, 5.0, 2.0])
 g_ = torch.tensor([1, 2, 3]); check('years to breast height start at the softwood and hardwood values', torch.allclose(mm.curve.years_bh(g_), torch.tensor([2.0, 5.0, 2.0])))
-check('the prior is 0 at those values', float(mm.curve.log_prior_bh()) == 0.0)
+check('the prior is 0 at those values', mm.curve.log_prior_bh().item() == 0.0)
 with torch.no_grad(): mm.curve.eps_l.weight[1] = 0.3
-check('one prior sd on one group costs 0.5', abs(float(mm.curve.log_prior_bh()) + 0.5) < 1e-5)
-check('a group moves its own value only', abs(float(mm.curve.years_bh(torch.tensor([1]))) - 2 * math.exp(0.3)) < 1e-5 and float(mm.curve.years_bh(torch.tensor([2]))) == 5.0)
+check('one prior sd on one group costs 0.5', abs(mm.curve.log_prior_bh().item() + 0.5) < 1e-5)
+check('a group moves its own value only', abs(mm.curve.years_bh(torch.tensor([1])).item() - 2 * math.exp(0.3)) < 1e-5 and mm.curve.years_bh(torch.tensor([2])).item() == 5.0)
 # 6. gradient routing
 m.zero_grad(); m.rec_ll(R).sum().backward()
 enc = [p for p in m.enc_params() if p.grad is not None and p.grad.abs().sum() > 0]
