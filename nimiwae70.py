@@ -9,6 +9,7 @@ Unborn    a slot before birth is scored below the smallest tally level, so the s
 E1        a microplot debut on a moved plot: slots before the move carry no FALSE label, because that spot was not sampled then (D65 item 2). The birth date decides instead.
 Slots     log D_t ~ N(log S(t - b; x) + delta(cc_t) + v, sigma_S) on slots up to the last visible record with a_t >= 0.5 yr. v = g(z) - g(prior mean), per-tree vigour.
 Records   log DIA_obs ~ N(log S(a_obs + l; x) + delta(cc), sqrt(sigma_meas^2 + sigma_S^2 + tau^2)); l = years to breast height, 0 for TOTAGE; tau replaces v, which a record has no z for.
+Years BH  per species group, log l ~ N(log l0, 0.3), l0 = 2 softwood, 5 hardwood (D70 am. 6): one prior term per group, not per record, so groups with data can move and the rest stay near l0.
           Site trees use their own crown class (6), so their selection is a learned offset. Western tally records carry CCLCD, which identifies delta.
 Objective (mean lineage IWAE) + (N_rec / N_lin) (mean record log likelihood); records reach only the curve parameters."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +23,7 @@ NSOIL = len(SOIL_COLS)
 KAPPA_B = 2.0                 # per year: the birth step is about half a year wide
 CC_SITE, NCC = 6, 7           # 0 unknown, 1-5 CCLCD, 6 site tree
 NKNOT, NCX = 8, NSOIL + 3 + 1
+L0_SOFT, L0_HARD, SD_LOGL = 2.0, 5.0, 0.3
 TOT, BHA, SITE = 0, 1, 2
 ITYR = COV.index('tyr')
 
@@ -29,7 +31,10 @@ def curve_vocab(seq, rec):
     spc = sorted(set(seq.spcd.dropna().astype(int)) | set(rec.spcd.dropna().astype(int)))
     grp = sorted(set(seq.spgrpcd.dropna().astype(int)) | set(rec.spgrpcd.dropna().astype(int)))
     both = pd.concat([seq[SOIL_COLS + ['tm_n', 'pp_n', 'vp_n']], rec[SOIL_COLS + ['tm_n', 'pp_n', 'vp_n']]])
+    wood = pd.concat([seq[['spgrpcd', 'sftwd_hrdwd']], rec[['spgrpcd', 'sftwd_hrdwd']]]).dropna()
+    soft = wood.assign(s=(wood.sftwd_hrdwd == 'S').astype(float)).groupby('spgrpcd').s.mean()
     return dict(spc={v: i + 1 for i, v in enumerate(spc)}, grp={v: i + 1 for i, v in enumerate(grp)},
+                l0=[L0_HARD] + [L0_SOFT if soft.get(v, 0.0) >= 0.5 else L0_HARD for v in grp],
                 norm={c: (float(both[c].mean()), float(both[c].std()) or 1.0) for c in both.columns})
 
 def curve_x(d, cv, west):
@@ -74,33 +79,37 @@ class Static70(M.Static):
         return s.out(torch.cat(x + ([B['summ']] if s.use_summ else []), -1))
 
 class AgeCurve(nn.Module):
-    def __init__(s, nspc, ngrp):
+    def __init__(s, nspc, ngrp, l0=None):
         super().__init__()
+        s.register_buffer('l0', torch.tensor(l0 if l0 is not None else [L0_HARD] * (ngrp + 1), dtype=torch.float32))
+        s.eps_l = nn.Embedding(ngrp + 1, 1); nn.init.zeros_(s.eps_l.weight)
         s.es, s.eg = nn.Embedding(nspc + 1, 12), nn.Embedding(ngrp + 1, 6)
         s.net = nn.Sequential(nn.Linear(12 + 6 + NCX, 64), nn.GELU(), nn.Linear(64, 64), nn.GELU())
-        s.out = nn.Linear(64, 1 + NKNOT + 1)                                             # alpha, knot weights, years to breast height
+        s.out = nn.Linear(64, 1 + NKNOT)                                                 # alpha, knot weights
         s.delta = nn.Embedding(NCC, 1)
         s.register_buffer('knots', torch.linspace(math.log(1.0), math.log(250.0), NKNOT))
         with torch.no_grad():
-            s.out.bias.zero_(); s.out.bias[0] = -1.0; s.out.bias[1:1 + NKNOT] = 0.0; s.out.bias[-1] = 1.0; s.delta.weight.zero_()
+            s.out.bias.zero_(); s.out.bias[0] = -1.0; s.out.bias[1:1 + NKNOT] = 0.0; s.delta.weight.zero_()
     def token(s, X):
         return s.out(s.net(torch.cat([s.es(X['c_spc']), s.eg(X['c_grp']), X['c_num']], -1)))
     def log_s(s, tok, a):
-        """log S at ages a [..., n] or [..., n, T], tok [n, 1 + NKNOT + 1]: monotone non-decreasing in a by construction."""
+        """log S at ages a [..., n] or [..., n, T], tok [n, 1 + NKNOT]: monotone non-decreasing in a by construction."""
         w = F.softplus(tok[..., 1:1 + NKNOT]); al = tok[..., 0]
         if a.dim() == tok.dim(): w, al = w[:, None], al[:, None]
         phi = torch.sigmoid((torch.log(a.clamp(min=0.25))[..., None] - s.knots) / 0.5)
         return al + (w * phi).sum(-1)
-    def years_bh(s, tok):
-        return F.softplus(tok[..., -1])
+    def years_bh(s, grp):
+        return s.l0[grp] * torch.exp(s.eps_l(grp)[..., 0])
+    def log_prior_bh(s):
+        return -0.5 * (s.eps_l.weight ** 2).sum() / SD_LOGL ** 2
 
 class NIMIWAE70(M.NIMIWAE56):
     build = staticmethod(lambda seq, vocab: build(seq, vocab))                             # predictions and stand totals use the joint build
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, nc_spc, nc_grp, age=True):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, nc_spc, nc_grp, age=True, l0=None):
         super().__init__(nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=False, prior_ctx=False)
         s.age = age
         s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False)
-        s.curve = AgeCurve(nc_spc, nc_grp)
+        s.curve = AgeCurve(nc_spc, nc_grp, l0)
         s.bhead = nn.Linear(DZ + D_MODEL, 1)
         s.gv70 = nn.Linear(DZ, 1, bias=False)
         s.lsS, s.lstau = nn.Parameter(torch.tensor(-1.5)), nn.Parameter(torch.tensor(-1.5))
@@ -133,7 +142,7 @@ class NIMIWAE70(M.NIMIWAE56):
         return fit + unborn
     def rec_ll(s, R):
         """log likelihood per age record [m]; touches only the curve and its two scale parameters."""
-        tok = s.curve.token(R); l = s.curve.years_bh(tok)
+        tok = s.curve.token(R); l = s.curve.years_bh(R['c_grp'])
         a = R['a_obs'] + torch.where(R['src'] == TOT, torch.zeros_like(l), l)
         mu = s.curve.log_s(tok, a) + s.curve.delta(R['cc'])[..., 0]
         var = torch.exp(2 * M.ls_dia(R['lD'])) + torch.exp(2 * s.lsS) + torch.exp(2 * s.lstau)
@@ -141,7 +150,7 @@ class NIMIWAE70(M.NIMIWAE56):
 
 def make_model(vocab, age=True):
     cv = vocab['_curve']
-    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), len(cv['spc']), len(cv['grp']), age=age)
+    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), len(cv['spc']), len(cv['grp']), age=age, l0=cv['l0'])
     m.vocab = vocab; m.cfg = dict(censor='known', growth='flex', noise=False, prior_ctx=False, age=age); return m
 
 @torch.no_grad()
@@ -153,7 +162,7 @@ def predict_age(model, R, grid=None):
         r = sub(R, slice(i, i + 4096)); tok = model.curve.token(r)
         ls = torch.stack([model.curve.log_s(tok, a.expand(tok.shape[0])) for a in grid], 1) + model.curve.delta(r['cc'])
         ix = (ls - r['lD'][:, None]).abs().argmin(1); a = grid[ix]
-        out.append(a - torch.where(r['src'] == TOT, torch.zeros_like(a), model.curve.years_bh(tok)))
+        out.append(a - torch.where(r['src'] == TOT, torch.zeros_like(a), model.curve.years_bh(r['c_grp'])))
     return torch.cat(out)
 
 def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True):
@@ -176,7 +185,7 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
             loss_t = -(torch.logsumexp(o['lw'], 0) - math.log(k)).mean()
             if age:
                 r = sub(R, torch.tensor(rng.integers(0, nr, bs)))
-                lr_ = -model.rec_ll(r).mean(); loss_t = loss_t + (nr / n) * lr_; totr += lr_.item()
+                lr_ = -model.rec_ll(r).mean(); loss_t = loss_t + (nr / n) * lr_ - model.curve.log_prior_bh() / n; totr += lr_.item()
             wt = torch.softmax(o['lw'], 0).detach()
             loss_p = -(wt ** 2 * o['lw_dreg']).sum(0).mean()
             gt = torch.autograd.grad(loss_t, theta, retain_graph=True, allow_unused=True)
