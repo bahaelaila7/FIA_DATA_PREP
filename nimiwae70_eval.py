@@ -66,7 +66,7 @@ if __name__ == '__main__':
     j = ln.merge(cur, on=M.K_ + ['invyr'], how='inner'); j = j[j.estimated_age.notna()]
     Rp['G1'] = dict(n=len(j), mae_joint=float((j.q50 - j.truth).abs().mean()), mae_current=float((j.estimated_age - j.truth).abs().mean()), bias_joint=med(j.q50 - j.truth), bias_current=med(j.estimated_age - j.truth))
     Rp['G5'] = dict(cover80=float(((ln.truth >= ln.q10) & (ln.truth <= ln.q90)).mean()))
-    Rp['G7'] = dict(sd_S=float(torch.exp(m1.lsS)), tau=float(torch.exp(m1.lstau)), hist=[round(h['sd_S'], 3) for h in ck1['hist']])
+    Rp['tau'] = float(torch.exp(m1.lstau))
     Rp['years_bh'] = {str(k): round(float(v), 2) for k, v in zip(['0'] + list(m1.vocab['_curve']['grp']), m1.curve.years_bh(torch.arange(len(m1.vocab['_curve']['grp']) + 1)))}
     pl = val.plot_key.drop_duplicates().sample(frac=0.5, random_state=2); vs = val[val.plot_key.isin(pl)]      # whole plots: sampling trees first left the benchmarks too thin
     c1 = completion(m1, vs); c0 = completion(m0, vs); Rp['completion'] = dict(age1=c1, age0=c0)

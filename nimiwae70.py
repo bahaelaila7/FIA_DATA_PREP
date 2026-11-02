@@ -7,9 +7,10 @@ Curve     log S(a; x) + delta(crown) is shared by lineages and age records. x = 
           Monotone in age: alpha(x) + sum_j softplus(w_j(x)) phi_j(log a) with fixed sigmoid phi_j.
 Unborn    a slot before birth is scored below the smallest tally level, so the size path cannot carry a tree that does not exist.
 E1        a microplot debut on a moved plot: slots before the move carry no FALSE label, because that spot was not sampled then (D65 item 2). The birth date decides instead.
-Slots     log D_t ~ N(log S(t - b; x) + delta(cc_t) + v, sigma_S) on slots up to the last visible record with a_t >= 0.5 yr.
+Slots     log DIA_t ~ N(log S(t - b; x) + delta(cc_t) + v, SIG_S) at visible measured records with a_t >= 0.5 yr. Am. 9: on the measurement, never the latent path, and with a fixed
+          width. The latent path is deterministic given z, so a learned width on it collapses: the path sits on the curve and each slot earns log(1 / sigma) without limit.
 Vigour    v = tau * (z_0 - mu_0) / sigma_0: under the prior v ~ N(0, tau), the between-tree spread the age records measure. Am. 7: a free v absorbed all size and left b constant.
-Records   log DIA_obs ~ N(log S(a_obs + l; x) + delta(cc), sqrt(sigma_meas^2 + sigma_S^2 + tau^2)); l = years to breast height, 0 for TOTAGE; tau replaces v, which a record has no z for.
+Records   log DIA_obs ~ N(log S(a_obs + l; x) + delta(cc), sqrt(sigma_meas^2 + SIG_S^2 + tau^2)); l = years to breast height, 0 for TOTAGE; tau replaces v, which a record has no z for.
 Years BH  per species group, log l ~ N(log l0, 0.3), l0 = 2 softwood, 5 hardwood (D70 am. 6): one prior term per group, not per record, so groups with data can move and the rest stay near l0.
           Site trees use their own crown class (6), so their selection is a learned offset. Western tally records carry CCLCD, which identifies delta.
 Objective (mean lineage IWAE) + (N_rec / N_lin) (mean record log likelihood); records reach only the curve parameters."""
@@ -25,6 +26,7 @@ KAPPA_B = 2.0                 # per year: the birth step is about half a year wi
 CC_SITE, NCC = 6, 7           # 0 unknown, 1-5 CCLCD, 6 site tree
 NKNOT, NCX = 8, NSOIL + 3 + 1
 L0_SOFT, L0_HARD, SD_LOGL = 2.0, 5.0, 0.3
+SIG_S = 0.15                  # within-tree scatter around the curve, fixed
 TOT, BHA, SITE = 0, 1, 2
 ITYR = COV.index('tyr')
 
@@ -112,7 +114,7 @@ class NIMIWAE70(M.NIMIWAE56):
         s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False)
         s.curve = AgeCurve(nc_spc, nc_grp, l0)
         s.bhead = nn.Linear(DZ + D_MODEL, 1)
-        s.lsS, s.lstau = nn.Parameter(torch.tensor(-1.5)), nn.Parameter(torch.tensor(-1.5))
+        s.lstau = nn.Parameter(torch.tensor(-1.5))
         with torch.no_grad(): s.bhead.bias.fill_(math.log(25.0))                           # log scale: in raw years the head could not spread ages at this learning rate
     def ages(s, z, B):
         """a_t [K, n, T]: one birth date per tree. a_N > 0 at the last slot; earlier slots subtract elapsed years exactly, so a_t < 0 before birth."""
@@ -137,18 +139,17 @@ class NIMIWAE70(M.NIMIWAE56):
         cc = (B['cc'].long().clamp(0, 5) * (B['mcc'] > 0).long())
         v_ = s.vigour(z, mp, lp)[..., None]                                                 # [K, n, 1]
         ar = torch.arange(T_MAX, device=z.device)[None, None]
-        m = (B['v'][None] > 0) & (ar <= B['l'][None, :, None]) & (a >= 0.5)
+        m = (B['mD'][None] > 0) & (a >= 0.5)
         mu = ls + s.curve.delta(cc)[None, ..., 0] + v_
-        sd = torch.exp(s.lsS)
-        fit = ((-0.5 * ((lDp - mu) / sd) ** 2 - s.lsS - 0.5 * math.log(2 * math.pi)) * m).sum(-1)
+        fit = ((-0.5 * ((B['lD'][None] - mu) / SIG_S) ** 2 - math.log(SIG_S) - 0.5 * math.log(2 * math.pi)) * m).sum(-1)
         unborn = (F.logsigmoid(-M.KAPPA * (lDp - B['lex'][None])) * ((a < 0) & (B['v'][None] > 0))).sum(-1)
         return fit + unborn
     def rec_ll(s, R):
-        """log likelihood per age record [m]; touches only the curve and its two scale parameters."""
+        """log likelihood per age record [m]; touches only the curve and tau."""
         tok = s.curve.token(R); l = s.curve.years_bh(R['c_grp'])
         a = R['a_obs'] + torch.where(R['src'] == TOT, torch.zeros_like(l), l)
         mu = s.curve.log_s(tok, a) + s.curve.delta(R['cc'])[..., 0]
-        var = torch.exp(2 * M.ls_dia(R['lD'])) + torch.exp(2 * s.lsS) + torch.exp(2 * s.lstau)
+        var = torch.exp(2 * M.ls_dia(R['lD'])) + SIG_S ** 2 + torch.exp(2 * s.lstau)
         return -0.5 * (R['lD'] - mu) ** 2 / var - 0.5 * torch.log(var) - 0.5 * math.log(2 * math.pi)
 
 def make_model(vocab, age=True):
@@ -201,6 +202,6 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
             nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step(); sched.step()
             tot += loss_t.item(); nb += 1
         ess = float((1 / (torch.softmax(o['lw'].detach(), 0) ** 2).sum(0)).median())
-        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=torch.exp(model.bhead(torch.cat([o['z'], model.st_p(b)[None].expand(k, -1, -1)], -1)))[..., 0].std().item() if age else 0.0))
+        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=torch.exp(model.bhead(torch.cat([o['z'], model.st_p(b)[None].expand(k, -1, -1)], -1)))[..., 0].std().item() if age else 0.0))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
     return model.to('cpu'), hist

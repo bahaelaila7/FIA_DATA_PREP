@@ -67,7 +67,7 @@ ll = m.rec_ll(R).detach(); tk = m.curve.token(R); l = m.curve.years_bh(R['c_grp'
 hand = []
 for i in range(3):
     ag = 20.0 + (0.0 if i == 0 else float(l[i])); mu = float(m.curve.log_s(tk[i:i + 1], torch.tensor([ag]))[0]) + float(m.curve.delta(R['cc'][i:i + 1])[0, 0])
-    var = 0.02 ** 2 + (0.06 / 6) ** 2 + math.exp(2 * float(m.lsS)) + math.exp(2 * float(m.lstau))
+    var = 0.02 ** 2 + (0.06 / 6) ** 2 + A.SIG_S ** 2 + math.exp(2 * float(m.lstau))
     hand.append(-0.5 * (math.log(6) - mu) ** 2 / var - 0.5 * math.log(var) - 0.5 * math.log(2 * math.pi))
 check('record likelihood = hand formula; TOTAGE gets no breast-height years', float((ll - torch.tensor(hand)).abs().max()) < 1e-4)
 torch.set_grad_enabled(True)
@@ -110,6 +110,12 @@ check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, m
 torch.manual_seed(9); mpv = torch.randn(2000, M.DZ) * 3; lpv = torch.randn(2000, M.DZ); zv = mpv + torch.exp(0.5 * lpv) * torch.randn(4, 2000, M.DZ)
 vv = tall.vigour(zv, mpv, lpv).detach(); tau = float(torch.exp(tall.lstau))
 check('vigour is N(0, tau) under the prior', abs(float(vv.mean())) < 0.03 and abs(float(vv.std()) / tau - 1) < 0.03, f'mean {float(vv.mean()):+.3f}, sd {float(vv.std()):.3f}, tau {tau:.3f}')
+# 9b. the curve term reads measurements, not the latent path: a path sitting on the curve earns nothing
+B9b = batch(); z9 = torch.randn(2, 6, M.DZ); mp9 = torch.zeros(6, M.DZ); lp9 = torch.zeros(6, M.DZ)
+far = torch.full((2, 6, M.T_MAX), math.log(9.0)); near = torch.full((2, 6, M.T_MAX), math.log(8.0)); B9c = {k: v.clone() for k, v in B9b.items()}
+tall2 = model(); a9 = tall2.ages(z9, B9b); neg9 = bool(((a9 < 0) & (B9b['v'][None] > 0)).any())
+check('curve term does not reward the latent path', neg9 or float((tall2.extra_lw(far, z9, B9b, mp9, lp9) - tall2.extra_lw(near, z9, B9b, mp9, lp9)).abs().max()) == 0.0)
+check('the curve width is fixed', 'lsS' not in dict(tall2.named_parameters()))
 # 10. E1 mask: only slots before the move, only trees first recorded at or after it
 s_ = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1, 2, 2, 2, 3, 3], 'invyr': [2002, 2007, 2012, 2002, 2007, 2012, 2002, 2007],
                    'slot_kind': ['pre', 'pre', 'real', 'real', 'real', 'post', 'pre', 'real'], 'move_invyr': [2007, 2007, 2007, 2007, 2007, 2007, np.nan, np.nan]})

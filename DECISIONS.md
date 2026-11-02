@@ -1868,3 +1868,8 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 
 **D70 amendment 8 (2026-11-02): birth head on a log scale.** With vigour fixed, a 30,000-tree test still gave ages of 26.8 to 27.9 yr across all sizes, correlation with log DIA 0.46. The head output years through softplus from a start near 25, and at a learning rate of 1e-3 its weights could not span tens of years. It now outputs log age.
 
+**D70 amendment 9 (2026-11-02): the curve width collapsed; the curve term moves to measurements.** Run d70b (400,000 trees, 12 epochs): `sd_S` fell from 0.23 to 0.013, below G7's 0.05, tau rose to 0.53, and the loss went to -7.7 against about +0.1 with age off. Cause, a design error: the curve term scored the latent size path, which is deterministic given z, so it is a density on the model's own output with no entropy term. The path can sit on the curve, and each slot earns log(1 / sigma) without limit.
+- **Change:** the term reads measured log DIA at visible records, with a fixed width SIG_S = 0.15, so it is a likelihood of data and cannot grow without limit. Records use the same width. Hidden visits and unmeasured slots are no longer pulled toward the curve, which should also ease G6. Unmeasured slots are still limited by the unborn rule and by growth being monotone.
+- **G7 no longer applies:** it tested a learned width that no longer exists. This retires a bar rather than loosening it, and the reason is recorded here.
+- **SIG_S = 0.15 is a judgement**, between the size measurement error and the between-tree tau. Sensitivity to be reported.
+
