@@ -87,7 +87,7 @@ if __name__ == '__main__':
     k = ['statecd', 'unitcd', 'countycd', 'plot']
     p = pl.concat([pl.read_parquet(f, columns=k).unique().with_columns([pl.col(x).cast(pl.Int64) for x in k]) for f in a.plots]).unique()
     c = duckdb.connect(); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
-    eco = c.execute("SELECT statecd, unitcd, countycd, plot, lon, lat FROM f.main.data_plot_eco WHERE lon IS NOT NULL AND lat IS NOT NULL").pl().with_columns([pl.col(x).cast(pl.Int64) for x in k])
+    eco = c.execute("SELECT statecd, unitcd, countycd, plot, TRY_CAST(lon AS DOUBLE) lon, TRY_CAST(lat AS DOUBLE) lat FROM f.main.data_plot_eco WHERE TRY_CAST(lon AS DOUBLE) IS NOT NULL AND TRY_CAST(lat AS DOUBLE) IS NOT NULL").pl().with_columns([pl.col(x).cast(pl.Int64) for x in k])
     d = p.join(eco, on=k, how='inner').sort(k); print(f'{p.height:,} plots, {d.height:,} with coordinates', flush=True)
     r = extract(a.solus, d['lon'].to_numpy(), d['lat'].to_numpy(), a.workers)
     o = d.select(k).with_columns([pl.Series(n, v).fill_nan(None) for n, v in r.items()]); o.write_parquet(a.out)
