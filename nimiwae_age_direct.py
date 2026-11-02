@@ -94,7 +94,8 @@ def main(a):
         for k_ in (0, 1): oof[fold == k_] = fit(Xt[fold != k_], yt[fold != k_], cats).predict(Xt[fold == k_])
         m = fit(Xt, yt, cats); s = fit(Xt, np.log((yt - oof) ** 2 + 1e-4), cats)
         def pr(X):
-            mu = m.predict(X); sd = np.sqrt(np.exp(s.predict(X))); return np.exp(mu), np.exp(mu - 1.2816 * sd), np.exp(mu + 1.2816 * sd)
+            # a booster on log r^2 estimates E log r^2 = log var - 1.27 for a normal residual, so var = exp(pred + 1.27)
+            mu = m.predict(X); sd = np.sqrt(np.exp(s.predict(X) + 1.2704)); return np.exp(mu), np.exp(mu - 1.2816 * sd), np.exp(mu + 1.2816 * sd)
         pv, lv, hv = pr(Xv); pl_, ll, hl = pr(Xl); v = va.assign(p=pv, lo=lv, hi=hv)
         G2 = {s_: score(g.p.to_numpy(), g.total.to_numpy(), g.lo.to_numpy(), g.hi.to_numpy()) for s_, g in v.groupby('source')}
         w = v[v.west == 1]; crown = {int(c_): score(g.p.to_numpy(), g.total.to_numpy()) for c_, g in w.groupby('cc')}
