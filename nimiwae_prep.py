@@ -21,6 +21,35 @@ def split_of(key: str) -> str:
     h = zlib.crc32(key.encode()) % 100
     return 'train' if h < 70 else 'val' if h < 85 else 'test'
 
+def cte_parts(q: str):
+    """Split 'WITH a AS (...), b AS (...) SELECT ...' at depth 0 -> [(name, body), ...], final select."""
+    i = q.index('WITH') + 4; parts = []
+    while True:
+        o = q.index('(', i); name = q[i:o].replace(' AS ', ' ').split()[0]
+        d, j, instr = 0, o, False
+        while True:
+            ch = q[j]
+            if ch == "'": instr = not instr
+            elif not instr and ch == '(': d += 1
+            elif not instr and ch == ')':
+                d -= 1
+                if d == 0: break
+            j += 1
+        parts.append((name, q[o + 1:j])); i = j + 1
+        rest = q[i:].lstrip()
+        if rest.startswith(','): i = q.index(',', i) + 1; continue
+        return parts, rest
+
+def run_steps(c, q: str) -> pl.DataFrame:
+    """One temp table per CTE: a single regional plan took hours once visits were joined on INVYR (D70 audit); each step is small and timed."""
+    import time
+    parts, final = cte_parts(q)
+    for name, body in parts:
+        t = time.time(); c.execute(f'CREATE OR REPLACE TEMP TABLE "{name}" AS {body}')
+        print(f"  {name}: {c.execute(f'SELECT count(*) FROM {chr(34)}{name}{chr(34)}').fetchone()[0]:,} rows, {time.time() - t:.0f} s", flush=True)
+    t = time.time(); df = pl.from_arrow(c.execute(final).arrow()); print(f'  frame: {df.height:,} rows, {time.time() - t:.0f} s', flush=True)
+    return df
+
 def load54(db: str) -> pl.DataFrame:
     """D54 lineage frame. Counted plot visits = at least one subplot with a forested condition; a subplot's span = its first to last
     such visit; a tree's lineage = every counted visit in its subplot's span (before its debut, during and after its record).
@@ -117,7 +146,7 @@ def load54(db: str) -> pl.DataFrame:
     LEFT JOIN sa USING (statecd, unitcd, countycd, plot, subp, invyr)
     LEFT JOIN mv ON mv.statecd = f.statecd AND mv.unitcd = f.unitcd AND mv.countycd = f.countycd AND mv.plot = f.plot
     ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr"""
-    df = pl.from_arrow(c.execute(q).arrow()); c.close()
+    df = run_steps(c, q); c.close()
     return df
 
 # neighbours = trees at or above the design's SUBPLOT-level threshold at both ends of the interval (column nb_thr; 5 in for DESIGNCD 1):
