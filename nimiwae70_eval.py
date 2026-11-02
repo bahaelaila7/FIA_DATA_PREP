@@ -14,7 +14,8 @@ def completion(m, val, seed=0):
     """size error on the hidden visits, E1 on the same lineages under '< limit only', E2 and E3 on censored ends"""
     torch.manual_seed(seed); out = {}
     h, _ = M.predictions(m, M.bench_sizes(val)); hh = h[h.hidden & h.dia.notna() & h.nim_lD.notna()]; out['mae_lD'] = float((hh.nim_lD - np.log(hh.dia)).abs().mean())
-    x1, _ = M.predictions(m, M.bench_sizes(val, interval=False)); x1 = x1[x1.truth_E.notna()]; out['E1'] = reliability(x1.nim_pE, x1.truth_E)['brier']
+    x1, _ = M.predictions(m, M.bench_sizes(val, interval=False)); x1 = x1[x1.truth_E.notna()]; r1 = reliability(x1.nim_pE, x1.truth_E); out['E1'] = r1['brier']; out['E1_n'] = r1['n']; out['E1_base'] = r1['base_rate']
+    assert 0 < r1['base_rate'] < 1, 'E1 benchmark needs both TRUE and FALSE labels'
     b = M.bench_end(val); e, _ = M.predictions(m, b); x = e[e.truth_E.notna()]; out['E2'] = reliability(x.nim_pE, x.truth_E)['brier']
     g = x[x.truth_E == 0]; g = g[g.truth_cut.notna()]; out['E3'] = reliability(g.nim_pCut / (g.nim_pCut + g.nim_pDie).clip(lower=1e-9), g.truth_cut)['brier']
     return out
@@ -50,6 +51,7 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     for x in ('--data', '--age1', '--age0', '--fiadb', '--out', '--db'): ap.add_argument(x)
     ap.add_argument('--age1b'); a = ap.parse_args()
+    torch.set_num_threads(6)
     seq = pd.read_parquet(f'{a.data}/seq.parquet'); val = seq[seq.split == 'val'].copy()
     rec = pd.read_parquet(f'{a.data}/age_rec.parquet'); rv = rec[(rec.split == 'val') & rec.first_of_tree & rec.fit_ok].copy()
     m1, ck1 = load(a.age1); m0, ck0 = load(a.age0); Rp = {}
@@ -66,8 +68,12 @@ if __name__ == '__main__':
     Rp['G5'] = dict(cover80=float(((ln.truth >= ln.q10) & (ln.truth <= ln.q90)).mean()))
     Rp['G7'] = dict(sd_S=float(torch.exp(m1.lsS)), tau=float(torch.exp(m1.lstau)), hist=[round(h['sd_S'], 3) for h in ck1['hist']])
     Rp['years_bh'] = {str(k): round(float(v), 2) for k, v in zip(['0'] + list(m1.vocab['_curve']['grp']), m1.curve.years_bh(torch.arange(len(m1.vocab['_curve']['grp']) + 1)))}
-    trees = val[M.K_].drop_duplicates().sample(min(30000, val[M.K_].drop_duplicates().shape[0]), random_state=1); vs = val.merge(trees, on=M.K_)
-    pl = vs.plot_key.drop_duplicates().sample(frac=1, random_state=2).head(4000); vs = vs[vs.plot_key.isin(pl)]
+    pl = val.plot_key.drop_duplicates().sample(frac=0.5, random_state=2); vs = val[val.plot_key.isin(pl)]      # whole plots: sampling trees first left the benchmarks too thin
     c1 = completion(m1, vs); c0 = completion(m0, vs); Rp['completion'] = dict(age1=c1, age0=c0)
     Rp['G6'] = dict(size_ratio=c1['mae_lD'] / c0['mae_lD'], dE2=c1['E2'] - c0['E2'], dE3=c1['E3'] - c0['E3']); Rp['G8'] = dict(dE1=c1['E1'] - c0['E1'])
+    if a.age1b:                                                                    # G4: natural saplings under 5 in, two seeds
+        m2, _ = load(a.age1b); nat = seq[(seq.split == 'val') & (seq.slot_kind == 'real') & (~seq.planted.fillna(False)) & (seq.dia < 5)]
+        pk = nat.plot_key.drop_duplicates().sample(frac=0.3, random_state=4); nt = val[val.plot_key.isin(pk)]; tk = nat[nat.plot_key.isin(pk)][M.K_ + ['invyr']]
+        q1 = lineage_age(m1, nt, tk).merge(tk, on=M.K_ + ['invyr']); q2 = lineage_age(m2, nt, tk).merge(tk, on=M.K_ + ['invyr'])
+        Rp['G4'] = dict(n=len(q1), mean_diff=float(q2.q50.mean() - q1.q50.mean()), mean_abs_tree=float((q2.q50.to_numpy() - q1.q50.to_numpy()).__abs__().mean()))
     json.dump(Rp, open(a.out, 'w'), indent=1, default=float); print(json.dumps(Rp, indent=0, default=float)[:3000])
