@@ -28,9 +28,9 @@ def records(c):
     # carried forward = the same plot, number, species, age, DIA and height at an earlier visit: keep the earliest visit of each such group
     site_r = f"""(SELECT * FROM f.main.SITETREE WHERE STATECD IN ({st(R4)})
                   QUALIFY INVYR = min(INVYR) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, TREE, SPCD, AGEDIA, DIA, HT))"""
-    site = f"""SELECT 'site' AS source, {common}, NULL::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.AGEDIA AS DOUBLE) a_obs
+    site = f"""SELECT 'site' AS source, {common}, NULL::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.AGEDIA AS DOUBLE) a_obs, NULL::DOUBLE prev_dia, NULL::DOUBLE remper
         FROM {site_r} R {VISIT} WHERE TRY_CAST(R.AGEDIA AS DOUBLE) > 0 AND R.DIA > 0"""
-    tally = lambda src, col: f"""SELECT '{src}' AS source, {common}, R.CCLCD::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.{col} AS DOUBLE) a_obs
+    tally = lambda src, col: f"""SELECT '{src}' AS source, {common}, R.CCLCD::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.{col} AS DOUBLE) a_obs, R.PREVDIA::DOUBLE prev_dia, P.REMPER::DOUBLE remper
         FROM f.main.TREE R {VISIT} WHERE R.STATECD IN ({st(WEST)}) AND V.RSCD IN (22, 26) AND R.STATUSCD = 1 AND TRY_CAST(R.{col} AS DOUBLE) > 0 AND R.DIA > 0 AND R.DIAHTCD = 1"""
     return pl.concat([c.execute(q).pl().unique() for q in (site, tally('tot', 'TOTAGE'), tally('bha', 'BHAGE'))], how='vertical_relaxed')
 
