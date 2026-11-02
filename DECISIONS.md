@@ -1873,3 +1873,20 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - **G7 no longer applies:** it tested a learned width that no longer exists. This retires a bar rather than loosening it, and the reason is recorded here.
 - **SIG_S = 0.15 is a judgement**, between the size measurement error and the between-tree tau. Sensitivity to be reported.
 
+**D70 amendment 10 (2026-11-02): second dev run, scored on VAL. No bar passes except site-tree bias in G2; the ages are not used.** 400,000 trees, 12 epochs, GPU; `FIA/nimiwae_r8/out/d70b_report.json`.
+| Bar | Target | Result | |
+|---|---|---|---|
+| G1 linked trees | MAE <= current 9.4; bias <= 2 | MAE 18.8; bias +7.2 | fail |
+| G2 records | bias <= 3 by source | site -0.02; BHAGE +3.3; TOTAGE -5.2 | fail, site passes |
+| G2 overtopped | bias <= 5 | -16.9 | fail |
+| G3 1-5 in | bias <= 3 | -9.0 | fail |
+| G4 two seeds | <= 0.2 yr | 3.0 yr mean, 5.1 per tree | fail |
+| G5 coverage | 0.75-0.85 | 0.41 | fail |
+| G6 completion | size <= 5 % worse; E2, E3 <= 0.005 worse | size 11 % worse; E2 +0.001; E3 +0.000 | fail on size |
+| G8 E1 | >= 0.005 better | 0.016 worse (0.077 vs 0.061, n 3,423, base 0.83) | fail |
+- **Better than the first run:** G1 MAE 29.4 to 18.8, bias -25.6 to +7.2, coverage 0.01 to 0.41, size penalty 24.5 % to 11 %. No collapse: loss, tau and sd_disc level off.
+- **Implausible ages:** 1.7 % of validation trees above 200 yr, 42 of 38,839 above 400 yr, up to 754 yr.
+- **Years to breast height:** reach 34 yr in some groups against l0 of 2 and 5, so one prior term per group is too weak against the records; l is absorbing curve misfit.
+- **Crown:** bias runs from +47 yr (CCLCD 2) to -17 yr (CCLCD 5), so a crown offset on the curve does not capture it.
+- **Reading:** age is poorly determined by DIA through an inverted curve; tau 0.43 in log size spreads ages widely. The current imputation stays.
+
