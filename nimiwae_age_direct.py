@@ -97,7 +97,7 @@ def main(a):
             mu = m.predict(X); sd = np.sqrt(np.exp(s.predict(X))); return np.exp(mu), np.exp(mu - 1.2816 * sd), np.exp(mu + 1.2816 * sd)
         pv, lv, hv = pr(Xv); pl_, ll, hl = pr(Xl); v = va.assign(p=pv, lo=lv, hi=hv)
         G2 = {s_: score(g.p.to_numpy(), g.total.to_numpy(), g.lo.to_numpy(), g.hi.to_numpy()) for s_, g in v.groupby('source')}
-        w = v[v.west]; crown = {int(c_): score(g.p.to_numpy(), g.total.to_numpy()) for c_, g in w.groupby('cc')}
+        w = v[v.west == 1]; crown = {int(c_): score(g.p.to_numpy(), g.total.to_numpy()) for c_, g in w.groupby('cc')}
         sm = w[(w.dia >= 1) & (w.dia < 5)]; R[name] = dict(G1=score(pl_, ln.total.to_numpy(), ll, hl), G2=G2, G2_crown=crown, G3=score(sm.p.to_numpy(), sm.total.to_numpy()), max_pred_linked=float(pl_.max()))
     run(NUM + CAT, 'f'); run(NUM + ['growth'] + CAT, 'f+g')
     json.dump(R, open(a.out, 'w'), indent=1, default=float); print(json.dumps(R, indent=0, default=float))
