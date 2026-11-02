@@ -205,14 +205,14 @@
   "detail": "[]"
  },
  {
-  "name": "M2 record tensors are finite",
+  "name": "M2 every real slot has an age prior, and no other slot does",
   "ok": true,
-  "detail": "[]"
+  "detail": "(29.0, 0.282)"
  },
  {
   "name": "M3 log weights are finite on real data",
   "ok": true,
-  "detail": "-2800.653564453125"
+  "detail": "-3314.9658203125"
  },
  {
   "name": "M4 gradients are finite",
@@ -220,14 +220,14 @@
   "detail": "[]"
  },
  {
-  "name": "M5 curve, birth head and scales all receive gradient",
+  "name": "M5 the prior and decoder receive gradient, and z0 stays out of the decoder input",
   "ok": true,
   "detail": "[]"
  },
  {
   "name": "M6 age step = elapsed years on real dates",
   "ok": true,
-  "detail": "1.4e-06"
+  "detail": "2.6e-05"
  },
  {
   "name": "M7 the E1 rule removes FALSE labels",

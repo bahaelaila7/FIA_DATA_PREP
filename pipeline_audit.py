@@ -82,20 +82,20 @@ def ages(rec, seq):
     print(rec.groupby(['source', 'split']).agg(n=('a_obs', 'size'), first=('first_of_tree', 'sum'), lt5=('dia', lambda d: int((d < 5).sum())), med_age=('a_obs', 'median')).to_string())
 
 
-def model(seq, rec):
+def model(seq):
     import nimiwae70 as A, nimiwae56 as M
     torch.manual_seed(0)
-    k = M.K_; tr = seq[seq.split == 'train']; rt = rec[(rec.split == 'train') & rec.first_of_tree]
+    k = M.K_; tr = seq[seq.split == 'train']
     pl_ = tr.plot_key.drop_duplicates().sample(400, random_state=1); t = tr[tr.plot_key.isin(pl_)]
-    cv = A.curve_vocab(t, rt); B, vocab, sq = A.build(t, cv=cv); R = A.build_rec(rt, cv)
+    B, vocab, sq = A.build(t)
     bad = [x for x, v in B.items() if torch.is_floating_point(v) and not torch.isfinite(v).all()]; check('M1 lineage tensors are finite', not bad, bad)
-    bad = [x for x, v in R.items() if torch.is_floating_point(v) and not torch.isfinite(v).all()]; check('M2 record tensors are finite', not bad, bad)
+    rs = seq[seq.slot_kind == 'real']; check('M2 every real slot has an age prior, and no other slot does', rs.af_mu.notna().all() and rs.af_sd.gt(0).all() and seq[seq.slot_kind != 'real'].af_mu.isna().all() and B['af_has'].all(), (round(float(np.exp(rs.af_mu.median())), 1), round(float(rs.af_sd.median()), 3)))
     m = A.make_model(vocab); ix = torch.arange(min(256, B['v'].shape[0])); b = M.sub(B, ix); o = m.joint(b, 8, dreg=True)
     check('M3 log weights are finite on real data', torch.isfinite(o['lw']).all(), o['lw'].mean().item())
-    loss = -(torch.logsumexp(o['lw'], 0) - np.log(8)).mean() - m.rec_ll(M.sub(R, torch.arange(256))).mean(); loss.backward()
+    loss = -(torch.logsumexp(o['lw'], 0) - np.log(8)).mean(); loss.backward()
     nog = [n for n, p in m.named_parameters() if p.grad is None and not n.startswith(('st_q', 'qin', 'qtr', 'qout', 'ercd', 'ecc'))]
     bad = [n for n, p in m.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
-    check('M4 gradients are finite', not bad, bad[:5]); check('M5 curve, birth head and scales all receive gradient', all(p.grad is not None for n, p in m.named_parameters() if n.startswith(('curve.out', 'bhead', 'lsS'))), nog[:6])
+    check('M4 gradients are finite', not bad, bad[:5]); check('M5 the prior and decoder receive gradient, and z0 stays out of the decoder input', not nog and float(m.p_z(b)[0][:, 0].abs().max()) == 0.0, nog[:6])
     a = m.ages(o['z'].detach(), b).detach(); t_ = b['cov'][..., A.ITYR] * 20; v = b['v'][None] > 0
     e = ((a - a.gather(-1, torch.zeros_like(a[..., :1]).long())) - (t_ - t_[:, :1])[None])[v.expand_as(a)]
     check('M6 age step = elapsed years on real dates', float(e.abs().max()) < 1e-3, f'{float(e.abs().max()):.1e}')
@@ -112,6 +112,6 @@ if __name__ == '__main__':
     c = duckdb.connect(a.db, read_only=True); c.execute('SET threads = 6')
     truth(c)
     seq = pd.read_parquet(f'{a.data}/seq.parquet'); rec = pd.read_parquet(f'{a.data}/age_rec.parquet')
-    frame(c, seq); ages(rec, seq); model(seq, rec)
+    frame(c, seq); ages(rec, seq); model(seq)
     json.dump(RES, open(a.out, 'w'), indent=1)
     n = sum(r['ok'] for r in RES); print(f'audit: {n} of {len(RES)} pass'); sys.exit(0 if n == len(RES) else 1)

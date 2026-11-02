@@ -5,7 +5,7 @@
 Fits age from measurements on TRAIN age records only and scores on VAL. No lineage model. Three fits:
   CR       Chapman-Richards height-age per species group on site trees: H = A (1 - exp(-k a)) ^ p, inverted with H / A capped at 0.98.
   f        gradient boosting of log total age on DIA, height, crown, species, soil, climate, region.
-  f+g      the same plus annual relative diameter growth where known. Only western tally records have it in training.
+  f+p      the same plus stand origin (STDORGCD 1 = planted), a field observation.
 Total age = TOTAGE, or BHAGE / AGEDIA + l0 (2 yr softwood, 5 yr hardwood, fixed here). Width: a second booster on the squared log residual, fitted out of fold.
 Scored as bars G1, G2, G3, G5 of D70 am. 4, whose thresholds do not change."""
 import sys, os, json, argparse
@@ -71,15 +71,20 @@ def main(a):
     rec['west'] = rec.source != 'site'; rec['l0'] = rec.sftwd_hrdwd.map(L0).fillna(5.0)
     rec['total'] = rec.a_obs + np.where(rec.source == 'tot', 0.0, rec.l0)
     rec.loc[rec.source == 'site', 'cc'] = CC_SITE
-    rec['growth'] = np.where((rec.prev_dia > 0) & (rec.remper > 0.5), (np.log(rec.dia) - np.log(rec.prev_dia.clip(lower=0.1))) / rec.remper, np.nan)
+    rec['planted'] = (rec.stdorgcd == 1).astype(int)
     rec = features(rec); tr = rec[(rec.split == 'train') & rec.first_of_tree]; va = rec[(rec.split == 'val') & rec.first_of_tree]
     seq = pd.read_parquet(f'{a.data}/seq.parquet'); val = seq[seq.split == 'val']; del seq
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
     ln = linked(c, val); ln['total'] = ln.a_obs + ln.sftwd_hrdwd.map(L0).fillna(5.0); ln['west'] = False; ln['cc'] = ln.cclcd
-    ln = features(ln[ln.ht.notna() & (ln.ht > 0)])
+    ln = features(ln[ln.ht.notna() & (ln.ht > 0)]); ln['planted'] = (ln.stdorgcd == 1).astype(int)
     t = duckdb.connect(a.db, read_only=True); cur = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees").df()
     ln = ln.merge(cur, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr'], how='inner'); ln = ln[ln.estimated_age.notna()]
     R = dict(n_train=len(tr), G1_current=score(ln.estimated_age.to_numpy(), ln.total.to_numpy()))
+    # R4 saplings have no measured age. Planted stands' field age (STDAGE) is the only outside check there: a diagnostic, never a target or an input
+    fa = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, age_from_stdage fld FROM curated_trees WHERE age_from_stdage IS NOT NULL AND cond_stdorgcd = 1").df()
+    vr = features(val[(val.slot_kind == 'real') & (val.dia > 0) & (val.ht > 0)].assign(west=False, cc=lambda d: d.cclcd)).merge(fa, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr'])
+    vr['planted'] = 1; vr['cls'] = pd.cut(vr.dia, [0, 3, 5, 7, 9, 15, 99], right=False).astype(str)
+    R['transfer_current'] = {c: float((g.merge(cur, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr']).pipe(lambda d: d.estimated_age - d.fld)).median()) for c, g in vr.groupby('cls')}
     # Chapman-Richards on site trees
     st = tr[tr.source == 'site']; cr = {}
     for g, d in st.groupby('spgrpcd'):
@@ -89,18 +94,32 @@ def main(a):
     R['CR'] = dict(groups=len(cr), site_val=score(crp(va[va.source == 'site']), va[va.source == 'site'].total.to_numpy()), G1=score(crp(ln), ln.total.to_numpy()))
     # boosted
     def run(cols, name):
-        Xt, Xv, Xl = encode(tr, [va, ln], cols); cats = [cols.index(x) for x in CAT]
+        Xt, Xv, Xl, Xf = encode(tr, [va, ln, vr], cols); cats = [cols.index(x) for x in CAT]
         yt = np.log(tr.total.to_numpy()); fold = (pd.util.hash_pandas_object(tr.plot_key, index=False).to_numpy() % 2).astype(int); oof = np.zeros(len(tr))
         for k_ in (0, 1): oof[fold == k_] = fit(Xt[fold != k_], yt[fold != k_], cats).predict(Xt[fold == k_])
         m = fit(Xt, yt, cats); s = fit(Xt, np.log((yt - oof) ** 2 + 1e-4), cats)
         def pr(X):
             # a booster on log r^2 estimates E log r^2 = log var - 1.27 for a normal residual, so var = exp(pred + 1.27)
             mu = m.predict(X); sd = np.sqrt(np.exp(s.predict(X) + 1.2704)); return np.exp(mu), np.exp(mu - 1.2816 * sd), np.exp(mu + 1.2816 * sd)
-        pv, lv, hv = pr(Xv); pl_, ll, hl = pr(Xl); v = va.assign(p=pv, lo=lv, hi=hv)
+        pv, lv, hv = pr(Xv); pl_, ll, hl = pr(Xl); v = va.assign(p=pv, lo=lv, hi=hv); pf, lf, hf = pr(Xf); xf = vr.assign(p=pf, lo=lf, hi=hf)
+        transfer = {c: dict(n=len(g), field=float(g.fld.median()), bias=float((g.p - g.fld).median()), cover80=float(((g.fld >= g.lo) & (g.fld <= g.hi)).mean())) for c, g in xf.groupby('cls')}
         G2 = {s_: score(g.p.to_numpy(), g.total.to_numpy(), g.lo.to_numpy(), g.hi.to_numpy()) for s_, g in v.groupby('source')}
         w = v[v.west == 1]; crown = {int(c_): score(g.p.to_numpy(), g.total.to_numpy()) for c_, g in w.groupby('cc')}
-        sm = w[(w.dia >= 1) & (w.dia < 5)]; R[name] = dict(G1=score(pl_, ln.total.to_numpy(), ll, hl), G2=G2, G2_crown=crown, G3=score(sm.p.to_numpy(), sm.total.to_numpy()), max_pred_linked=float(pl_.max()))
-    run(NUM + CAT, 'f'); run(NUM + ['growth'] + CAT, 'f+g')
+        sm = w[(w.dia >= 1) & (w.dia < 5)]; R[name] = dict(G1=score(pl_, ln.total.to_numpy(), ll, hl), G2=G2, G2_crown=crown, G3=score(sm.p.to_numpy(), sm.total.to_numpy()), max_pred_linked=float(pl_.max()), transfer=transfer)
+    run(NUM + CAT, 'f'); run(NUM + ['planted'] + CAT, 'f+p')
+    if a.export:                                                                     # D70 am. 12: prior on log total age at live records: f+p, read from one record, so no hidden record feeds it
+        cols = NUM + ['planted'] + CAT; sq = pd.read_parquet(f'{a.data}/seq.parquet')
+        keep = (sq.slot_kind == 'real') & (sq.dia > 0) & (sq.ht > 0) & ~(pd.to_datetime(sq.measdate) >= pd.to_datetime(sq.dead_md)); real = features(sq[keep].assign(west=False, cc=lambda d: d.cclcd, planted=lambda d: (d.stdorgcd == 1).astype(int)))
+        maps = {c: {v: i for i, v in enumerate(sorted(tr[c].dropna().unique()))} for c in CAT}
+        enc = lambda d: d[cols].assign(**{c: d[c].map(maps[c]).astype(float) for c in CAT}); Xt = enc(tr); cats = [cols.index(x) for x in CAT]; yt = np.log(tr.total.to_numpy())
+        hash2 = lambda d: (pd.util.hash_pandas_object(d.plot_key, index=False).to_numpy() % 2).astype(int)
+        fold = hash2(tr); oof = np.zeros(len(tr)); mk = {}
+        for k_ in (0, 1): mk[k_] = fit(Xt[fold != k_], yt[fold != k_], cats); oof[fold == k_] = mk[k_].predict(Xt[fold == k_])
+        m = fit(Xt, yt, cats); s_ = fit(Xt, np.log((yt - oof) ** 2 + 1e-4), cats); Xr = enc(real); mu = m.predict(Xr); fr = hash2(real)
+        isT = (real.split == 'train').to_numpy()                                     # train plots take the fold that left them out, so a frame tree never sees its own age record
+        for k_ in (0, 1): mu[isT & (fr == k_)] = mk[k_].predict(Xr[isT & (fr == k_)])
+        sq['af_mu'] = np.nan; sq['af_sd'] = np.nan; sq.loc[real.index, 'af_mu'] = mu; sq.loc[real.index, 'af_sd'] = np.sqrt(np.exp(s_.predict(Xr) + 1.2704)); sq.to_parquet(f'{a.data}/seq.parquet')
+        print('exported', int(sq.af_mu.notna().sum()), 'of', int((sq.slot_kind == 'real').sum()), 'real slots; median age', round(float(np.exp(sq.af_mu.median())), 1), 'median sd', round(float(sq.af_sd.median()), 3))
     json.dump(R, open(a.out, 'w'), indent=1, default=float); print(json.dumps(R, indent=0, default=float))
 
 
@@ -117,5 +136,5 @@ def selftest():
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     for x in ('--data', '--fiadb', '--db', '--out'): ap.add_argument(x)
-    ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
+    ap.add_argument('--selftest', action='store_true'); ap.add_argument('--export', action='store_true'); a = ap.parse_args()
     selftest() if a.selftest else main(a)

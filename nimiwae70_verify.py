@@ -1,4 +1,4 @@
-"""D70 verification. Independent of the training path; synthetic lineages, so no frame is needed. Usage: python -I nimiwae70_verify.py"""
+"""D70 verification. Independent of the training path; synthetic lineages, so no frame is needed. Usage: python -I nimiwae70_verify.py [DATA_DIR]; with a frame, checks 14 use real trees."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import math
 import numpy as np, pandas as pd, torch, torch.nn.functional as F
@@ -23,12 +23,12 @@ def batch(n=6):
     for k in ('sp', 'l3', 'maj', 'fty', 'spc', 'moved', 'ndef', 'cause', 'scl', 'phy', 'rcd'): B[k] = torch.ones(n, dtype=torch.long)
     B['moved'][:] = 0; B['ndef'][:] = 0; B['f'] = torch.full((n,), 2, dtype=torch.long); B['l'] = torch.full((n,), 3, dtype=torch.long)
     B['snum'] = torch.zeros(n, 9); B['summ'] = torch.zeros(n, M.NSUMM)
-    B['c_spc'] = torch.ones(n, dtype=torch.long); B['c_grp'] = torch.ones(n, dtype=torch.long); B['c_num'] = torch.randn(n, A.NCX)
+    B['soil'] = torch.randn(n, A.NSOIL); B['af_mu'] = torch.full((n,), math.log(30.0)); B['af_sd'] = torch.full((n,), 0.4); B['la'] = torch.full((n,), 3, dtype=torch.long); B['af_has'] = torch.ones(n)
     return B
 
 def model(age=True):
     torch.manual_seed(0)
-    return A.NIMIWAE70(3, 3, 3, 3, 3, 3, 3, age=age)
+    return A.NIMIWAE70(3, 3, 3, 3, 3, age=age)
 
 m = model(); B = batch(); z = torch.randn(4, 6, M.DZ)
 # 1. your constraint: age advances exactly with elapsed time, for every sample and tree
@@ -36,10 +36,12 @@ a = m.ages(z, B).detach(); t = B['cov'][..., A.ITYR] * 20
 d = (a - a[..., :1]) - (t - t[:, :1])[None]
 check('age step = elapsed years at every slot', float(d[..., :5].abs().max()) < 1e-4, f'max |error| {float(d[..., :5].abs().max()):.1e} yr')
 check('one birth date: t - a_t is constant over slots', float(((t[None] - a)[..., :5].std(-1)).max()) < 1e-4)
-# 2. curve monotone in age for random inputs and weights
-tok = m.curve.token(B) + torch.randn(6, 1 + A.NKNOT); grid = torch.exp(torch.linspace(0, math.log(400), 200))
-ls = torch.stack([m.curve.log_s(tok, g.expand(6)) for g in grid], 1)
-check('curve monotone in age', bool((ls[:, 1:] - ls[:, :-1] >= -1e-6).all()))
+# 2. the age prior is exact: z0 ~ N(0, 1) under p(z) and log a_l = af_mu + af_sd z0
+mp2, lp2 = m.p_z(B); check('z0 has a standard normal prior', float(mp2[:, 0].abs().max()) == 0.0 and float(lp2[:, 0].abs().max()) == 0.0)
+check('other dimensions keep their learned prior', float(mp2[:, 1:].abs().max()) > 0)
+zs_ = torch.randn(4000, 6, M.DZ); az = m.ages(zs_, B).detach()[:, :, 3]; la_ = torch.log(az)
+check('age at the prior slot follows the direct model: mean and sd of log age', abs(float(la_.mean()) - math.log(30)) < 0.01 and abs(float(la_.std()) - 0.4) < 0.01, f'{float(la_.mean()):.3f} {float(la_.std()):.3f}')
+check('no learned parameter moves the age prior', not any('bhead' in k or 'curve' in k for k in dict(m.named_parameters())))
 # 3. existence gate against the written formula
 lp1 = F.logsigmoid(40 * (torch.randn(4, 6, M.T_MAX))); lp0 = torch.log(-torch.expm1(lp1.clamp(max=-1e-6)))
 with torch.no_grad():
@@ -59,40 +61,28 @@ torch.manual_seed(5); o2 = b0.joint(B0, 8)
 with torch.no_grad(): check('hooks are inert when age is off', float((o['lw'] - o2['lw']).abs().max()) == 0.0)
 torch.manual_seed(5); oa = m.joint(B0, 8)
 with torch.no_grad(): check('hooks act when age is on', float((oa['lw'] - o['lw']).abs().max()) > 0)
-# 5. record likelihood against a hand computation
-R = dict(c_spc=torch.ones(3, dtype=torch.long), c_grp=torch.ones(3, dtype=torch.long), c_num=torch.zeros(3, A.NCX), src=torch.tensor([A.TOT, A.BHA, A.SITE]), cc=torch.tensor([1, 5, A.CC_SITE]),
-         a_obs=torch.tensor([20., 20., 20.]), lD=torch.log(torch.tensor([6., 6., 6.])))
-torch.set_grad_enabled(False)
-ll = m.rec_ll(R).detach(); tk = m.curve.token(R); l = m.curve.years_bh(R['c_grp'])
-hand = []
-for i in range(3):
-    ag = 20.0 + (0.0 if i == 0 else float(l[i])); mu = float(m.curve.log_s(tk[i:i + 1], torch.tensor([ag]))[0]) + float(m.curve.delta(R['cc'][i:i + 1])[0, 0])
-    var = 0.02 ** 2 + (0.06 / 6) ** 2 + A.SIG_S ** 2 + math.exp(2 * float(m.lstau))
-    hand.append(-0.5 * (math.log(6) - mu) ** 2 / var - 0.5 * math.log(var) - 0.5 * math.log(2 * math.pi))
-check('record likelihood = hand formula; TOTAGE gets no breast-height years', float((ll - torch.tensor(hand)).abs().max()) < 1e-4)
-torch.set_grad_enabled(True)
-# 5b. years to breast height: the prior is centred on l0, by species group, with one term per group
-mm = A.NIMIWAE70(3, 3, 3, 3, 3, 3, 3, l0=[5.0, 2.0, 5.0, 2.0])
-g_ = torch.tensor([1, 2, 3]); check('years to breast height start at the softwood and hardwood values', torch.allclose(mm.curve.years_bh(g_), torch.tensor([2.0, 5.0, 2.0])))
-check('the prior is 0 at those values', mm.curve.log_prior_bh().item() == 0.0)
-with torch.no_grad(): mm.curve.eps_l.weight[1] = 0.3
-check('one prior sd on one group costs 0.5', abs(mm.curve.log_prior_bh().item() + 0.5) < 1e-5)
-check('a group moves its own value only', abs(mm.curve.years_bh(torch.tensor([1])).item() - 2 * math.exp(0.3)) < 1e-5 and mm.curve.years_bh(torch.tensor([2])).item() == 5.0)
-# 6. gradient routing
-m.zero_grad(); m.rec_ll(R).sum().backward()
-enc = [p for p in m.enc_params() if p.grad is not None and p.grad.abs().sum() > 0]
-dec = [p for mod in (m.dtr, m.dout, m.bhead) for p in mod.parameters() if p.grad is not None and p.grad.abs().sum() > 0]
-cur = [p for p in m.curve.parameters() if p.grad is not None and p.grad.abs().sum() > 0]
-check('records reach the curve, not the encoder or decoder', len(enc) == 0 and len(dec) == 0 and len(cur) > 0)
+# 6. the decoder never reads z0
+torch.manual_seed(2); zd = torch.randn(2, 6, M.DZ); zd2 = zd.clone(); zd2[..., 0] += 2.0; zd3 = zd.clone(); zd3[..., 1] += 2.0
+with torch.no_grad():
+    D1 = m.decode(zd, B)[0]; D2 = m.decode(zd2, B)[0]; D3 = m.decode(zd3, B)[0]
+check('z0 does not reach the size path', float((D1 - D2).abs().max()) == 0.0); check('the other dimensions do', float((D1 - D3).abs().max()) > 0)
+check('decode does not change z in place', float((zd[..., 0]).abs().max()) > 0)
+b0d = model(age=False); check('age off keeps every dimension in the size path', float((b0d.decode(zd, B)[0] - b0d.decode(zd2, B)[0]).abs().max()) > 0)
+# 6b. gradient routing
 m.zero_grad(); torch.manual_seed(2); oo = m.joint(batch(), 4); (-oo['lw'].mean()).backward()
-check('lineages reach the curve and the birth head', m.curve.out.weight.grad.abs().sum() > 0 and m.bhead.weight.grad.abs().sum() > 0)
-# 7. no leak: the birth date does not depend on the tree's records or on where its last record falls
+check('lineages train the encoder and decoder', sum(float(p.grad.abs().sum()) for p in m.enc_params() if p.grad is not None) > 0 and m.dout.weight.grad.abs().sum() > 0)
+# 7. no leak: age depends on z and the prior's own slot, not on the tree's other records or where they end
 Bb = batch(); Bc = {k: v.clone() for k, v in Bb.items()}; Bc['lD'] = Bc['lD'] + 1.0; Bc['mD'] = torch.zeros_like(Bc['mD']); Bc['l'][:] = 2; Bc['f'][:] = 1; torch.manual_seed(3); zz = torch.randn(2, 6, M.DZ)
-check('birth date depends on z and statics only', float((m.ages(zz, Bb) - m.ages(zz, Bc)).abs().max()) == 0.0)
+check('birth date depends on z and the prior only', float((m.ages(zz, Bb) - m.ages(zz, Bc)).abs().max()) == 0.0)
+Bq = batch(); Bq2 = {k: v.clone() for k, v in Bq.items()}; Bq2['af_mu'] = Bq2['af_mu'] + 1.0
+with torch.no_grad():
+    check('the decoder and prior do not read the age prior', float((m.p_z(Bq)[0] - m.p_z(Bq2)[0]).abs().max()) == 0.0 and float((m.decode(zd, Bq)[0] - m.decode(zd, Bq2)[0]).abs().max()) == 0.0)
+    check('the encoder does', float((m.st_q(Bq) - m.st_q(Bq2)).abs().max()) > 0); check('age off: the encoder does not', float((b0d.st_q(Bq) - b0d.st_q(Bq2)).abs().max()) == 0.0)
 # 8. birth can fall inside the lineage: slots before it have no existence, in probabilities and in sampled lineages
 young = model(); B8 = batch(); B8['lD'][:] = 0; B8['ev'][:] = 0; B8['real'][:] = 0; B8['mD'][:] = 0
 B8['real'][:, 4] = 1; B8['mD'][:, 4] = 1; B8['lD'][:, 4] = math.log(1.5); B8['ev'][:, 4] = M.EV['true_hard']; B8['f'][:] = 4; B8['l'][:] = 4
-with torch.no_grad(): young.bhead.bias.fill_(math.log(3.0)); young.bhead.weight.zero_(); young.dout.bias[0] = 3.0
+B8['la'][:] = 4; B8['af_mu'][:] = math.log(3.0); B8['af_sd'][:] = 1e-3
+with torch.no_grad(): young.dout.bias[0] = 3.0
 aY = young.ages(torch.zeros(1, 6, M.DZ), B8)[0, 0]
 check('birth can fall after the first slots', float(aY[0]) < 0 and float(aY[3]) < 0 and float(aY[4]) > 0, f'ages {[round(float(x), 1) for x in aY[:5]]}')
 L = M.sample_lineages(young, B8, n_draws=5, K=8)
@@ -102,20 +92,11 @@ lim = torch.sigmoid(A.KAPPA_B * aY[:4].detach())
 check('P(exists) never exceeds the birth step before birth', bool((Pr['pE'][:, :4] <= lim + 1e-5).all()), f'limit by slot {[round(float(x), 5) for x in lim]}')
 # 9. a tree cannot carry tally size before birth
 tall = model(); B9 = batch()
-with torch.no_grad(): tall.bhead.bias.fill_(math.log(3.0)); tall.bhead.weight.zero_()
+B9['af_mu'][:] = math.log(3.0); B9['af_sd'][:] = 1e-3
 zz9 = torch.zeros(1, 6, M.DZ); aa = tall.ages(zz9, B9); neg = (aa < 0) & (B9['v'][None] > 0)
 small = torch.full((1, 6, M.T_MAX), math.log(0.2)); big = torch.full((1, 6, M.T_MAX), math.log(3.0)); mp0 = torch.zeros(6, M.DZ); lp0 = torch.zeros(6, M.DZ)
 check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, mp0, lp0) - tall.extra_lw(big, zz9, B9, mp0, lp0)).min()) > 0 or not bool(neg.any()), f'{int(neg.sum())} unborn slots')
-# 12. vigour has a real prior: under p(z) it is N(0, tau), whatever the prior's own location and scale
-torch.manual_seed(9); mpv = torch.randn(2000, M.DZ) * 3; lpv = torch.randn(2000, M.DZ); zv = mpv + torch.exp(0.5 * lpv) * torch.randn(4, 2000, M.DZ)
-vv = tall.vigour(zv, mpv, lpv).detach(); tau = float(torch.exp(tall.lstau))
-check('vigour is N(0, tau) under the prior', abs(float(vv.mean())) < 0.03 and abs(float(vv.std()) / tau - 1) < 0.03, f'mean {float(vv.mean()):+.3f}, sd {float(vv.std()):.3f}, tau {tau:.3f}')
-# 9b. the curve term reads measurements, not the latent path: a path sitting on the curve earns nothing
-B9b = batch(); z9 = torch.randn(2, 6, M.DZ); mp9 = torch.zeros(6, M.DZ); lp9 = torch.zeros(6, M.DZ)
-far = torch.full((2, 6, M.T_MAX), math.log(9.0)); near = torch.full((2, 6, M.T_MAX), math.log(8.0)); B9c = {k: v.clone() for k, v in B9b.items()}
-tall2 = model(); a9 = tall2.ages(z9, B9b); neg9 = bool(((a9 < 0) & (B9b['v'][None] > 0)).any())
-check('curve term does not reward the latent path', neg9 or float((tall2.extra_lw(far, z9, B9b, mp9, lp9) - tall2.extra_lw(near, z9, B9b, mp9, lp9)).abs().max()) == 0.0)
-check('the curve width is fixed', 'lsS' not in dict(tall2.named_parameters()))
+zg = torch.zeros(1, 6, M.DZ, requires_grad=True); (tall.extra_lw(big, zg, B9, mp0, lp0)).sum().backward(); check('the unborn term reaches z0', float(zg.grad[..., 0].abs().sum()) > 0)
 # 10. E1 mask: only slots before the move, only trees first recorded at or after it
 s_ = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1, 2, 2, 2, 3, 3], 'invyr': [2002, 2007, 2012, 2002, 2007, 2012, 2002, 2007],
                    'slot_kind': ['pre', 'pre', 'real', 'real', 'real', 'post', 'pre', 'real'], 'move_invyr': [2007, 2007, 2007, 2007, 2007, 2007, np.nan, np.nan]})
@@ -138,4 +119,16 @@ for t_ in range(1500):
     i_ = torch.randint(0, 40, (8,)); s3.zero_grad(); ((A_[i_] @ p3 - y_[i_]) ** 2).mean().backward(); s3.step()
 s3.finish(); ls_ = torch.linalg.lstsq(A_, y_[:, None]).solution[:, 0]
 check('it converges on noisy least squares; finish() leaves x', float((p3.detach() - ls_).norm()) < 0.1 and float((p3.detach() - s3.x[0]).abs().max()) == 0.0, f"{float((p3.detach() - ls_).norm()):.3f} from the solution")
+# 14. on the real frame: the prior comes from the last visible live record, a hidden record never feeds it, and age steps match the dates
+if len(sys.argv) > 1:
+    sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()
+    Bf, vf, sf_ = A.build(f_); ti, po = sf_._tid.to_numpy(), sf_._pos.to_numpy()
+    ok = (sf_.slot_kind == 'real') & sf_.af_mu.notna(); e_ = sf_[ok].assign(ti=ti[ok], po=po[ok]).sort_values(['ti', 'po']).groupby('ti').last()
+    check('frame: la is the last slot with a prior', bool((Bf['la'][e_.index.to_numpy().copy()].numpy() == e_.po.to_numpy()).all()) and abs(float(Bf['af_mu'][e_.index.to_numpy().copy()].mean()) - e_.af_mu.mean()) < 1e-3, f'{len(e_):,} of {Bf["v"].shape[0]:,} trees')
+    bs_ = M.bench_sizes(f_); Bh, _, sh = A.build(bs_, vf); ti, po = sh._tid.to_numpy(), sh._pos.to_numpy(); hi = sh.hidden.fillna(False).to_numpy(bool)
+    check('frame: no hidden slot feeds the prior', int(((Bh['af_has'].numpy()[ti[hi]] > 0) & (Bh['la'].numpy()[ti[hi]] == po[hi])).sum()) == 0, f'{int(hi.sum()):,} hidden slots')
+    zf = torch.zeros(1, Bf['v'].shape[0], M.DZ)
+    mf = A.make_model(vf); af = mf.ages(zf, Bf).detach()[0].numpy(); ti, po = sf_._tid.to_numpy(), sf_._pos.to_numpy(); sa = sf_.assign(a=af[ti, po], yr=(pd.to_datetime(sf_.measdate) - pd.Timestamp('2000-01-01')) / pd.Timedelta(days=365.25))
+    r_ = sa.groupby(M.K_).apply(lambda g: float(((g.a - g.a.iloc[0]) - (g.yr - g.yr.iloc[0])).abs().max()), include_groups=False).max()
+    check('frame: age steps equal elapsed time from the dates', r_ < 0.01, f'max error {r_:.4f} yr')
 print('checks:', sum(o for _, o in RES), 'of', len(RES)); sys.exit(0 if all(o for _, o in RES) else 1)

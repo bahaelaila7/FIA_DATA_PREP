@@ -8,6 +8,7 @@ Writes DIR/age_rec.parquet: one row per measured age. Read-only on FIADB. Natura
   bha   TREE.BHAGE,  RSCD 22 and 26, annual, live.
 Diameter must be at breast height (DIAHTCD 1): a root-collar diameter is not on the same scale. HI and the territories are left out: no climate.
 A site tree listed twice at a visit with identical measurements counts once. fit_ok: ages up to 400 yr; older western trees (redcedar, Douglas-fir) are real but outside the curve's range.
+STDORGCD comes from the record's own condition at that visit (CONDID is visit-scoped): stand origin is a field observation, not an age estimate.
 first_of_tree marks a tree's first age record per source; later ones are repeats, used to test the step with elapsed time. STDAGE, FLDAGE and SICOND are not
 read: SICOND is computed from the site trees themselves."""
 import os, sys, argparse
@@ -19,12 +20,13 @@ R4 = (1, 12, 13, 21, 28, 37, 45, 47)
 WEST = (4, 8, 16, 30, 32, 35, 49, 56, 6, 41, 53)     # RSCD 22 and 26, conterminous states
 MD = "MAKE_DATE(P.MEASYEAR::INT, COALESCE(NULLIF(P.MEASMON::INT, 0), 6), COALESCE(NULLIF(P.MEASDAY::INT, 0), 15))"
 VISIT = """JOIN f.main.PLOT P ON P.STATECD = R.STATECD AND P.UNITCD = R.UNITCD AND P.COUNTYCD = R.COUNTYCD AND P.PLOT = R.PLOT AND P.INVYR = R.INVYR
-           JOIN (SELECT DISTINCT STATECD, INVYR, RSCD FROM f.main.SURVEY WHERE ANN_INVENTORY = 'Y' AND P3_OZONE_IND = 'N') V ON V.STATECD = R.STATECD AND V.INVYR = R.INVYR"""
+           JOIN (SELECT DISTINCT STATECD, INVYR, RSCD FROM f.main.SURVEY WHERE ANN_INVENTORY = 'Y' AND P3_OZONE_IND = 'N') V ON V.STATECD = R.STATECD AND V.INVYR = R.INVYR
+           LEFT JOIN f.main.COND C ON C.STATECD = R.STATECD AND C.UNITCD = R.UNITCD AND C.COUNTYCD = R.COUNTYCD AND C.PLOT = R.PLOT AND C.INVYR = R.INVYR AND C.CONDID = R.CONDID"""
 
 
 def records(c):
     st = lambda x: ",".join(map(str, x))
-    common = f"R.STATECD statecd, R.UNITCD unitcd, R.COUNTYCD countycd, R.PLOT plot, R.INVYR invyr, {MD} measdate, R.SPCD spcd, R.SPGRPCD spgrpcd, R.DIA::DOUBLE dia, R.HT::DOUBLE ht"
+    common = f"R.STATECD statecd, R.UNITCD unitcd, R.COUNTYCD countycd, R.PLOT plot, R.INVYR invyr, {MD} measdate, R.SPCD spcd, R.SPGRPCD spgrpcd, R.DIA::DOUBLE dia, R.HT::DOUBLE ht, C.STDORGCD::INT stdorgcd"
     # carried forward = the same plot, number, species, age, DIA and height at an earlier visit: keep the earliest visit of each such group
     site_r = f"""(SELECT * FROM f.main.SITETREE WHERE STATECD IN ({st(R4)})
                   QUALIFY INVYR = min(INVYR) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, TREE, SPCD, AGEDIA, DIA, HT))"""
@@ -32,7 +34,11 @@ def records(c):
         FROM {site_r} R {VISIT} WHERE TRY_CAST(R.AGEDIA AS DOUBLE) > 0 AND R.DIA > 0"""
     tally = lambda src, col: f"""SELECT '{src}' AS source, {common}, R.CCLCD::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.{col} AS DOUBLE) a_obs, R.PREVDIA::DOUBLE prev_dia, P.REMPER::DOUBLE remper
         FROM f.main.TREE R {VISIT} WHERE R.STATECD IN ({st(WEST)}) AND V.RSCD IN (22, 26) AND R.STATUSCD = 1 AND TRY_CAST(R.{col} AS DOUBLE) > 0 AND R.DIA > 0 AND R.DIAHTCD = 1"""
-    return pl.concat([c.execute(q).pl().unique() for q in (site, tally('tot', 'TOTAGE'), tally('bha', 'BHAGE'))], how='vertical_relaxed')
+    df = pl.concat([c.execute(q).pl().unique() for q in (site, tally('tot', 'TOTAGE'), tally('bha', 'BHAGE'))], how='vertical_relaxed')
+    # a site tree listed twice with identical measurements counts once, even when its two rows name different conditions; a disputed origin is unknown
+    rest = [x for x in df.columns if x != 'stdorgcd']
+    return (df.group_by(rest).agg(pl.col('stdorgcd').unique().alias('o'))
+              .with_columns(pl.when(pl.col('o').list.len() == 1).then(pl.col('o').list.first()).otherwise(None).cast(pl.Int32).alias('stdorgcd')).drop('o'))
 
 
 def attach(df, c, prism, solus):
@@ -79,6 +85,7 @@ if __name__ == '__main__':
     os.makedirs(a.out, exist_ok=True)
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
     df = finish(attach(records(c), c, a.prism, a.solus))
+    df = df.sort(['source', 'statecd', 'unitcd', 'countycd', 'plot', 'invyr', 'subp', 'tree', 'spcd', 'a_obs', 'dia', 'ht'], nulls_last=True)     # stable output: the boosters see rows in this order
     df.write_parquet(f'{a.out}/age_rec.parquet')
     pl.Config.set_tbl_rows(20); pl.Config.set_tbl_cols(10)
     print(df.group_by('source', 'split').agg(pl.len(), pl.col('tm_n').is_null().sum().alias('no_clim'), pl.col('soil_clay').is_null().sum().alias('no_soil'),

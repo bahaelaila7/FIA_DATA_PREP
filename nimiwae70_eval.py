@@ -1,4 +1,4 @@
-"""D70 scoring: bars G1-G8 (DECISIONS.md D70 am. 4) on VAL for one or both dev arms. TEST is not read.
+"""D70 scoring: bars G1, G4-G6, G8 (DECISIONS.md D70 am. 4, am. 12) on VAL for the dev arms. TEST is not read. G2 and G3 are records of the direct model: age_gate.json.
   python -I nimiwae70_eval.py --data DIR --age1 DIR1 --age0 DIR0 --fiadb FIADB --out report.json [--age1b DIR]
 Sizes, E1, E2, E3 use the same benchmarks and definitions as the D55 comparison (nimiwae54_ncv.score), run through the joint build."""
 import sys, os, json, argparse
@@ -53,21 +53,20 @@ if __name__ == '__main__':
     ap.add_argument('--age1b'); a = ap.parse_args()
     torch.set_num_threads(6)
     seq = pd.read_parquet(f'{a.data}/seq.parquet'); val = seq[seq.split == 'val'].copy()
-    rec = pd.read_parquet(f'{a.data}/age_rec.parquet'); rv = rec[(rec.split == 'val') & rec.first_of_tree & rec.fit_ok].copy()
     m1, ck1 = load(a.age1); m0, ck0 = load(a.age0); Rp = {}
-    R = A.build_rec(rv, m1.vocab['_curve']); rv['pred'] = A.predict_age(m1, R).numpy(); rv['err'] = rv.pred - rv.a_obs
-    Rp['G2'] = {s: dict(n=len(g), bias=med(g.err), mae=float(g.err.abs().mean())) for s, g in rv.groupby('source')}
-    tally = rv[rv.source != 'site']; Rp['G2_crown'] = {int(c): dict(n=len(g), bias=med(g.err)) for c, g in tally.groupby('cc')}
-    sm = tally[(tally.dia >= 1) & (tally.dia < 5)]; Rp['G3'] = dict(n=len(sm), bias=med(sm.err), mae=float(sm.err.abs().mean()), by_source={s: dict(n=len(g), bias=med(g.err)) for s, g in sm.groupby('source')})
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
     ln = linked(c, val); L = lineage_age(m1, val, ln); ln = ln.merge(L, on=M.K_ + ['invyr'])
-    lag = np.where(ln.sftwd_hrdwd == 'S', A.L0_SOFT, A.L0_HARD); ln['truth'] = ln.a_obs + lag; ln['e'] = ln.q50 - ln.truth
+    ln['truth'] = ln.a_obs + np.where(ln.sftwd_hrdwd == 'S', 2.0, 5.0); ln['e'] = ln.q50 - ln.truth
     t = duckdb.connect(a.db, read_only=True); cur = t.execute("SELECT statecd, unitcd, countycd, plot, subp, tree, invyr, estimated_age FROM (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees)").df()
     j = ln.merge(cur, on=M.K_ + ['invyr'], how='inner'); j = j[j.estimated_age.notna()]
     Rp['G1'] = dict(n=len(j), mae_joint=float((j.q50 - j.truth).abs().mean()), mae_current=float((j.estimated_age - j.truth).abs().mean()), bias_joint=med(j.q50 - j.truth), bias_current=med(j.estimated_age - j.truth))
     Rp['G5'] = dict(cover80=float(((ln.truth >= ln.q10) & (ln.truth <= ln.q90)).mean()))
-    Rp['tau'] = float(torch.exp(m1.lstau))
-    Rp['years_bh'] = {str(k): round(float(v), 2) for k, v in zip(['0'] + list(m1.vocab['_curve']['grp']), m1.curve.years_bh(torch.arange(len(m1.vocab['_curve']['grp']) + 1)))}
+    Rp['G5b'] = dict(width_q90_q10=float((ln.q90 / ln.q10.clip(lower=0.1)).median()), n=len(ln))
+    # R4 saplings have no measured age. Planted field age is a diagnostic, never a target or input: am. 12 records the prior's own numbers
+    fa = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, age_from_stdage fld FROM curated_trees WHERE age_from_stdage IS NOT NULL AND cond_stdorgcd = 1").df()
+    vk = val[val.slot_kind == 'real'][M.K_ + ['invyr', 'dia', 'plot_key']].merge(fa, on=M.K_ + ['invyr']); vk = vk[vk.plot_key.isin(vk.plot_key.drop_duplicates().sample(frac=0.25, random_state=3))]
+    fq = lineage_age(m1, val[val.plot_key.isin(vk.plot_key)], vk).merge(vk, on=M.K_ + ['invyr']); fq['cls'] = pd.cut(fq.dia, [0, 3, 5, 7, 9, 15, 99], right=False).astype(str)
+    Rp['planted_field'] = {c: dict(n=len(g), field=med(g.fld), bias=med(g.q50 - g.fld), cover80=float(((g.fld >= g.q10) & (g.fld <= g.q90)).mean())) for c, g in fq.groupby('cls')}
     pl = val.plot_key.drop_duplicates().sample(frac=0.5, random_state=2); vs = val[val.plot_key.isin(pl)]      # whole plots: sampling trees first left the benchmarks too thin
     c1 = completion(m1, vs); c0 = completion(m0, vs); Rp['completion'] = dict(age1=c1, age0=c0)
     Rp['G6'] = dict(size_ratio=c1['mae_lD'] / c0['mae_lD'], dE2=c1['E2'] - c0['E2'], dE3=c1['E3'] - c0['E3']); Rp['G8'] = dict(dE1=c1['E1'] - c0['E1'])
