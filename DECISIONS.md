@@ -1866,3 +1866,5 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 - **E1 benchmark bug:** `bench_sizes` required `cond_status == 1`, a column null since D55 am. 7, so the benchmark held only TRUE labels and E1 scored nothing. Fixed. E1 from frames after am. 7 must be rechecked, `truth_v1` included.
 - **Curve shape to watch:** inverted on site trees, bias runs -9 yr at 5-8 in to +18 yr at 16+ in. Inverting size given age spreads ages too wide; lineage ages should improve on this through the prior on b, and G1 will show it.
 
+**D70 amendment 8 (2026-11-02): birth head on a log scale.** With vigour fixed, a 30,000-tree test still gave ages of 26.8 to 27.9 yr across all sizes, correlation with log DIA 0.46. The head output years through softplus from a start near 25, and at a learning rate of 1e-3 its weights could not span tens of years. It now outputs log age.
+

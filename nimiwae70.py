@@ -113,11 +113,11 @@ class NIMIWAE70(M.NIMIWAE56):
         s.curve = AgeCurve(nc_spc, nc_grp, l0)
         s.bhead = nn.Linear(DZ + D_MODEL, 1)
         s.lsS, s.lstau = nn.Parameter(torch.tensor(-1.5)), nn.Parameter(torch.tensor(-1.5))
-        with torch.no_grad(): s.bhead.bias.fill_(math.log(math.expm1(25.0)))
+        with torch.no_grad(): s.bhead.bias.fill_(math.log(25.0))                           # log scale: in raw years the head could not spread ages at this learning rate
     def ages(s, z, B):
         """a_t [K, n, T]: one birth date per tree. a_N > 0 at the last slot; earlier slots subtract elapsed years exactly, so a_t < 0 before birth."""
         K = z.shape[0]; tok = s.st_p(B)[None].expand(K, -1, -1)
-        aN = F.softplus(s.bhead(torch.cat([z, tok], -1)))[..., 0]                         # [K, n]
+        aN = torch.exp(s.bhead(torch.cat([z, tok], -1)).clamp(-3, 7))[..., 0]             # [K, n], 0.05 to about 1100 yr
         t = B['cov'][..., ITYR] * 20.0                                                     # [n, T] years since 2000, from measurement dates
         last = (B['v'].sum(1).long() - 1).clamp(min=0)
         tN = t.gather(1, last[:, None])                                                    # [n, 1]
@@ -201,6 +201,6 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
             nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step(); sched.step()
             tot += loss_t.item(); nb += 1
         ess = float((1 / (torch.softmax(o['lw'].detach(), 0) ** 2).sum(0)).median())
-        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=float(model.ages(o['z'].detach(), b)[..., -1].std()) if age else 0.0))
+        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=float(torch.exp(model.bhead(torch.cat([o['z'].detach(), model.st_p(b)[None].expand(k, -1, -1)], -1)))[..., 0].std()) if age else 0.0))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
     return model.to('cpu'), hist

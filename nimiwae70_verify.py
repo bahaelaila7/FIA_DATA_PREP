@@ -85,7 +85,7 @@ check('birth date depends on z and statics only', float((m.ages(zz, Bb) - m.ages
 # 8. birth can fall inside the lineage: slots before it have no existence, in probabilities and in sampled lineages
 young = model(); B8 = batch(); B8['lD'][:] = 0; B8['ev'][:] = 0; B8['real'][:] = 0; B8['mD'][:] = 0
 B8['real'][:, 4] = 1; B8['mD'][:, 4] = 1; B8['lD'][:, 4] = math.log(1.5); B8['ev'][:, 4] = M.EV['true_hard']; B8['f'][:] = 4; B8['l'][:] = 4
-with torch.no_grad(): young.bhead.bias.fill_(math.log(math.expm1(3.0))); young.bhead.weight.zero_(); young.dout.bias[0] = 3.0
+with torch.no_grad(): young.bhead.bias.fill_(math.log(3.0)); young.bhead.weight.zero_(); young.dout.bias[0] = 3.0
 aY = young.ages(torch.zeros(1, 6, M.DZ), B8)[0, 0]
 check('birth can fall after the first slots', float(aY[0]) < 0 and float(aY[3]) < 0 and float(aY[4]) > 0, f'ages {[round(float(x), 1) for x in aY[:5]]}')
 L = M.sample_lineages(young, B8, n_draws=5, K=8)
@@ -95,7 +95,7 @@ lim = torch.sigmoid(A.KAPPA_B * aY[:4].detach())
 check('P(exists) never exceeds the birth step before birth', bool((Pr['pE'][:, :4] <= lim + 1e-5).all()), f'limit by slot {[round(float(x), 5) for x in lim]}')
 # 9. a tree cannot carry tally size before birth
 tall = model(); B9 = batch()
-with torch.no_grad(): tall.bhead.bias.fill_(math.log(math.expm1(3.0))); tall.bhead.weight.zero_()
+with torch.no_grad(): tall.bhead.bias.fill_(math.log(3.0)); tall.bhead.weight.zero_()
 zz9 = torch.zeros(1, 6, M.DZ); aa = tall.ages(zz9, B9); neg = (aa < 0) & (B9['v'][None] > 0)
 small = torch.full((1, 6, M.T_MAX), math.log(0.2)); big = torch.full((1, 6, M.T_MAX), math.log(3.0)); mp0 = torch.zeros(6, M.DZ); lp0 = torch.zeros(6, M.DZ)
 check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, mp0, lp0) - tall.extra_lw(big, zz9, B9, mp0, lp0)).min()) > 0 or not bool(neg.any()), f'{int(neg.sum())} unborn slots')
