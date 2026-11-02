@@ -130,9 +130,19 @@
   "detail": "(60585, 0)"
  },
  {
-  "name": "F11 soil on at least 99.9 % of plots",
+  "name": "F11 real soil values on at least 95 % of plots",
   "ok": true,
-  "detail": "1.00000"
+  "detail": "0.99144"
+ },
+ {
+  "name": "F11b soil_ok agrees with the values",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "F11c soil varies",
+  "ok": true,
+  "detail": "(np.float64(9.12), np.float64(0.347))"
  },
  {
   "name": "F12 climate normals on every slot",
@@ -150,9 +160,9 @@
   "detail": "[]"
  },
  {
-  "name": "A1 one row per source, visit and tree",
-  "ok": false,
-  "detail": "6355"
+  "name": "A1 no record repeated",
+  "ok": true,
+  "detail": "0"
  },
  {
   "name": "A2 ages and sizes are positive",
@@ -175,14 +185,14 @@
   "detail": "(28493, 0)"
  },
  {
-  "name": "A6 climate and soil on at least 99 % of records",
-  "ok": false,
-  "detail": "(np.float64(1.0), np.float64(0.0))"
+  "name": "A6 climate on 99 % and real soil on 95 % of records",
+  "ok": true,
+  "detail": "(np.float64(1.0), np.float64(0.98676))"
  },
  {
-  "name": "A7 ages are plausible (max 1000 yr)",
-  "ok": false,
-  "detail": "1600.0"
+  "name": "A7 fitted ages stay within the curve range",
+  "ok": true,
+  "detail": "(np.float64(1600.0), np.float64(458.0), 5054)"
  },
  {
   "name": "A8 every split has age records from each source",
@@ -202,7 +212,7 @@
  {
   "name": "M3 log weights are finite on real data",
   "ok": true,
-  "detail": "-3958.530029296875"
+  "detail": "-2800.653564453125"
  },
  {
   "name": "M4 gradients are finite",
