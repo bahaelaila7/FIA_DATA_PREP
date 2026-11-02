@@ -129,7 +129,7 @@ def load54(db: str) -> pl.DataFrame:
            t.age_calc, t.dia, t.ht, t.cr, ct.cclcd, t.drybio_g, t.tpa, coalesce(t.ba, 0) own_ba,
            f.species_symbol, f.spcd, f.sp_revised, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use,
            CASE WHEN t.tree IS NOT NULL THEN ct.treeclcd END treeclcd, CASE WHEN t.tree IS NOT NULL THEN ct.actualht END actualht,
-           dm.dmg1, dm.dmg2, dm.dmg3,
+           CASE WHEN t.tree IS NOT NULL THEN dm.dmg1 END dmg1, CASE WHEN t.tree IS NOT NULL THEN dm.dmg2 END dmg2, CASE WHEN t.tree IS NOT NULL THEN dm.dmg3 END dmg3,   -- in the ON clause this forced a nested-loop join
            rc.rcd0, f.terminal_fate, dr.dead_invyr, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc, s0.s0_dia, s0.s0_ht, s0.s0_kind,
            f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, NULL::INT cond_status,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
@@ -141,7 +141,7 @@ def load54(db: str) -> pl.DataFrame:
     LEFT JOIN real t USING ({K}, invyr)
     LEFT JOIN ct USING ({K}, invyr)
     LEFT JOIN dm ON dm.statecd = f.statecd AND dm.unitcd = f.unitcd AND dm.countycd = f.countycd AND dm.plot = f.plot AND dm.subp = f.subp
-         AND dm.tree = f.tree AND dm.invyr = f.invyr AND t.tree IS NOT NULL
+         AND dm.tree = f.tree AND dm.invyr = f.invyr
     LEFT JOIN rc USING ({K}) LEFT JOIN dr USING ({K}) LEFT JOIN s0 USING ({K})
     LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, invyr)
     LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.invyr = f.invyr
