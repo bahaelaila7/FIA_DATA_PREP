@@ -12,12 +12,13 @@ pyarrow==24.0.0
 R
 cat > "$W/nimiwae70/run.sh" <<'R'
 #!/usr/bin/env bash
-# Usage: bash run.sh [device]   Three runs, one after the other. Copy the out folder back.
+# Usage: bash run.sh [device]   Four runs, one after the other. Copy the out folder back.
 set -euo pipefail
 D=${1:-cuda}
 python -I nimiwae70_verify.py data | tail -1
-python -I nimiwae70_dev.py --data data --out out/d70q_age1 --age 1 --opt adamw --trees 400000 --epochs 12 --device "$D" --threads 8
-python -I nimiwae70_dev.py --data data --out out/d70q_age0 --age 0 --opt adamw --trees 400000 --epochs 12 --device "$D" --threads 8
-python -I nimiwae70_dev.py --data data --out out/d70q_age1_s1 --age 1 --opt adamw --seed 1 --trees 400000 --epochs 12 --device "$D" --threads 8
+python -I nimiwae70_dev.py --data data --out out/d70r_age1 --age 1 --opt adamw --trees 400000 --epochs 24 --device "$D" --threads 8
+python -I nimiwae70_dev.py --data data --out out/d70r_age0 --age 0 --opt adamw --trees 400000 --epochs 24 --device "$D" --threads 8
+python -I nimiwae70_dev.py --data data --out out/d70r_age1_s1 --age 1 --opt adamw --seed 1 --trees 400000 --epochs 24 --device "$D" --threads 8
+python -I nimiwae70_dev.py --data data --out out/d70r_age0_s1 --age 0 --opt adamw --seed 1 --trees 400000 --epochs 24 --device "$D" --threads 8
 R
 tar -cf "$OUT" -C "$W" nimiwae70; rm -rf "$W"; tar -tvf "$OUT" | awk '{printf "%8.1f MB  %s\n", $3/1048576, $NF}'

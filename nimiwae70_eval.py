@@ -50,7 +50,7 @@ def med(x): return float(np.median(x)) if len(x) else None
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     for x in ('--data', '--age1', '--age0', '--fiadb', '--out', '--db'): ap.add_argument(x)
-    ap.add_argument('--age1b'); a = ap.parse_args()
+    ap.add_argument('--age1b'); ap.add_argument('--age0b'); a = ap.parse_args()
     torch.set_num_threads(6)
     seq = pd.read_parquet(f'{a.data}/seq.parquet'); val = seq[seq.split == 'val'].copy()
     m1, ck1 = load(a.age1); m0, ck0 = load(a.age0); Rp = {}
@@ -70,6 +70,10 @@ if __name__ == '__main__':
     pl = val.plot_key.drop_duplicates().sample(frac=0.5, random_state=2); vs = val[val.plot_key.isin(pl)]      # whole plots: sampling trees first left the benchmarks too thin
     c1 = completion(m1, vs); c0 = completion(m0, vs); Rp['completion'] = dict(age1=c1, age0=c0)
     Rp['G6'] = dict(size_ratio=c1['mae_lD'] / c0['mae_lD'], dE2=c1['E2'] - c0['E2'], dE3=c1['E3'] - c0['E3']); Rp['G8'] = dict(dE1=c1['E1'] - c0['E1'])
+    if a.age1b or a.age0b:                                                         # run-to-run noise: G6 and G8 mean little if seeds differ by more than the arms do
+        Rp['seeds'] = {}
+        if a.age1b: Rp['seeds']['age1b'] = completion(load(a.age1b)[0], vs)
+        if a.age0b: Rp['seeds']['age0b'] = completion(load(a.age0b)[0], vs)
     if a.age1b:                                                                    # G4: natural saplings under 5 in, two seeds
         m2, _ = load(a.age1b); nat = seq[(seq.split == 'val') & (seq.slot_kind == 'real') & (~seq.planted.fillna(False)) & (seq.dia < 5)]
         pk = nat.plot_key.drop_duplicates().sample(frac=0.3, random_state=4); nt = val[val.plot_key.isin(pk)]; tk = nat[nat.plot_key.isin(pk)][M.K_ + ['invyr']]
