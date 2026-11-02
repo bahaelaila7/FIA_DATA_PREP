@@ -228,7 +228,7 @@ class NIMIWAE56(nn.Module):
             with torch.no_grad(): s.u_net[-1].weight.zero_(); s.u_net[-1].bias.zero_()                # starts at the prior
     def born_gate(s, lp1, lp0, z, B):
         return lp1, lp0, torch.ones_like(lp1, dtype=torch.bool)
-    def extra_lw(s, lDp, z, B, mp):
+    def extra_lw(s, lDp, z, B, mp, lp):
         return 0.0
     def enc_params(s):
         mods = (s.st_q, s.ercd, s.ecc, s.qin, s.qtr, s.qout) + ((s.u_net,) if s.noise else ())
@@ -371,7 +371,7 @@ class NIMIWAE56(nn.Module):
         lrec = lcr + lcc + ldm + lbk + lcl
         lpz = (-0.5 * (z - mp) ** 2 / torch.exp(lp) - 0.5 * lp - c2).sum(-1)
         lqz = (-0.5 * (z - mq) ** 2 / torch.exp(lq) - 0.5 * lq - c2).sum(-1)
-        lxt = s.extra_lw(lDp, z, B, mp)                                                                 # D70 hook; base model: 0
+        lxt = s.extra_lw(lDp, z, B, mp, lp)                                                             # D70 hook; base model: 0
         lw = lpx + lrec + lpz - lqz + lpu - lqu + lxt
         out = dict(lw=lw, lpost=lj - lpx[..., None, None], D=D, H=H, p1=torch.exp(lp1), lsdisc=s.lsdisc, z=z, u=u, born=born)
         if dreg:

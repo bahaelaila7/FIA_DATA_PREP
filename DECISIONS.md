@@ -1860,3 +1860,9 @@ By size (< 2 / 2–3 / 3–4 / 4–5 in), link probability: normal 1.5 / 6.3 / 2
 
 **D70 amendment 6 (2026-11-02; user chose the prior).** Years to breast height: one value per species group, log l ~ N(log l0, 0.3), l0 = 2 yr softwood, 5 yr hardwood, the values verifier (k) already uses. One prior term per group enters the objective, scaled like the rest. Report how much E1 moves when l0 shifts by 2 yr. The prior stays valid if the model later trains on all regions: only RSCD 22 and 26 hold TOTAGE or BHAGE, so elsewhere it keeps most of the weight.
 
+**D70 amendment 7 (2026-11-02): first dev run failed; the birth date collapsed.** 150,000 trees, 4 epochs, GPU, seed 0, VAL. G1 fail (MAE 29.4 vs current 9.4, bias -25.6), G2 fail (site +0.4 passes; BHAGE +4.4, TOTAGE -11.2, overtopped -14.4), G3 fail (-9.2), G5 fail (0.01), G6 fail (size 24.5 % worse; E2, E3 pass), G7 pass (0.22), G4 not run, G8 unusable.
+- **Cause:** predicted age at the last slot was 30.4 +- 1.0 yr for every tree, 30.3 yr at 1-3 in and 30.3 yr at 15+ in, correlation with log DIA 0.08. Vigour v(z) had sd 0.67 and no cost, so it absorbed all size and b stayed constant. More epochs would not fix it.
+- **Change:** v = tau (z_0 - mu_0) / sigma_0, so under the prior v ~ N(0, tau), with tau the between-tree spread the age records identify. No bar changes.
+- **E1 benchmark bug:** `bench_sizes` required `cond_status == 1`, a column null since D55 am. 7, so the benchmark held only TRUE labels and E1 scored nothing. Fixed. E1 from frames after am. 7 must be rechecked, `truth_v1` included.
+- **Curve shape to watch:** inverted on site trees, bias runs -9 yr at 5-8 in to +18 yr at 16+ in. Inverting size given age spreads ages too wide; lineage ages should improve on this through the prior on b, and G1 will show it.
+

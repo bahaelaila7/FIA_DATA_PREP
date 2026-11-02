@@ -7,7 +7,8 @@ Curve     log S(a; x) + delta(crown) is shared by lineages and age records. x = 
           Monotone in age: alpha(x) + sum_j softplus(w_j(x)) phi_j(log a) with fixed sigmoid phi_j.
 Unborn    a slot before birth is scored below the smallest tally level, so the size path cannot carry a tree that does not exist.
 E1        a microplot debut on a moved plot: slots before the move carry no FALSE label, because that spot was not sampled then (D65 item 2). The birth date decides instead.
-Slots     log D_t ~ N(log S(t - b; x) + delta(cc_t) + v, sigma_S) on slots up to the last visible record with a_t >= 0.5 yr. v = g(z) - g(prior mean), per-tree vigour.
+Slots     log D_t ~ N(log S(t - b; x) + delta(cc_t) + v, sigma_S) on slots up to the last visible record with a_t >= 0.5 yr.
+Vigour    v = tau * (z_0 - mu_0) / sigma_0: under the prior v ~ N(0, tau), the between-tree spread the age records measure. Am. 7: a free v absorbed all size and left b constant.
 Records   log DIA_obs ~ N(log S(a_obs + l; x) + delta(cc), sqrt(sigma_meas^2 + sigma_S^2 + tau^2)); l = years to breast height, 0 for TOTAGE; tau replaces v, which a record has no z for.
 Years BH  per species group, log l ~ N(log l0, 0.3), l0 = 2 softwood, 5 hardwood (D70 am. 6): one prior term per group, not per record, so groups with data can move and the rest stay near l0.
           Site trees use their own crown class (6), so their selection is a learned offset. Western tally records carry CCLCD, which identifies delta.
@@ -111,7 +112,6 @@ class NIMIWAE70(M.NIMIWAE56):
         s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False)
         s.curve = AgeCurve(nc_spc, nc_grp, l0)
         s.bhead = nn.Linear(DZ + D_MODEL, 1)
-        s.gv70 = nn.Linear(DZ, 1, bias=False)
         s.lsS, s.lstau = nn.Parameter(torch.tensor(-1.5)), nn.Parameter(torch.tensor(-1.5))
         with torch.no_grad(): s.bhead.bias.fill_(math.log(math.expm1(25.0)))
     def ages(s, z, B):
@@ -127,12 +127,15 @@ class NIMIWAE70(M.NIMIWAE56):
         a = s.ages(z, B); lb = F.logsigmoid(KAPPA_B * a)
         l1 = lp1 + lb
         return l1, torch.log(-torch.expm1(l1.clamp(max=-1e-6))), a > 0
-    def extra_lw(s, lDp, z, B, mp):
+    def vigour(s, z, mp, lp):
+        """[K, n]: distributed N(0, tau) under the prior, so a tree leaves the curve only at a real cost"""
+        return torch.exp(s.lstau) * (z[..., 0] - mp[..., 0]) * torch.exp(-0.5 * lp[..., 0])
+    def extra_lw(s, lDp, z, B, mp, lp):
         if not s.age: return 0.0
         a = s.ages(z, B); tok = s.curve.token(B); K = z.shape[0]
         ls = torch.stack([s.curve.log_s(tok, a[k]) for k in range(K)])                     # [K, n, T]
         cc = (B['cc'].long().clamp(0, 5) * (B['mcc'] > 0).long())
-        v_ = (s.gv70(z) - s.gv70(mp)[None])                                                 # [K, n, 1]
+        v_ = s.vigour(z, mp, lp)[..., None]                                                 # [K, n, 1]
         ar = torch.arange(T_MAX, device=z.device)[None, None]
         m = (B['v'][None] > 0) & (ar <= B['l'][None, :, None]) & (a >= 0.5)
         mu = ls + s.curve.delta(cc)[None, ..., 0] + v_
@@ -198,6 +201,6 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
             nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step(); sched.step()
             tot += loss_t.item(); nb += 1
         ess = float((1 / (torch.softmax(o['lw'].detach(), 0) ** 2).sum(0)).median())
-        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item()))
+        hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item(), age_sd=float(model.ages(o['z'].detach(), b)[..., -1].std()) if age else 0.0))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
     return model.to('cpu'), hist

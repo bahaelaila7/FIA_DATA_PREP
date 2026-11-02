@@ -97,8 +97,12 @@ check('P(exists) never exceeds the birth step before birth', bool((Pr['pE'][:, :
 tall = model(); B9 = batch()
 with torch.no_grad(): tall.bhead.bias.fill_(math.log(math.expm1(3.0))); tall.bhead.weight.zero_()
 zz9 = torch.zeros(1, 6, M.DZ); aa = tall.ages(zz9, B9); neg = (aa < 0) & (B9['v'][None] > 0)
-small = torch.full((1, 6, M.T_MAX), math.log(0.2)); big = torch.full((1, 6, M.T_MAX), math.log(3.0)); mp0 = torch.zeros(6, M.DZ)
-check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, mp0) - tall.extra_lw(big, zz9, B9, mp0)).min()) > 0 or not bool(neg.any()), f'{int(neg.sum())} unborn slots')
+small = torch.full((1, 6, M.T_MAX), math.log(0.2)); big = torch.full((1, 6, M.T_MAX), math.log(3.0)); mp0 = torch.zeros(6, M.DZ); lp0 = torch.zeros(6, M.DZ)
+check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, mp0, lp0) - tall.extra_lw(big, zz9, B9, mp0, lp0)).min()) > 0 or not bool(neg.any()), f'{int(neg.sum())} unborn slots')
+# 12. vigour has a real prior: under p(z) it is N(0, tau), whatever the prior's own location and scale
+torch.manual_seed(9); mpv = torch.randn(2000, M.DZ) * 3; lpv = torch.randn(2000, M.DZ); zv = mpv + torch.exp(0.5 * lpv) * torch.randn(4, 2000, M.DZ)
+vv = tall.vigour(zv, mpv, lpv).detach(); tau = float(torch.exp(tall.lstau))
+check('vigour is N(0, tau) under the prior', abs(float(vv.mean())) < 0.03 and abs(float(vv.std()) / tau - 1) < 0.03, f'mean {float(vv.mean()):+.3f}, sd {float(vv.std()):.3f}, tau {tau:.3f}')
 # 10. E1 mask: only slots before the move, only trees first recorded at or after it
 s_ = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1, 2, 2, 2, 3, 3], 'invyr': [2002, 2007, 2012, 2002, 2007, 2012, 2002, 2007],
                    'slot_kind': ['pre', 'pre', 'real', 'real', 'real', 'post', 'pre', 'real'], 'move_invyr': [2007, 2007, 2007, 2007, 2007, 2007, np.nan, np.nan]})
