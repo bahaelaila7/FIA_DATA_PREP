@@ -23,6 +23,8 @@ def split_of(key: str) -> str:
 
 def cte_parts(q: str):
     """Split 'WITH a AS (...), b AS (...) SELECT ...' at depth 0 -> [(name, body), ...], final select."""
+    import re
+    q = re.sub(r'--[^\n]*', '', q)                                                                 # SQL comments (no string in the frame query holds --)
     i = q.index('WITH') + 4; parts = []
     while True:
         o = q.index('(', i); name = q[i:o].replace(' AS ', ' ').split()[0]
