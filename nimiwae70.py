@@ -133,7 +133,7 @@ class NIMIWAE70(M.NIMIWAE56):
         ls = torch.stack([s.curve.log_s(tok, a[k]) for k in range(K)])                     # [K, n, T]
         cc = (B['cc'].long().clamp(0, 5) * (B['mcc'] > 0).long())
         v_ = (s.gv70(z) - s.gv70(mp)[None])                                                 # [K, n, 1]
-        ar = torch.arange(T_MAX)[None, None]
+        ar = torch.arange(T_MAX, device=z.device)[None, None]
         m = (B['v'][None] > 0) & (ar <= B['l'][None, :, None]) & (a >= 0.5)
         mu = ls + s.curve.delta(cc)[None, ..., 0] + v_
         sd = torch.exp(s.lsS)
@@ -165,26 +165,29 @@ def predict_age(model, R, grid=None):
         out.append(a - torch.where(r['src'] == TOT, torch.zeros_like(a), model.curve.years_bh(r['c_grp'])))
     return torch.cat(out)
 
-def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True):
+def to_dev(b, device):
+    return {k: v.to(device, non_blocking=True) for k, v in b.items()}
+
+def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu'):
     assert set(tr.split.unique()) <= {'train'} and set(rec.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
     assert rec.first_of_tree.all() and rec.fit_ok.all(), 'one age record per tree in fitting, within the curve range; repeats test the step'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     cv = curve_vocab(tr, rec); B, vocab, _ = build(tr, cv=cv); n = B['v'].shape[0]; R = build_rec(rec, cv); nr = R['lD'].shape[0]
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
-    model = make_model(vocab, age=age)
+    model = make_model(vocab, age=age).to(device)
     phi = model.enc_params(); pid = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in pid]
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     nb_ep = (n + bs - 1) // bs
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * nb_ep, pct_start=0.05, anneal_strategy='cos')
-    log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; age records {nr:,}; K {k} (DReG); age {age}')
+    log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; age records {nr:,}; K {k} (DReG); age {age}; device {device}')
     hist = []
     for ep in range(epochs):
         t0, tot, totr, nb = time.time(), 0.0, 0.0, 0
         for ix in torch.split(torch.tensor(rng.permutation(n)), bs):
-            b = sub(B, ix); o = model.joint(b, k, dreg=True)
+            b = to_dev(sub(B, ix), device); o = model.joint(b, k, dreg=True)
             loss_t = -(torch.logsumexp(o['lw'], 0) - math.log(k)).mean()
             if age:
-                r = sub(R, torch.tensor(rng.integers(0, nr, bs)))
+                r = to_dev(sub(R, torch.tensor(rng.integers(0, nr, bs))), device)
                 lr_ = -model.rec_ll(r).mean(); loss_t = loss_t + (nr / n) * lr_ - model.curve.log_prior_bh() / n; totr += lr_.item()
             wt = torch.softmax(o['lw'], 0).detach()
             loss_p = -(wt ** 2 * o['lw_dreg']).sum(0).mean()
@@ -197,4 +200,4 @@ def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e
         ess = float((1 / (torch.softmax(o['lw'].detach(), 0) ** 2).sum(0)).median())
         hist.append(dict(epoch=ep, loss=tot / nb, rec_nll=totr / nb, ess_last_batch=ess, sd_S=torch.exp(model.lsS).item(), tau=torch.exp(model.lstau).item(), sd_disc=torch.exp(model.lsdisc).item()))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
-    return model, hist
+    return model.to('cpu'), hist

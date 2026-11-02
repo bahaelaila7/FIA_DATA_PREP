@@ -243,7 +243,7 @@ class NIMIWAE56(nn.Module):
     def q(s, B):
         m = B['mD']; cc = s.ecc(B['cc'].long().clamp(0, 5)) * B['mcc'][..., None]
         haslo = (B['mode'] == MODE['interval']).float()
-        T = T_MAX; ar = torch.arange(T)[None]
+        T = T_MAX; ar = torch.arange(T, device=B['v'].device)[None]
         x = torch.cat([B['cov'], torch.stack([B['lD'] * m, m, B['lH'] * B['mH'], B['mH'], B['cr'], B['mcr'], B['mcc'], B['real'], B['psamp'],
                                               B['llim'], haslo, B['llo'].clamp(min=-1) * haslo, (ar == B['f'][:, None]).float(),
                                               (ar == B['l'][:, None]).float(), B['v']], -1),
@@ -298,7 +298,7 @@ class NIMIWAE56(nn.Module):
     def joint(s, B, K, dreg=False):
         """-> log weights lw [K, n], log posterior over (e, f) [K, n, E, 2], latent paths D, H [K, n, T], existence step p1."""
         mq, lq = s.q(B); hs = s._hs; mp, lp = s.p_z(B)
-        z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape)
+        z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)
         c2 = 0.5 * math.log(2 * math.pi)
         u, lpu, lqu = None, 0.0, 0.0
         if s.noise:
@@ -308,7 +308,7 @@ class NIMIWAE56(nn.Module):
             lpu = ((-0.5 * u ** 2 - c2) * vv).sum((-1, -2))
             lqu = ((-0.5 * (u - muu) ** 2 / torch.exp(lvu) - 0.5 * lvu - c2) * vv).sum((-1, -2))
         D, H, lend, crm, ccl, dml, brl, cll = s.decode(z, B, u)
-        T = T_MAX; ar = torch.arange(T)
+        T = T_MAX; ar = torch.arange(T, device=z.device)
         lDp, lHp = torch.log(D.clamp(min=1e-3)), torch.log(H.clamp(min=1.0))
         xe = KAPPA * (lDp - B['lex'][None])                                                             # qualifies at the smallest level
         lp1, lp0 = F.logsigmoid(xe), F.logsigmoid(-xe)
@@ -359,8 +359,8 @@ class NIMIWAE56(nn.Module):
         alive = csum.gather(-1, (nv - 1).clamp(min=0).expand(K, -1, 1))
         lpe = torch.stack([torch.cat([lpe_die, alive], -1), torch.cat([lpe_cut, torch.full_like(alive, NEG)], -1)], -1)
         known = (B['ndef'] == 1) & (B['moved'] == 0)
-        cmask = torch.zeros(1, B['v'].shape[0], 1, 2); cmask[0, known, 0, 1 - B['cause'][known]] = NEG
-        lpe = lpe + cmask * (torch.arange(T_MAX + 1)[None, None] < T_MAX)[..., None].float()
+        cmask = torch.zeros(1, B['v'].shape[0], 1, 2, device=z.device); cmask[0, known, 0, 1 - B['cause'][known]] = NEG
+        lpe = lpe + cmask * (torch.arange(T_MAX + 1, device=z.device)[None, None] < T_MAX)[..., None].float()
         lj = lpe + lle[..., None]
         lpx = torch.logsumexp(lj.reshape(K, lj.shape[1], -1), -1)
         lcr = (nl(B['cr'][None], crm, s.lscr) * B['mcr'][None]).sum(-1)
