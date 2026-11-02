@@ -559,7 +559,7 @@ def bench_sizes(seq: pd.DataFrame, limit=None, interval: bool = True) -> pd.Data
     first = b[b.slot_kind == 'real'].groupby(K_).measdate.min().rename('_d0')
     b = b.join(first, on=K_)
     b['truth_E'] = np.where(b.hidden, 1.0, np.nan)
-    clean = (b.slot_kind == 'pre') & b.rcd0.isin([1, 2]) & (b.forest_micrcond_prop.fillna(0) >= 1.0) & (b.cond_status == 1)   # microplot debut (selected above)
+    clean = (b.slot_kind == 'pre') & b.rcd0.isin([1, 2]) & (b.forest_micrcond_prop.fillna(0) >= 1.0)   # microplot debut (selected above); D55 am. 7 left cond_status null, which removed every FALSE truth
     b.loc[clean, 'truth_E'] = 0.0
     b['limit_in'] = b.thr_subp if limit is None else float(limit)
     b['lo_in'] = np.where(b.hidden & interval, b.thr_micro, np.nan); b['e_known'] = b.hidden & interval
