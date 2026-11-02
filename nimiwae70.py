@@ -158,7 +158,7 @@ def predict_age(model, R, grid=None):
 
 def train(tr, rec, epochs=4, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True):
     assert set(tr.split.unique()) <= {'train'} and set(rec.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
-    assert rec.first_of_tree.all(), 'one age record per tree in fitting; repeats test the step'
+    assert rec.first_of_tree.all() and rec.fit_ok.all(), 'one age record per tree in fitting, within the curve range; repeats test the step'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     cv = curve_vocab(tr, rec); B, vocab, _ = build(tr, cv=cv); n = B['v'].shape[0]; R = build_rec(rec, cv); nr = R['lD'].shape[0]
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees

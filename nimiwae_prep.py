@@ -219,7 +219,8 @@ SOIL = ['clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'cec', 'depth_restriction', '
 def add_soil(df: pl.DataFrame, solus: str) -> pl.DataFrame:
     """D70: SOLUS100 at the plot (as extracted by plot key); a renumbered plot's canonical key may have no row: soil_ok false."""
     so = pl.read_parquet(solus).select(['statecd', 'unitcd', 'countycd', 'plot'] + SOIL).rename({c: f'soil_{c}' for c in SOIL})
-    so = so.with_columns([pl.col(c).cast(df.schema[c]) for c in ('statecd', 'unitcd', 'countycd', 'plot')]).with_columns(pl.lit(True).alias('soil_ok'))
+    so = so.with_columns([pl.col(c).cast(df.schema[c]) for c in ('statecd', 'unitcd', 'countycd', 'plot')]).with_columns(pl.col('soil_clay').is_not_null().alias('soil_ok'))
+    assert so['soil_ok'].mean() > 0.5, 'soil extract is empty'
     return df.join(so, on=['statecd', 'unitcd', 'countycd', 'plot'], how='left').with_columns(pl.col('soil_ok').fill_null(False))
 
 def resplit_r2(split: str, key: str) -> str:

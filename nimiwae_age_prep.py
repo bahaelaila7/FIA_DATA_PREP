@@ -7,6 +7,7 @@ Writes DIR/age_rec.parquet: one row per measured age. Read-only on FIADB. Natura
   tot   TREE.TOTAGE, RSCD 22 and 26, annual, live.
   bha   TREE.BHAGE,  RSCD 22 and 26, annual, live.
 Diameter must be at breast height (DIAHTCD 1): a root-collar diameter is not on the same scale. HI and the territories are left out: no climate.
+A site tree listed twice at a visit with identical measurements counts once. fit_ok: ages up to 400 yr; older western trees (redcedar, Douglas-fir) are real but outside the curve's range.
 first_of_tree marks a tree's first age record per source; later ones are repeats, used to test the step with elapsed time. STDAGE, FLDAGE and SICOND are not
 read: SICOND is computed from the site trees themselves."""
 import os, sys, argparse
@@ -31,7 +32,7 @@ def records(c):
         FROM {site_r} R {VISIT} WHERE TRY_CAST(R.AGEDIA AS DOUBLE) > 0 AND R.DIA > 0"""
     tally = lambda src, col: f"""SELECT '{src}' AS source, {common}, R.CCLCD::INT cc, R.TREE::BIGINT tree, R.SUBP::INT subp, TRY_CAST(R.{col} AS DOUBLE) a_obs
         FROM f.main.TREE R {VISIT} WHERE R.STATECD IN ({st(WEST)}) AND V.RSCD IN (22, 26) AND R.STATUSCD = 1 AND TRY_CAST(R.{col} AS DOUBLE) > 0 AND R.DIA > 0 AND R.DIAHTCD = 1"""
-    return pl.concat([c.execute(q).pl() for q in (site, tally('tot', 'TOTAGE'), tally('bha', 'BHAGE'))], how='vertical_relaxed')
+    return pl.concat([c.execute(q).pl().unique() for q in (site, tally('tot', 'TOTAGE'), tally('bha', 'BHAGE'))], how='vertical_relaxed')
 
 
 def attach(df, c, prism, solus):
@@ -56,7 +57,8 @@ def finish(df):
     df = df.join(keys, on='plot_key', how='left')
     tid = ['source', 'statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'spcd']
     return (df.with_columns((pl.col('invyr') == pl.col('invyr').min().over(tid)).alias('first_of_tree'))
-              .with_columns((pl.col('invyr').rank('dense').over(tid) - 1).cast(pl.Int32).alias('rec_no')))
+              .with_columns((pl.col('invyr').rank('dense').over(tid) - 1).cast(pl.Int32).alias('rec_no'),
+                            (pl.col('a_obs') <= 400).alias('fit_ok')))
 
 
 def selftest():

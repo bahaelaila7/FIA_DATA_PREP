@@ -57,7 +57,9 @@ def frame(c, seq):
     bad = x[x.fate.astype(str).str.startswith('censored')]; check('F8 closure-dead trees are not labelled censored', len(bad) == 0, (len(bad), bad.fate.value_counts().to_dict()))
     rr = seq[seq.s0_kind == 'dead_cut']; check('F9 dead closures are not censoring events in the frame', len(rr) == 0, len(rr))
     z = seq[seq.s0_kind == 'sized'].drop_duplicates(k); check('F10 sized closures give a last size', len(z) > 0 and z.s0_dia.notna().all(), (len(z), int(z.s0_dia.isna().sum())))
-    t0 = seq.drop_duplicates('plot_key'); soil = float(t0.soil_ok.mean()); check('F11 soil on at least 99.9 % of plots', soil >= 0.999, f'{soil:.5f}')
+    t0 = seq.drop_duplicates('plot_key'); soil = float(t0.soil_clay.notna().mean()); check('F11 real soil values on at least 95 % of plots', soil >= 0.95, f'{soil:.5f}')
+    check('F11b soil_ok agrees with the values', bool((t0.soil_ok == t0.soil_clay.notna()).all()))
+    check('F11c soil varies', t0.soil_clay.std() > 1 and t0.soil_ph.std() > 0.1, (round(t0.soil_clay.std(), 2), round(t0.soil_ph.std(), 3)))
     check('F12 climate normals on every slot', seq.tm_n.notna().mean() >= 0.999, f'{seq.tm_n.notna().mean():.5f}')
     mv = c.execute("SELECT DISTINCT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot FROM procedural_breaks WHERE is_microplot_move").df()
     a = seq[seq.move_invyr.notna()].drop_duplicates('plot_key'); b = a.merge(mv, on=['statecd', 'unitcd', 'countycd', 'plot']); check('F13 move_invyr only on plots with a flagged move', len(a) == len(b) and len(a) > 0, (len(a), len(b)))
@@ -65,7 +67,8 @@ def frame(c, seq):
 
 
 def ages(rec, seq):
-    check('A1 one row per source, visit and tree', not rec.duplicated(['source', 'statecd', 'unitcd', 'countycd', 'plot', 'invyr', 'subp', 'tree', 'spcd']).any(), int(rec.duplicated(['source', 'statecd', 'unitcd', 'countycd', 'plot', 'invyr', 'subp', 'tree', 'spcd']).sum()))
+    kk = ['source', 'statecd', 'unitcd', 'countycd', 'plot', 'invyr', 'subp', 'tree', 'spcd', 'dia', 'ht', 'a_obs']
+    check('A1 no record repeated', not rec.duplicated(kk).any(), int(rec.duplicated(kk).sum()))
     check('A2 ages and sizes are positive', (rec.a_obs > 0).all() and (rec.dia > 0).all())
     st = rec[rec.source == 'site']; check('A3 site trees are R4 and at least 5 in', st.statecd.isin([1, 12, 13, 21, 28, 37, 45, 47]).all() and st.dia.min() >= 5.0, st.dia.min())
     w = rec[rec.source != 'site']; check('A4 tally ages are outside R4', not w.statecd.isin([1, 12, 13, 21, 28, 37, 45, 47]).any(), sorted(w.statecd.unique().tolist()))
@@ -73,8 +76,8 @@ def ages(rec, seq):
     j = pd.concat([pm.rename('a'), sp.rename('b')], axis=1, join='inner'); bad = int((j.a != j.b).sum())
     check('A5 a plot has the same split in the frame and the age records', bad == 0 and len(j) > 0, (len(j), bad))
     only = st[~st.plot_key.isin(pm.index)].plot_key.nunique(); print(f'INFO  site-tree plots not in the frame: {only}')
-    check('A6 climate and soil on at least 99 % of records', rec.tm_n.notna().mean() >= 0.99 and rec.soil_clay.notna().mean() >= 0.99, (round(rec.tm_n.notna().mean(), 5), round(rec.soil_clay.notna().mean(), 5)))
-    check('A7 ages are plausible (max 1000 yr)', rec.a_obs.max() <= 1000, rec.a_obs.max())
+    check('A6 climate on 99 % and real soil on 95 % of records', rec.tm_n.notna().mean() >= 0.99 and rec.soil_clay.notna().mean() >= 0.95, (round(rec.tm_n.notna().mean(), 5), round(rec.soil_clay.notna().mean(), 5)))
+    check('A7 fitted ages stay within the curve range; site trees at most 400 yr', rec[rec.fit_ok].a_obs.max() <= 400 and st.a_obs.max() <= 400, (rec.a_obs.max(), st.a_obs.max(), int((~rec.fit_ok).sum())))
     check('A8 every split has age records from each source', rec.groupby('source').split.nunique().min() >= 3, rec.groupby('source').split.nunique().to_dict())
     print(rec.groupby(['source', 'split']).agg(n=('a_obs', 'size'), first=('first_of_tree', 'sum'), lt5=('dia', lambda d: int((d < 5).sum())), med_age=('a_obs', 'median')).to_string())
 

@@ -1,0 +1,227 @@
+[
+ {
+  "name": "T1 tree x INVYR unique in curated_trees",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T2 tree x invyr unique in tree_trajectories",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T3 every closure_dead record is a dead_cut closure event",
+  "ok": true,
+  "detail": "(26436, 26436)"
+ },
+ {
+  "name": "T4 a closure_dead record is never also a censoring event",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T5 every dead_cut closure reached curated_trees",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T6 no live record after a closure death on the same tree id",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T7 sized and unknown closures stay censored",
+  "ok": true,
+  "detail": "(64585, 64585)"
+ },
+ {
+  "name": "T8 sized closures carry a size",
+  "ok": true,
+  "detail": "(60585, 0)"
+ },
+ {
+  "name": "T9 a sized closure is never a live row",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T10 sim_year is one value per visit and increases with INVYR",
+  "ok": true,
+  "detail": "(0, 0)"
+ },
+ {
+  "name": "T11 condition links run forward in time",
+  "ok": true,
+  "detail": "(0, 0, 131311)"
+ },
+ {
+  "name": "T12 no move is flagged on a nonsampled visit",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T13 one break row per visit",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T14 every stored renumber link is accepted (no ties)",
+  "ok": true,
+  "detail": "(36, 36)"
+ },
+ {
+  "name": "T15 cohort rows all carry invyr",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "T16 every cohort row sits on a scaffold visit",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "F1 tree x invyr unique",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "F2 tree x date unique",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "F3 slots in date order are in INVYR order",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "F4 no lineage exceeds 8 slots",
+  "ok": true,
+  "detail": "6"
+ },
+ {
+  "name": "F5 every real trajectory row is a real slot",
+  "ok": true,
+  "detail": "(3729318, 3729318)"
+ },
+ {
+  "name": "F6 one split per plot",
+  "ok": true,
+  "detail": "1"
+ },
+ {
+  "name": "F7 closure-dead trees in the frame have a dead date",
+  "ok": true,
+  "detail": "(26436, 0)"
+ },
+ {
+  "name": "F8 closure-dead trees are not labelled censored",
+  "ok": true,
+  "detail": "(0, {})"
+ },
+ {
+  "name": "F9 dead closures are not censoring events in the frame",
+  "ok": true,
+  "detail": "0"
+ },
+ {
+  "name": "F10 sized closures give a last size",
+  "ok": true,
+  "detail": "(60585, 0)"
+ },
+ {
+  "name": "F11 soil on at least 99.9 % of plots",
+  "ok": true,
+  "detail": "1.00000"
+ },
+ {
+  "name": "F12 climate normals on every slot",
+  "ok": true,
+  "detail": "1.00000"
+ },
+ {
+  "name": "F13 move_invyr only on plots with a flagged move",
+  "ok": true,
+  "detail": "(16891, 16891)"
+ },
+ {
+  "name": "F14 no STDAGE or curated age column in the frame",
+  "ok": true,
+  "detail": "[]"
+ },
+ {
+  "name": "A1 one row per source, visit and tree",
+  "ok": false,
+  "detail": "6355"
+ },
+ {
+  "name": "A2 ages and sizes are positive",
+  "ok": true,
+  "detail": ""
+ },
+ {
+  "name": "A3 site trees are R4 and at least 5 in",
+  "ok": true,
+  "detail": "5.0"
+ },
+ {
+  "name": "A4 tally ages are outside R4",
+  "ok": true,
+  "detail": "[4, 6, 8, 16, 30, 32, 35, 41, 49, 53, 56]"
+ },
+ {
+  "name": "A5 a plot has the same split in the frame and the age records",
+  "ok": true,
+  "detail": "(28493, 0)"
+ },
+ {
+  "name": "A6 climate and soil on at least 99 % of records",
+  "ok": false,
+  "detail": "(np.float64(1.0), np.float64(0.0))"
+ },
+ {
+  "name": "A7 ages are plausible (max 1000 yr)",
+  "ok": false,
+  "detail": "1600.0"
+ },
+ {
+  "name": "A8 every split has age records from each source",
+  "ok": true,
+  "detail": "{'bha': 3, 'site': 3, 'tot': 3}"
+ },
+ {
+  "name": "M1 lineage tensors are finite",
+  "ok": true,
+  "detail": "[]"
+ },
+ {
+  "name": "M2 record tensors are finite",
+  "ok": true,
+  "detail": "[]"
+ },
+ {
+  "name": "M3 log weights are finite on real data",
+  "ok": true,
+  "detail": "-3958.530029296875"
+ },
+ {
+  "name": "M4 gradients are finite",
+  "ok": true,
+  "detail": "[]"
+ },
+ {
+  "name": "M5 curve, birth head and scales all receive gradient",
+  "ok": true,
+  "detail": "[]"
+ },
+ {
+  "name": "M6 age step = elapsed years on real dates",
+  "ok": true,
+  "detail": "1.4e-06"
+ },
+ {
+  "name": "M7 the E1 rule removes FALSE labels",
+  "ok": true,
+  "detail": "base 4732, joint 3535, masked slots 5495"
+ }
+]
