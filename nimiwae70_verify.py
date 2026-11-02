@@ -3,6 +3,10 @@ import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import math
 import numpy as np, pandas as pd, torch, torch.nn.functional as F
 import nimiwae56 as M, nimiwae70 as A
+_float = float
+def float(x):                                                 # tensors are read as values here; gradients are tested separately
+    return x.detach().item() if torch.is_tensor(x) else _float(x)
+
 RES = []
 def check(name, ok, detail=''):
     RES.append((name, bool(ok))); print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}", flush=True)
