@@ -137,14 +137,16 @@ class NIMIWAE70(M.NIMIWAE56):
 def age_posterior(model, B, K=100, G=61, zmax=3.6):
     """Exact posterior of z0 on a grid: [n, G] probabilities. The decoder never reads z0, so the rest of the model is scored once and only the birth limits vary along the grid.
     Importance resampling is not used here: with ESS near 7 of K it moved ages by 0.24 sd where the exact answer is the prior (am. 14). lw divides by q(z0 = g), which the grid replaces, so that term goes back in."""
-    mq, lq = M.NIMIWAE56.q(model, B); g = torch.linspace(-zmax, zmax, G, device=mq.device); rest = model.sample_z(mq, lq, K)[0]   # flow q: z_rest from the flow (D73)
+    assert model.age, 'the grid is over the age latent z0'
+    mq, lq = M.NIMIWAE56.q(model, B); g = torch.linspace(-zmax, zmax, G, device=mq.device); rest, lqs = model.sample_z(mq, lq, K)   # flow q: z_rest from the flow (D73)
     zz = rest.clone(); zz[..., 0] = 0.0; model._cache = None; dec = model.decode(zz, B); model._cache = dict(q=(mq, lq), dec=dec)
     c2 = 0.5 * math.log(2 * math.pi); out = []
+    lq_rest = lqs - (-0.5 * (rest[..., 0] - mq[:, 0]) ** 2 / torch.exp(lq[:, 0]) - 0.5 * lq[:, 0] - c2)   # exact log q(z_rest) from the draw itself: no inverse pass (D73: float32 inverse of a flat spline is off)
     try:
         for gi in g:
             z = rest.clone(); z[..., 0] = gi
             lq0 = -0.5 * (gi - mq[:, 0]) ** 2 / torch.exp(lq[:, 0]) - 0.5 * lq[:, 0] - c2
-            out.append(torch.logsumexp(model.joint(B, K, z=z)['lw'] + lq0[None], 0))
+            out.append(torch.logsumexp(model.joint(B, K, z=z, lqz=lq0[None] + lq_rest)['lw'] + lq0[None], 0))
     finally:
         model._cache = None
     return g, torch.softmax(torch.stack(out, 1), 1)

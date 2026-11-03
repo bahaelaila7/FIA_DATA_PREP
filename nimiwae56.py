@@ -308,11 +308,11 @@ class NIMIWAE56(nn.Module):
             if mu_ is not None: rate = rate * mu_[:, :, t]
             Ds.append(Ds[-1] + dt[None, :, t] * rate[..., 0] * B['v'][None, :, t]); Hs.append(Hs[-1] + dt[None, :, t] * rate[..., 1] * B['v'][None, :, t])
         return torch.stack(Ds, -1), torch.stack(Hs, -1)
-    def joint(s, B, K, dreg=False, z=None):
+    def joint(s, B, K, dreg=False, z=None, lqz=None):
         """-> log weights lw [K, n], log posterior over (e, f) [K, n, E, 2], latent paths D, H [K, n, T], existence step p1."""
         mq, lq = s.q(B); hs = s._hs; mp, lp = s.p_z(B)
         if z is None: z, lqz = s.sample_z(mq, lq, K)                                              # D73 hook: Gaussian or flow q
-        else: lqz = s.log_qz(z, mq, lq)                                                             # z given: score those draws (D70 age grid)
+        elif lqz is None: lqz = s.log_qz(z, mq, lq)                                                 # z given: score those draws (D70 age grid); lqz given: their exact log q
         c2 = 0.5 * math.log(2 * math.pi)
         u, lpu, lqu = None, 0.0, 0.0
         if s.noise:

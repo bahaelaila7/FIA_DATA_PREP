@@ -16,7 +16,7 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 # D72: run WITHOUT OLD_CV. The frame changed (lineage segments), so both arms retrain. OLD_CV (rescoring old age-off checkpoints) is only for a frame that did not change.
 # Runs 5 at a time (P=...), CPU threads shared out, runs spread over GPUs. Finished runs are skipped, so it can be restarted. Copy $O back (out/cv72 or out/cv72flow).
 set -uo pipefail
-D=${1:-cuda}; OLD=${2:-}; Q=${Q:-gauss}; O=out/cv72; [ "$Q" = flow ] && O=out/cv72flow; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
+D=${1:-cuda}; OLD=${2:-}; Q=${Q:-gauss}; case "$Q" in gauss) O=out/cv72;; flow) O=out/cv72flow;; *) echo "Q must be gauss or flow, not $Q"; exit 1;; esac; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
 python -I nimiwae70_verify.py data | tail -1 || exit 1
 python -I nimiwae70_cv.py --selftest || exit 1
 echo "q $Q into $O; $P at a time, $T CPU threads each, $G GPU(s)"
