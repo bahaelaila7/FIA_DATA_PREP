@@ -13,12 +13,17 @@ Observation model (D72): every factor, once. g_t = P(at breast height at t | z0)
   measurements, crown, damage          as D55, at visible records
 There is no separate short-tree factor: before breast height the gate removes existence and the tally, so the size path there is unobserved (am. 16's term double-counted g_t
 at every TRUE slot and was not a likelihood). Age off: g_t = 1 everywhere, the D55 model.
-E1        a microplot debut on a moved plot: slots before the move carry no FALSE label (D65 item 2)."""
+E1        a microplot debut on a moved plot: slots before the move carry no FALSE label (D65 item 2).
+q         'gauss' (diagonal Gaussian, the default) or 'flow' (D73): z0 keeps its own Gaussian, the other dimensions go through a conditional rational-quadratic spline
+          coupling flow on the encoder's tree state (nimiwae_flow.py). q(z) = q(z0) q(z_rest) either way, which the exact age grid needs."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import math, time, json, contextlib
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import nimiwae56 as M
 from nimiwae56 import T_MAX, DZ, D_MODEL, COV, sub
+from torch.func import functional_call
+import nimiwae_flow as NF
+FLOW_DEFAULT = dict(layers=6, hidden=64, bins=8, bound=5.0)
 
 SOIL_COLS = [f'soil_{c}' for c in ('clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'cec', 'depth_restriction', 'rock_frag', 'depth_bedrock')]
 NSOIL = len(SOIL_COLS)
@@ -72,10 +77,32 @@ class Static70(M.Static):
 
 class NIMIWAE70(M.NIMIWAE56):
     build = staticmethod(lambda seq, vocab: build(seq, vocab))                             # predictions and stand totals use the joint build
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, age=True):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, age=True, q='gauss', flow=None):
         super().__init__(nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=False, prior_ctx=False)
-        s.age = age
+        assert q in ('gauss', 'flow')
+        s.age, s.qfam = age, q
         s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc, use_af=age); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False)
+        if q == 'flow':                                                                       # D73: z0 (age) stays Gaussian and separate; age off, every dimension flows
+            fc = {**FLOW_DEFAULT, **(flow or {})}; s.f0 = 1 if age else 0
+            s.flow = NF.CondFlow(DZ - s.f0, D_MODEL, layers=fc['layers'], hidden=fc['hidden'], bins=fc['bins'], B=fc['bound'])
+    def enc_params(s):
+        return super().enc_params() + (list(s.flow.parameters()) if s.qfam == 'flow' else [])
+    def sample_z(s, mq, lq, K):
+        """flow: e ~ N(mq, exp(lq)), z = (e_0, T(e_rest; c)); log q(z) = log N(e) - log |dT/de|"""
+        if s.qfam != 'flow': return super().sample_z(mq, lq, K)
+        e = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)
+        zr, ld = s.flow(e[..., s.f0:], s._hq)
+        return torch.cat([e[..., :s.f0], zr], -1), M.NIMIWAE56.log_qz(s, e, mq, lq) - ld
+    def log_qz(s, z, mq, lq, detach=False):
+        """flow: e_rest = T^-1(z_rest; c); log q(z) = log N((z_0, e_rest)) + log |de/dz|. detach: Gaussian, context and flow weights held fixed, z keeps its path (DReG)"""
+        if s.qfam != 'flow': return super().log_qz(z, mq, lq, detach)
+        c = s._hq
+        if detach:
+            mq, lq, c = mq.detach(), lq.detach(), c.detach()
+            er, ld = functional_call(s.flow, {k: v.detach() for k, v in s.flow.named_parameters()}, (z[..., s.f0:], c), dict(inverse=True))
+        else:
+            er, ld = s.flow(z[..., s.f0:], c, inverse=True)
+        return M.NIMIWAE56.log_qz(s, torch.cat([z[..., :s.f0], er], -1), mq, lq) + ld
     def q(s, B):
         return s._cache['q'] if getattr(s, '_cache', None) else super().q(B)
     def p_z(s, B):
@@ -110,7 +137,7 @@ class NIMIWAE70(M.NIMIWAE56):
 def age_posterior(model, B, K=100, G=61, zmax=3.6):
     """Exact posterior of z0 on a grid: [n, G] probabilities. The decoder never reads z0, so the rest of the model is scored once and only the birth limits vary along the grid.
     Importance resampling is not used here: with ESS near 7 of K it moved ages by 0.24 sd where the exact answer is the prior (am. 14). lw divides by q(z0 = g), which the grid replaces, so that term goes back in."""
-    mq, lq = M.NIMIWAE56.q(model, B); g = torch.linspace(-zmax, zmax, G, device=mq.device); rest = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)
+    mq, lq = M.NIMIWAE56.q(model, B); g = torch.linspace(-zmax, zmax, G, device=mq.device); rest = model.sample_z(mq, lq, K)[0]   # flow q: z_rest from the flow (D73)
     zz = rest.clone(); zz[..., 0] = 0.0; model._cache = None; dec = model.decode(zz, B); model._cache = dict(q=(mq, lq), dec=dec)
     c2 = 0.5 * math.log(2 * math.pi); out = []
     try:
@@ -129,9 +156,13 @@ def z_quantiles(g, p, q):
     n_ = torch.arange(cdf.shape[0]); lo, hi = cdf[n_, i - 1], cdf[n_, i]
     return edges[i - 1] + (q_[:, None] - lo) / (hi - lo).clamp(min=1e-12) * step
 
-def make_model(vocab, age=True):
-    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), age=age)
-    m.vocab = vocab; m.cfg = dict(censor='known', growth='flex', noise=False, prior_ctx=False, age=age); return m
+def make_model(vocab, age=True, q='gauss', flow=None):
+    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), age=age, q=q, flow=flow)
+    m.vocab = vocab; m.cfg = dict(censor='known', growth='flex', noise=False, prior_ctx=False, age=age, q=q, **({'flow': {**FLOW_DEFAULT, **(flow or {})}} if q == 'flow' else {})); return m
+
+def model_from_cfg(vocab, cfg):
+    """rebuild a saved model's architecture; checkpoints from before D73 have no 'q' and are Gaussian"""
+    return make_model(vocab, age=cfg['age'], q=cfg.get('q', 'gauss'), flow=cfg.get('flow'))
 
 class ScheduleFreeAdamW:
     """Schedule-Free AdamW (Defazio et al. 2024, arXiv 2405.15682). Three sequences: z takes the Adam step, x is the weighted average of z and the model to evaluate,
@@ -169,12 +200,12 @@ class ScheduleFreeAdamW:
 def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
-def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None):
+def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None):
     assert set(tr.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     B, vocab, _ = build(tr); n = B['v'].shape[0]
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
-    model = make_model(vocab, age=age).to(device)
+    model = make_model(vocab, age=age, q=q, flow=flow).to(device)
     phi = model.enc_params(); pid = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in pid]
     nb_ep = (n + bs - 1) // bs
     if opt_name == 'sf':                                                                     # warmup = the 5 % of steps OneCycleLR uses
@@ -182,7 +213,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * nb_ep, pct_start=0.05, anneal_strategy='cos')
-    log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; prior on {int(B["af_has"].sum()):,} trees; K {k} (DReG); age {age}; device {device}; optimizer {opt_name}')
+    log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; prior on {int(B["af_has"].sum()):,} trees; K {k} (DReG); age {age}; q {q}{" " + json.dumps(model.cfg["flow"]) if q == "flow" else ""}; device {device}; optimizer {opt_name}')
     hist = []
     for ep in range(epochs):
         t0, tot, nb = time.time(), 0.0, 0

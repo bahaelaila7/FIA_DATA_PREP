@@ -246,8 +246,9 @@ def noise_off(seq):
         B, _, _ = M55.build(x, vocab); B['psamp'] = B['sampled'].float()                    # same tensors; the share binarised (am. 6 differs by design)
         with torch.no_grad():
             torch.manual_seed(0); a_ = m55.joint(B, 4); torch.manual_seed(0); b_ = m56.joint(B, 4)
-        d = max(float((a_['lw'] - b_['lw']).abs().max()), float((torch.exp(a_['lpost']) - torch.exp(b_['lpost'])).abs().max()))
-        check(f'[{censor}+{growth}] N1 noise off reproduces D55 exactly (same tensors, binary sampling)', d < 1e-5, f'max |Δ| {d:.1e}')
+        # lw relative to its scale: an untrained model gives |lw| ~ 6e4 on some D72 trees, where float32 spacing is 4e-3 (2 ulps failed the old absolute 1e-5)
+        d = max(float((a_['lw'] - b_['lw']).abs().max()) / max(1.0, float(a_['lw'].abs().max())), float((torch.exp(a_['lpost']) - torch.exp(b_['lpost'])).abs().max()))
+        check(f'[{censor}+{growth}] N1 noise off reproduces D55 exactly (same tensors, binary sampling)', d < 1e-5, f'max |Δ| (lw relative) {d:.1e}')
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); a = ap.parse_args()

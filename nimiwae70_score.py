@@ -14,7 +14,7 @@ def reliability(p, y, nmin=200):
     return dict(n=int(len(p)), brier=float(np.mean((p - y) ** 2)), base_rate=float(y.mean()) if len(y) else None, cells=cells, pass_=passed)
 
 def load(d, name='model.pt'):
-    ck = torch.load(f'{d}/{name}', weights_only=False, map_location='cpu'); m = A.make_model(ck['vocab'], age=ck['cfg']['age']); m.load_state_dict(ck['state']); m.eval(); return m, ck
+    ck = torch.load(f'{d}/{name}', weights_only=False, map_location='cpu'); m = A.model_from_cfg(ck['vocab'], ck['cfg']); m.load_state_dict(ck['state']); m.eval(); return m, ck
 
 def med(x): return float(np.median(x)) if len(x) else None
 

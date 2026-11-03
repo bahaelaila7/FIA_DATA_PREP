@@ -140,6 +140,53 @@ for t_ in range(1500):
     i_ = torch.randint(0, 40, (8,)); s3.zero_grad(); ((A_[i_] @ p3 - y_[i_]) ** 2).mean().backward(); s3.step()
 s3.finish(); ls_ = torch.linalg.lstsq(A_, y_[:, None]).solution[:, 0]
 check('it converges on noisy least squares; finish() leaves x', float((p3.detach() - ls_).norm()) < 0.1 and float((p3.detach() - s3.x[0]).abs().max()) == 0.0, f"{float((p3.detach() - ls_).norm()):.3f} from the solution")
+# 16. D73 flow q: the spline and the flow against autograd; at initialisation the flow q is the Gaussian q; DReG with detached flow weights; z0 stays separate
+import nimiwae_flow as NF
+torch.manual_seed(11); xs = torch.linspace(-6.5, 6.5, 401, dtype=torch.float64).repeat(3, 1).requires_grad_(True); uw, uh, ud = ((torch.randn(3, 1, n_, dtype=torch.float64) * 2).expand(-1, 401, -1) for n_ in (8, 8, 7))   # one spline per row; float64: a formula check (float32 loses 1e-3 where the slope is 1e-4, the flow checks below run float32)
+ys, ldf = NF.rq_spline(xs, uw, uh, ud); dy = torch.autograd.grad(ys.sum(), xs)[0]; xb, ldi = NF.rq_spline(ys.detach(), uw, uh, ud, inverse=True)
+check('spline: log dy/dx = autograd derivative', float((ldf - torch.log(dy)).abs().max()) < 1e-9, f'{float((ldf - torch.log(dy)).abs().max()):.1e}')
+check('spline: inverse(forward(x)) = x and the log-derivatives cancel', float((xb - xs).abs().max()) < 1e-9 and float((ldf + ldi).abs().max()) < 1e-9, f'{float((xb - xs).abs().max()):.1e} {float((ldf + ldi).abs().max()):.1e}')
+check('spline: monotone, identity outside [-B, B]', bool((ys[:, 1:] > ys[:, :-1]).all()) and float((ys - xs)[xs.abs() >= 5].abs().max()) == 0.0)
+check('spline: zero parameters are the identity', float((NF.rq_spline(xs, torch.zeros_like(uw), torch.zeros_like(uh), torch.full_like(ud, NF.D_ID))[0] - xs).abs().max()) < 1e-9)
+fl = NF.CondFlow(7, 5, layers=4, hidden=16, bins=6)
+with torch.no_grad():
+    for L_ in fl.layers: L_.net[-1].weight.normal_(0, 0.5); L_.net[-1].bias.normal_(0, 0.5)
+e7, c5 = torch.randn(3, 7) * 2, torch.randn(3, 5); z7, ld7 = fl(e7, c5); e7b, ldi7 = fl(z7, c5, inverse=True)
+J = [torch.autograd.functional.jacobian(lambda x: fl(x[None], c5[i:i + 1])[0][0], e7[i]) for i in range(3)]
+ldJ = torch.stack([torch.linalg.slogdet(j)[1] for j in J])
+check('flow: log |dT/de| = log |det| of the autograd Jacobian', float((ld7 - ldJ).abs().max()) < 1e-3, f'{float((ld7 - ldJ).abs().max()):.1e}')
+check('flow: inverse(T(e)) = e, log-determinants cancel', float((e7b - e7).abs().max()) < 1e-3 and float((ld7 + ldi7).abs().max()) < 1e-3)
+def model_q(q, age=True, perturb=False):
+    torch.manual_seed(0); m_ = A.NIMIWAE70(3, 3, 3, 3, 3, age=age, q=q)
+    if perturb:
+        with torch.no_grad():
+            for L_ in m_.flow.layers: L_.net[-1].weight.normal_(0, 0.3); L_.net[-1].bias.normal_(0, 0.3)
+    return m_
+mg, mfl = model_q('gauss'), model_q('flow'); B16 = batch()
+with torch.no_grad():
+    torch.manual_seed(7); og = mg.joint(B16, 8); torch.manual_seed(7); of = mfl.joint(B16, 8)
+check('flow at initialisation = the Gaussian q: same draws, same weights', float((og['z'] - of['z']).abs().max()) < 1e-4 and float((og['lw'] - of['lw']).abs().max()) < 1e-3, f"{float((og['lw'] - of['lw']).abs().max()):.1e}")
+mfp = model_q('flow', perturb=True)
+with torch.no_grad():
+    torch.manual_seed(7); op = mfp.joint(B16, 8, dreg=True); mq16, lq16 = mfp.q(B16)
+    torch.manual_seed(7); zs16, lqs16 = mfp.sample_z(mq16, lq16, 8)
+    check('flow: z0 is the Gaussian draw, untouched', float((op['z'][..., 0] - og['z'][..., 0]).abs().max()) < 1e-5)
+    check('flow: the other dimensions move', float((op['z'][..., 1:] - og['z'][..., 1:]).abs().max()) > 1e-2)
+    check('flow: density of own draws (forward) = density at given z (inverse)', float((lqs16 - mfp.log_qz(zs16, mq16, lq16)).abs().max()) < 1e-3, f'{float((lqs16 - mfp.log_qz(zs16, mq16, lq16)).abs().max()):.1e}')
+    check('flow: the DReG weights equal the weights in value', float((op['lw'] - op['lw_dreg']).abs().max()) < 1e-3)
+    torch.manual_seed(9); oz = mfp.joint(B16, 8, z=op['z'])
+    check('flow: joint scores given draws', float((oz['lw'] - op['lw']).abs().max()) < 1e-3)
+fid = {id(p) for p in mfp.flow.parameters()}; check('flow weights are encoder parameters', fid <= {id(p) for p in mfp.enc_params()})
+mfp.zero_grad(); torch.manual_seed(7); od = mfp.joint(B16, 8, dreg=True); wt = torch.softmax(od['lw'], 0).detach(); (-(wt ** 2 * od['lw_dreg']).sum(0).mean()).backward()
+check('flow: the DReG surrogate trains the flow (through z)', sum(float(p.grad.abs().sum()) for p in mfp.flow.parameters() if p.grad is not None) > 0)
+mq16, lq16 = mfp.q(B16); check('flow: the DReG density holds every q parameter fixed (no graph without z)', not mfp.log_qz(od['z'].detach(), mq16, lq16, detach=True).requires_grad and mfp.log_qz(od['z'].detach(), mq16, lq16).requires_grad)
+mfx = model_q('flow', perturb=True); mfx.eval(); Bx16 = batch(); Bx16['la'][:] = 0; Bx16['f'][:] = 0; Bx16['af_mu'][:] = math.log(60.0); Bx16['af_sd'][:] = 0.3
+gq, pq = A.age_posterior(mfx, Bx16, K=16); zq16 = A.z_quantiles(gq, pq, [0.1, 0.5, 0.9])
+check('flow: no birth limit, the grid posterior is still the prior (q factorises)', float(zq16[1].abs().max()) < 0.02 and float((zq16[2] - 1.2816).abs().max()) < 0.03, f'{[round(float(zq16[i, 0]), 3) for i in range(3)]}')
+check('flow, age off: every dimension flows', model_q('flow', age=False).f0 == 0 and model_q('flow').f0 == 1)
+voc = {k: [0, 1, 2] for k in ('spgrpcd', 'epa_l3', 'major_spgrpcd', 'spcd')}; voc['fortypcd'] = [0, 1]
+ms_ = A.make_model(voc, q='flow', flow=dict(layers=4)); mr_ = A.model_from_cfg(voc, ms_.cfg); mr_.load_state_dict(ms_.state_dict())
+check('flow: a checkpoint rebuilds from its cfg', mr_.qfam == 'flow' and len(mr_.flow.layers) == 4 and A.model_from_cfg(voc, dict(age=True)).qfam == 'gauss')
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()

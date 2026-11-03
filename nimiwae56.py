@@ -235,6 +235,14 @@ class NIMIWAE56(nn.Module):
         """log P(no record) at a sampled, unrecorded slot: the spot was sampled with probability p_s, and a sampled tree is missed only below the limit"""
         psc = ps.clamp(1e-6, 1 - 1e-6)                                                               # both where-branches finite (gradients)
         return torch.where(ps >= 1, F.logsigmoid(-xt), torch.logaddexp(torch.log(psc) + F.logsigmoid(-xt), torch.log1p(-psc)))
+    def sample_z(s, mq, lq, K):
+        """K draws from q(z | x) and their log density: (z [K, n, DZ], log q [K, n]). D73 hook; base: the diagonal Gaussian."""
+        z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)
+        return z, s.log_qz(z, mq, lq)
+    def log_qz(s, z, mq, lq, detach=False):
+        """log q(z | x) [K, n] at given z. detach: the q parameters held fixed while z keeps its path (the DReG density)."""
+        if detach: mq, lq = mq.detach(), lq.detach()
+        return (-0.5 * (z - mq) ** 2 / torch.exp(lq) - 0.5 * lq - 0.5 * math.log(2 * math.pi)).sum(-1)
     def enc_params(s):
         mods = (s.st_q, s.ercd, s.ecc, s.qin, s.qtr, s.qout) + ((s.u_net,) if s.noise else ())
         return [p for m in mods for p in m.parameters()]
@@ -259,7 +267,7 @@ class NIMIWAE56(nn.Module):
         h = s.qin(x); cls = s.st_q(B)[:, None]
         pad = torch.cat([torch.zeros_like(B['v'][:, :1]), 1 - B['v']], 1).bool()
         oo = s.qtr(torch.cat([cls, h], 1), src_key_padding_mask=pad)
-        mu, lv = s.qout(oo[:, 0]).chunk(2, -1); s._hs = oo[:, 1:]                                    # per-slot states for encoder 2
+        mu, lv = s.qout(oo[:, 0]).chunk(2, -1); s._hs = oo[:, 1:]; s._hq = oo[:, 0]                  # per-slot states for encoder 2; tree state for a flow q (D73)
         return mu, lv.clamp(-8, 4)
     def p_z(s, B):
         tok = s.st_p(B)
@@ -303,7 +311,8 @@ class NIMIWAE56(nn.Module):
     def joint(s, B, K, dreg=False, z=None):
         """-> log weights lw [K, n], log posterior over (e, f) [K, n, E, 2], latent paths D, H [K, n, T], existence step p1."""
         mq, lq = s.q(B); hs = s._hs; mp, lp = s.p_z(B)
-        if z is None: z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)   # z given: score those draws (D70 age grid)
+        if z is None: z, lqz = s.sample_z(mq, lq, K)                                              # D73 hook: Gaussian or flow q
+        else: lqz = s.log_qz(z, mq, lq)                                                             # z given: score those draws (D70 age grid)
         c2 = 0.5 * math.log(2 * math.pi)
         u, lpu, lqu = None, 0.0, 0.0
         if s.noise:
@@ -374,17 +383,15 @@ class NIMIWAE56(nn.Module):
         lcl = (torch.log_softmax(cll, -1).gather(-1, B['cl'][None, ..., None].expand(K, -1, -1, 1))[..., 0] * B['m_cl'][None]).sum(-1)
         lrec = lcr + lcc + ldm + lbk + lcl
         lpz = (-0.5 * (z - mp) ** 2 / torch.exp(lp) - 0.5 * lp - c2).sum(-1)
-        lqz = (-0.5 * (z - mq) ** 2 / torch.exp(lq) - 0.5 * lq - c2).sum(-1)
         lxt = s.extra_lw(lDp, z, B, mp, lp)                                                             # D70 hook; base model: 0
         lw = lpx + lrec + lpz - lqz + lpu - lqu + lxt
         out = dict(lw=lw, lpost=lj - lpx[..., None, None], D=D, H=H, p1=torch.exp(lp1), lsdisc=s.lsdisc, z=z, u=u, born=born)
         if dreg:
-            mqd, lqd = mq.detach(), lq.detach()
             lqu_d = 0.0
             if s.noise:                                                                               # stop-gradient on encoder-2 weights and slot states; z keeps its path
                 muu_d, lvu_d = s.qu(hs.detach(), z, params={k: v.detach() for k, v in s.u_net.named_parameters()})
                 lqu_d = ((-0.5 * (u - muu_d) ** 2 / torch.exp(lvu_d) - 0.5 * lvu_d - c2) * B['v'][None, :, :, None]).sum((-1, -2))
-            out['lw_dreg'] = lpx + lrec + lpz - (-0.5 * (z - mqd) ** 2 / torch.exp(lqd) - 0.5 * lqd - c2).sum(-1) + lpu - lqu_d + lxt
+            out['lw_dreg'] = lpx + lrec + lpz - s.log_qz(z, mq, lq, detach=True) + lpu - lqu_d + lxt
         return out
 
 def make_model(vocab, censor='known', growth='flex', noise=True, prior_ctx=False):
