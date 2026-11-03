@@ -684,6 +684,18 @@ if a.simb_db:
     check_n("(n17) E9: Sim B rows = raw DRYBIO_AG x TPA_UNADJ of the real live >= 5 in members (one row per cohort key, both directions)",
             r[1] == 0 and r[2] == 0 and r[3] == 0, r[0], f"({r[0]:,} keys; raw-only {r[1]}, product-only {r[2]}, duplicate/AGB differ {r[3]})")
 
+# D72: lineage segments re-derived from raw PLOT (a segment starts at KINDCD 1 / 3 or a DESIGNCD change after a plot's first annual visit)
+con.execute(f"""CREATE TEMP TABLE vseg AS
+SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR,
+       sum(CASE WHEN k > 1 AND (KINDCD IN (1, 3) OR DESIGNCD IS DISTINCT FROM pd) THEN 1 ELSE 0 END)
+           OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY md, INVYR ROWS UNBOUNDED PRECEDING) seg
+FROM (SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.KINDCD, P.DESIGNCD, x.md,
+             lag(P.DESIGNCD) OVER w pd, row_number() OVER w k
+      FROM f.PLOT P JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
+      CROSS JOIN LATERAL (SELECT MAKE_DATE(CAST(P.MEASYEAR AS INTEGER), COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md) x
+      WHERE {scope('P')}
+      WINDOW w AS (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY x.md, P.INVYR))""")
+con.execute("CREATE TEMP TABLE rvs AS SELECT rv.*, v.seg FROM rv JOIN vseg v USING (STATECD, UNITCD, COUNTYCD, PLOT, INVYR)")
 # ---- r7 E6: phantom COMPLETENESS — the allowed slot set re-derived (debut x earlier raw scaffold
 # visits with prior_age >= 1, minus the D-rule blocks) equals the phantoms, in both directions -----
 con.execute(f"""CREATE TEMP TABLE tdeb AS
@@ -699,8 +711,14 @@ for _lab, _act, _rc in (
                                       "FROM new.tree_trajectories WHERE intro_type='phantom_backfill'", False),
         ("Sim A tree-pass phantoms (phantom_tree_sources)", "SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, prior_measdate p "
                                                             "FROM new.phantom_tree_sources", True)):
-    con.execute(f"""CREATE OR REPLACE TEMP TABLE expv AS SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, p FROM ({block_reasons("SELECT * FROM cand", _rc)})
-                    WHERE NOT (r_a OR r_n OR r_b OR r_c OR r_z OR no_debut)""")
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE expv AS SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, p FROM ({block_reasons("SELECT * FROM cand", _rc)}) x
+                    WHERE NOT (r_a OR r_n OR r_b OR r_c OR r_z OR no_debut)
+                      AND (SELECT any_value(v.seg) FROM rvs v WHERE v.STATECD = x.STATECD AND v.UNITCD = x.UNITCD AND v.COUNTYCD = x.COUNTYCD
+                           AND v.PLOT = x.PLOT AND v.SUBP = x.SUBP AND v.md = x.p)
+                        IS NOT DISTINCT FROM (SELECT any_value(v.seg) FROM rvs v JOIN tdeb d ON d.STATECD = v.STATECD AND d.UNITCD = v.UNITCD
+                           AND d.COUNTYCD = v.COUNTYCD AND d.PLOT = v.PLOT AND d.SUBP = v.SUBP AND v.md = d.dmd
+                           WHERE d.STATECD = x.STATECD AND d.UNITCD = x.UNITCD AND d.COUNTYCD = x.COUNTYCD AND d.PLOT = x.PLOT
+                           AND d.SUBP = x.SUBP AND d.TREE = x.TREE)   -- D72: never across a lineage segment start""")
     r = con.execute(f"""WITH act AS ({_act})
         SELECT (SELECT count(*) FROM expv), (SELECT count(*) FROM act WHERE {scope()}),
                (SELECT count(*) FROM (SELECT * FROM expv EXCEPT SELECT * FROM act)),
@@ -801,18 +819,6 @@ con.execute(f"""CREATE TEMP TABLE rlx AS {_rekey(f'''
     FROM f.TREE T JOIN f.PLOT P ON P.CN = T.PLT_CN JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
     JOIN f.COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
     WHERE T.STATUSCD = 1 AND T.SUBP <= 4 AND C.COND_STATUS_CD IN (2, 3, 4) AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y' AND {scope('T')}''', 'md')}""")
-# D72: lineage segments re-derived from raw PLOT (a segment starts at KINDCD 1 / 3 or a DESIGNCD change after a plot's first annual visit)
-con.execute(f"""CREATE TEMP TABLE vseg AS
-SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR,
-       sum(CASE WHEN k > 1 AND (KINDCD IN (1, 3) OR DESIGNCD IS DISTINCT FROM pd) THEN 1 ELSE 0 END)
-           OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY md, INVYR ROWS UNBOUNDED PRECEDING) seg
-FROM (SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.KINDCD, P.DESIGNCD, x.md,
-             lag(P.DESIGNCD) OVER w pd, row_number() OVER w k
-      FROM f.PLOT P JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
-      CROSS JOIN LATERAL (SELECT MAKE_DATE(CAST(P.MEASYEAR AS INTEGER), COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md) x
-      WHERE {scope('P')}
-      WINDOW w AS (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY x.md, P.INVYR))""")
-con.execute("CREATE TEMP TABLE rvs AS SELECT rv.*, v.seg FROM rv JOIN vseg v USING (STATECD, UNITCD, COUNTYCD, PLOT, INVYR)")
 # D72: a tree alive at its last record whose next visit starts a new segment is censored (lineage_break); one removed only where a later
 # visit of its own segment had forest in its own tally area (microplot below 5 in, else subplot), dated at the first such visit; else
 # censored_unobserved
