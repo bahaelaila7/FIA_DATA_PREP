@@ -28,7 +28,7 @@ def bound(m, B, k, dev, bs=512):
 def run(a):
     d = f'{a.out}/f{a.fold}_age{a.age}'; os.makedirs(d, exist_ok=True)
     if os.path.exists(f'{d}/done.json'): print('already done', d); return
-    seq = pd.read_parquet(f'{a.data}/seq.parquet'); tr = seq[seq.split == 'train']; del seq
+    tr = pd.read_parquet(f'{a.data}/seq.parquet', filters=[('split', '==', 'train')])       # TRAIN rows only: several runs load this at once
     site, planted = pd.read_parquet(f'{a.data}/site_refs.parquet'), pd.read_parquet(f'{a.data}/planted_refs.parquet')
     held_k, mon_k, fit_k = split_plots(sorted(tr.plot_key.unique()), a.fold)
     held, mon, fit = (tr[tr.plot_key.isin(set(x))] for x in (held_k, mon_k, fit_k))
