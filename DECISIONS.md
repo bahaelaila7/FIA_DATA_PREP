@@ -1893,6 +1893,16 @@ After the code-read review (`docs/SEMANTIC_REVIEW_2026-11-03.md`) the user asked
 - **Model (M1):** no short-tree factor; the design rule's "sampled, no record" term is log(1 - p_s g_t sigma(x_t)), g_t = P(at breast height). The observation model is listed once in the `nimiwae70` docstring.
 - **Checks:** verifier n20 re-derives the end rules independently (segments from raw PLOT); n27: no phantom on another segment; audit F15-F18: every live record a real slot, every slot in its tree's segment, inferred removals where the tally area was sampled, cuts end as cuts in the frame.
 - **Rebuild:** R4 into a new truth DB (`FIA/truth/fia_truth_r4_d72.duckdb`); the live DB stays until the regression is read.
+- **Measured on R4 (rebuild 2026-11-03; `docs/D72_REGRESSION.md`, `fia_truth_d72_regression.py`).** Verifier 217 / 217, lint clean, audit 51 / 51 (F15-F18 pass; 2 trees end on the dead-record fallback, F18b).
+  - curated_trees: every record and every column identical; final_tree_fate identical for every tree.
+  - C1: all 2,001 segment starts are KINDCD 1 re-installations (no KINDCD 3, no DESIGNCD change). FIA closes every tree alive before one (mostly RECONCILECD 9), so no tree ends `censored_lineage_break`. Effect = slots and phantoms on the earlier segment: 17,315 trajectory phantoms, 1,109 Sim A / stdorg cohort phantoms (1,491 tree-pass sources), 41,910 frame slots (21,213 pre, 20,697 post). Knock-on: trajectories' plot / subplot visit counts on 790 / 2,083 rows, `land_use_4way` on 2 plots (a mode over trajectory rows), cohort_disturbance +8 full removals.
+  - C3: 21 inferred removals before and after; none becomes `censored_unobserved`. The frame now dates them at the visit that sampled the spot.
+  - C7: no frame cause changes: every land-clearing cut record in R4 carries AGENTCD 80.
+  - C8: 0 (curated live records = trajectory real rows = 3,729,318).
+  - C2: no E1 mask changes beyond the removed slots.
+  - subp_has_dstrb unchanged on every subplot (Sim A and Sim B).
+  - The review overstated C3, C7 and C8 for R4; they stay fixed so other regions or later data cannot hit them.
+- **Next run:** `FIA/nimiwae_r8/d72`, both arms retrained (the frame changed), `out/cv72`; the age-off checkpoints of `out/cv` are not reused.
 
 **D69 amendment 2 (2026-11-01): the id change on the regional fit.** Am. 1 guessed a regional fit would move less. It moved more. Step 2 rerun on the same data with only `natural_record_id` changed: natural saplings under 5 in +0.58 yr mean, 0.84 mean absolute, 3.4 at the 99th percentile (596,563 records); natural 5+ in -0.01, 0.18; planted under 5 in -0.08, 0.34; planted 5+ in 0.00, 0.10. No estage age changes. The data changes of steps 2-3 alone move natural saplings -0.09 yr. Out-of-fold errors are unchanged, because those saplings are not scored. Reading: natural sapling ages sit outside the model's training sizes, so they depend on the bootstrap draw by about half a year. They are not stable values; the joint age model (D70) replaces them.
 

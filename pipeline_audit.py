@@ -79,11 +79,14 @@ def frame(c, seq):
         WHERE q.terminal_fate = 'disappeared_inferred_removal' AND q.measdate = q.dead_md""")
     check('F17 an inferred removal ends where the tree\'s own tally area was sampled (C3)', r[1] == 0 and r[0] > 0, r)
     if 'end_cause' in seq:
-        r = one(c, """WITH f AS (SELECT DISTINCT statecd, unitcd, countycd, plot, subp, tree, end_cause FROM _sq WHERE dead_md IS NOT NULL)
-            SELECT count(*), count(*) FILTER (WHERE (te.cause = 'cut') IS DISTINCT FROM (f.end_cause = 'cut')),
-                   count(*) FILTER (WHERE te.end_reason = 'diverted_landuse' AND te.end_kind = 'cut' AND f.end_cause IS DISTINCT FROM 'cut')
+        r = one(c, """WITH f AS (SELECT DISTINCT statecd, unitcd, countycd, plot, subp, tree, end_cause, dead_md FROM _sq WHERE dead_md IS NOT NULL)
+            SELECT count(*) FILTER (WHERE f.dead_md = te.end_measdate),
+                   count(*) FILTER (WHERE f.dead_md = te.end_measdate AND (te.cause = 'cut') IS DISTINCT FROM (f.end_cause = 'cut')),
+                   count(*) FILTER (WHERE f.dead_md = te.end_measdate AND te.end_reason = 'diverted_landuse' AND te.end_kind = 'cut' AND f.end_cause IS DISTINCT FROM 'cut'),
+                   count(*) FILTER (WHERE f.dead_md IS DISTINCT FROM te.end_measdate)
             FROM f JOIN tree_end te ON te.STATECD = f.statecd AND te.UNITCD = f.unitcd AND te.COUNTYCD = f.countycd AND te.PLOT = f.plot AND te.SUBP = f.subp AND te.TREE = f.tree""")
-        check('F18 every cut ends as a cut in the frame, land clearing included (C7)', r[1] == 0 and r[2] == 0, r)
+        check('F18 every cut ends as a cut in the frame, land clearing included (C7)', r[1] == 0 and r[2] == 0 and r[0] > 0, r[:3])
+        print(f'INFO  F18b trees ending on the fallback (tree_end ends before the last live record, a data error): {r[3]:,}')
     c.unregister('_sq')
     banned = [x_ for x_ in seq.columns if x_.lower() in ('stdage', 'fldage', 'estimated_age', 'age_from_stdage')]; check('F14 no STDAGE or curated age column in the frame', not banned, banned)
 

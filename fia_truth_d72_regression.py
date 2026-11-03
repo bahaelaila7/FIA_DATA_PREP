@@ -59,7 +59,8 @@ def main():
         if t not in (to & tn):
             continue
         L += ["", f"## {t}: rows by intro_type", "", "| intro_type | old | new | only old | only new |", "|---|---|---|---|---|"]
-        for row in c.execute(f"""WITH x AS (SELECT DISTINCT {kk}, intro_type it FROM o.main.{t}), y AS (SELECT DISTINCT {kk}, intro_type it FROM n.main.{t})
+        kk2 = kk.replace(", intro_type", ", COALESCE(intro_type, 'real') AS intro_type")     # a NULL intro_type (real rows) must match itself
+        for row in c.execute(f"""WITH x AS (SELECT DISTINCT {kk2}, COALESCE(intro_type, 'real') it FROM o.main.{t}), y AS (SELECT DISTINCT {kk2}, COALESCE(intro_type, 'real') it FROM n.main.{t})
             SELECT COALESCE(x.it, y.it), count(x.it), count(y.it), count(*) FILTER (WHERE y.it IS NULL), count(*) FILTER (WHERE x.it IS NULL)
             FROM x FULL JOIN y USING ({kk}) GROUP BY 1 ORDER BY 1""").fetchall():
             L.append(f"| {row[0]} | {row[1]:,} | {row[2]:,} | {row[3]:,} | {row[4]:,} |")

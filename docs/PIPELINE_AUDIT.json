@@ -152,7 +152,27 @@
  {
   "name": "F13 move_invyr only on plots with a flagged move",
   "ok": true,
-  "detail": "(16891, 16891)"
+  "detail": "(16521, 16521)"
+ },
+ {
+  "name": "F15 every curated live record is a real slot (C8)",
+  "ok": true,
+  "detail": "(3729318, 3729318)"
+ },
+ {
+  "name": "F16 every slot lies in its tree's lineage segment (C1)",
+  "ok": true,
+  "detail": "(6943790, 0)"
+ },
+ {
+  "name": "F17 an inferred removal ends where the tree's own tally area was sampled (C3)",
+  "ok": true,
+  "detail": "(21, 0)"
+ },
+ {
+  "name": "F18 every cut ends as a cut in the frame, land clearing included (C7)",
+  "ok": true,
+  "detail": "(632863, 0, 0)"
  },
  {
   "name": "F14 no STDAGE or curated age column in the frame",
@@ -212,7 +232,7 @@
  {
   "name": "M3 log weights are finite on real data",
   "ok": true,
-  "detail": "-3330.13134765625"
+  "detail": "-3328.63037109375"
  },
  {
   "name": "M4 gradients are finite",
@@ -232,6 +252,6 @@
  {
   "name": "M7 the E1 rule removes FALSE labels",
   "ok": true,
-  "detail": "base 4732, joint 3535, masked slots 5495"
+  "detail": "base 4723, joint 3534, masked slots 5244"
  }
 ]

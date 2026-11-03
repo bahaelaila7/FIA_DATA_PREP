@@ -18,6 +18,8 @@ Severity: **H** wrong result on real data · **M** wrong in a definable case, or
 
 Counts for C1, C3, C7 and C8 need one query each on the truth DB; nothing was run for this review.
 
+**Measured after the D72 fixes (DECISIONS D72):** in R4 only C1 changes data (41,910 frame slots, 18,424 phantoms; no tree is cut off because FIA closes trees at re-installation); C3 (21 removals, none unobserved), C7 (all clearing cuts have AGENTCD 80), C8 (0) and C2 have no effect. M1 is the substantive change.
+
 ## Order
 1. Model: `nimiwae70.py`, `nimiwae56.py` (joint, build, impute, sample_lineages) — done, see M1.
 2. Frame: `nimiwae_prep.py`
