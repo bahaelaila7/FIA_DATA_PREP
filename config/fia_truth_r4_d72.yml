@@ -1,0 +1,9 @@
+# FIA Truth, EPA Region 4 (D59). Paths are relative to $WORKSPACE (the parent of FIA/ unless set).
+region: r4
+states: [1, 12, 13, 21, 28, 37, 45, 47]        # AL FL GA KY MS NC SC TN
+fiadb: FIA/FIASQLITE2PGSQL/FIADB.duckdb        # read-only; only this pipeline may read it
+estage_dir: FIA/TreeAge/14775738
+work_dir: FIA/truth/r4_d72                         # curated.duckdb, simB.duckdb, logs
+output: FIA/truth/fia_truth_r4_d72.duckdb
+threads: 8
+memory: 16GB
