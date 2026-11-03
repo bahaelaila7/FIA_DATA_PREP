@@ -97,6 +97,19 @@ zz9 = torch.zeros(1, 6, M.DZ); aa = tall.ages(zz9, B9); neg = (aa < 0) & (B9['v'
 small = torch.full((1, 6, M.T_MAX), math.log(0.2)); big = torch.full((1, 6, M.T_MAX), math.log(3.0)); mp0 = torch.zeros(6, M.DZ); lp0 = torch.zeros(6, M.DZ)
 check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, mp0, lp0) - tall.extra_lw(big, zz9, B9, mp0, lp0)).min()) > 0 or not bool(neg.any()), f'{int(neg.sum())} unborn slots')
 zg = torch.zeros(1, 6, M.DZ, requires_grad=True); (tall.extra_lw(big, zg, B9, mp0, lp0)).sum().backward(); check('the unborn term reaches z0', float(zg.grad[..., 0].abs().sum()) > 0)
+# 15. the exact age posterior: no slot before the first record means the prior, whatever the draws; a limit moves it
+mx = model(); Bx = batch(); Bx['la'][:] = 0; Bx['f'][:] = 0; Bx['af_mu'][:] = math.log(60.0); Bx['af_sd'][:] = 0.3; mx.eval()
+torch.manual_seed(4); ox = mx.joint(Bx, 6); zx = ox['z'].detach()
+torch.manual_seed(9); oy = mx.joint(Bx, 6, z=zx)
+check('joint scores given draws: same draws, same weights', float((ox['lw'] - oy['lw']).abs().max()) < 1e-3, f"{float((ox['lw'] - oy['lw']).abs().max()):.1e}")
+gx, px = A.age_posterior(mx, Bx, K=16); zq = A.z_quantiles(gx, px, [0.1, 0.5, 0.9])
+check('no birth limit: the grid posterior is the prior for every tree', float((zq[1]).abs().max()) < 0.02 and float((zq[2] - 1.2816).abs().max()) < 0.03 and float((zq[0] + 1.2816).abs().max()) < 0.03, f'{[round(float(zq[i, 0]), 3) for i in range(3)]}')
+check('the grid leaves no state behind', getattr(mx, '_cache', None) is None)
+Bl = batch(); Bl['la'][:] = 4; Bl['f'][:] = 4; Bl['af_mu'][:] = math.log(4.0); Bl['af_sd'][:] = 0.5; Bl['ev'][:, 2:4] = M.EV['true_soft']; Bl['real'][:, 2:4] = 0; Bl['mD'][:, 2:4] = 0
+Bl['real'][:, 4] = 1; Bl['mD'][:, 4] = 1; Bl['lD'][:, 4] = math.log(3.0); Bl['ev'][:, 4] = M.EV['true_hard']
+gl, pl_ = A.age_posterior(mx, Bl, K=16); zl = A.z_quantiles(gl, pl_, [0.1, 0.5, 0.9])
+check('a birth limit moves the posterior older', float(zl[1].min()) > 0.2, f'median z0 {float(zl[1].min()):.2f}')
+tq = A.z_quantiles(torch.linspace(-1, 1, 3), torch.tensor([[0.25, 0.5, 0.25]]), [0.25, 0.5, 0.75]); check('grid quantiles against a hand case', float((tq[:, 0] - torch.tensor([-0.5, 0.0, 0.5])).abs().max()) < 1e-5, f'{tq[:, 0].tolist()}')
 # 10. E1 mask: only slots before the move, only trees first recorded at or after it
 s_ = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1, 2, 2, 2, 3, 3], 'invyr': [2002, 2007, 2012, 2002, 2007, 2012, 2002, 2007],
                    'slot_kind': ['pre', 'pre', 'real', 'real', 'real', 'post', 'pre', 'real'], 'move_invyr': [2007, 2007, 2007, 2007, 2007, 2007, np.nan, np.nan]})
@@ -132,4 +145,9 @@ if len(sys.argv) > 1:
     mf = A.make_model(vf); af = mf.ages(zf, Bf).detach()[0].numpy(); ti, po = sf_._tid.to_numpy(), sf_._pos.to_numpy(); sa = sf_.assign(a=af[ti, po], yr=(pd.to_datetime(sf_.measdate) - pd.Timestamp('2000-01-01')) / pd.Timedelta(days=365.25))
     r_ = sa.groupby(M.K_).apply(lambda g: float(((g.a - g.a.iloc[0]) - (g.yr - g.yr.iloc[0])).abs().max()), include_groups=False).max()
     check('frame: age steps equal elapsed time from the dates', r_ < 0.01, f'max error {r_:.4f} yr')
+p4 = torch.nn.Parameter(torch.tensor([3.0, -2.0])); s4 = A.ScheduleFreeAdamW([p4], lr=0.1, wd=0.0, warmup=1)
+for t_ in range(5): s4.zero_grad(); (0.5 * (p4 ** 2).sum()).backward(); s4.step()
+y4 = p4.detach().clone()
+with s4.averaged(): inside = float((p4.detach() - s4.x[0]).abs().max())
+check('scoring mid-run reads x and gives y back', inside == 0.0 and float((p4.detach() - y4).abs().max()) == 0.0)
 print('checks:', sum(o for _, o in RES), 'of', len(RES)); sys.exit(0 if all(o for _, o in RES) else 1)

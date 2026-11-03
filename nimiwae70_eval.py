@@ -5,20 +5,7 @@ import sys, os, json, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pandas as pd, torch, duckdb
 import nimiwae56 as M, nimiwae70 as A
-from nimiwae54_ncv import reliability
-
-def load(d):
-    ck = torch.load(f'{d}/model.pt', weights_only=False); m = A.make_model(ck['vocab'], age=ck['cfg']['age']); m.load_state_dict(ck['state']); m.eval(); return m, ck
-
-def completion(m, val, seed=0):
-    """size error on the hidden visits, E1 on the same lineages under '< limit only', E2 and E3 on censored ends"""
-    torch.manual_seed(seed); out = {}
-    h, _ = M.predictions(m, M.bench_sizes(val)); hh = h[h.hidden & h.dia.notna() & h.nim_lD.notna()]; out['mae_lD'] = float((hh.nim_lD - np.log(hh.dia)).abs().mean())
-    x1, _ = M.predictions(m, M.bench_sizes(val, interval=False)); x1 = x1[x1.truth_E.notna()]; r1 = reliability(x1.nim_pE, x1.truth_E); out['E1'] = r1['brier']; out['E1_n'] = r1['n']; out['E1_base'] = r1['base_rate']
-    assert 0 < r1['base_rate'] < 1, 'E1 benchmark needs both TRUE and FALSE labels'
-    b = M.bench_end(val); e, _ = M.predictions(m, b); x = e[e.truth_E.notna()]; out['E2'] = reliability(x.nim_pE, x.truth_E)['brier']
-    g = x[x.truth_E == 0]; g = g[g.truth_cut.notna()]; out['E3'] = reliability(g.nim_pCut / (g.nim_pCut + g.nim_pDie).clip(lower=1e-9), g.truth_cut)['brier']
-    return out
+from nimiwae70_score import load, completion, lineage_age, med
 
 def linked(c, seq_val):
     """R4 site trees tied to a tally record by exact DIA and exact height, one-to-one; D70 am. 4: scoring only"""
@@ -31,21 +18,6 @@ def linked(c, seq_val):
         SELECT * FROM m""").df()
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr']
     return seq_val[k + ['slot_kind', 'sftwd_hrdwd']].merge(st[k + ['a_obs']], on=k).query("slot_kind == 'real'")
-
-@torch.no_grad()
-def lineage_age(m, val, keys, K=100):
-    """importance-weighted age at the linked visits: median, 10 and 90 %"""
-    trees = keys[M.K_].drop_duplicates(); b = val.merge(trees, on=M.K_); B, _, sq = A.build(b, m.vocab)
-    out = []
-    for i in range(0, B['v'].shape[0], 512):
-        s = M.sub(B, slice(i, i + 512)); o = m.joint(s, K); a = m.ages(o['z'], s); w = torch.softmax(o['lw'], 0)
-        ix = torch.multinomial(w.T + 1e-30, 400, replacement=True); nn_ = torch.arange(a.shape[1])[:, None]
-        q = torch.quantile(a.permute(1, 0, 2)[nn_, ix], torch.tensor([0.1, 0.5, 0.9]), dim=1)   # [3, n, T]
-        out.append(q)
-    q = torch.cat(out, 1).numpy(); ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
-    return sq.assign(q10=q[0, ti, po], q50=q[1, ti, po], q90=q[2, ti, po])[M.K_ + ['invyr', 'q10', 'q50', 'q90']]
-
-def med(x): return float(np.median(x)) if len(x) else None
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()

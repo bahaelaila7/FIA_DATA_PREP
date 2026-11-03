@@ -9,7 +9,7 @@ Size      the decoder never reads z0, so growth is not read as age and age does 
 Unborn    a slot before birth is scored below the smallest tally level, so the size path cannot carry a tree that does not exist.
 E1        a microplot debut on a moved plot: slots before the move carry no FALSE label, because that spot was not sampled then (D65 item 2). The birth date decides instead."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import math, time, json
+import math, time, json, contextlib
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import nimiwae56 as M
 from nimiwae56 import T_MAX, DZ, D_MODEL, COV, sub
@@ -67,12 +67,15 @@ class NIMIWAE70(M.NIMIWAE56):
         super().__init__(nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=False, prior_ctx=False)
         s.age = age
         s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc, use_af=age); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False)
+    def q(s, B):
+        return s._cache['q'] if getattr(s, '_cache', None) else super().q(B)
     def p_z(s, B):
         mu, lv = super().p_z(B)
         if not s.age: return mu, lv
         keep = torch.ones_like(mu); keep[..., 0] = 0.0                                        # z0 ~ N(0, 1) exactly
         return mu * keep, lv * keep
     def decode(s, z, B, u=None):
+        if getattr(s, '_cache', None): return s._cache['dec']
         if s.age:
             z = z.clone(); z[..., 0] = 0.0
         return super().decode(z, B, u)
@@ -88,6 +91,29 @@ class NIMIWAE70(M.NIMIWAE56):
     def extra_lw(s, lDp, z, B, mp, lp):
         if not s.age: return 0.0
         return (F.logsigmoid(-M.KAPPA * (lDp - B['lex'][None])) * torch.sigmoid(-KAPPA_B * s.ages(z, B)) * B['v'][None]).sum(-1)   # same soft step as the gate, so z0 feels it
+
+@torch.no_grad()
+def age_posterior(model, B, K=100, G=61, zmax=3.6):
+    """Exact posterior of z0 on a grid: [n, G] probabilities. The decoder never reads z0, so the rest of the model is scored once and only the birth limits vary along the grid.
+    Importance resampling is not used here: with ESS near 7 of K it moved ages by 0.24 sd where the exact answer is the prior (am. 14). lw divides by q(z0 = g), which the grid replaces, so that term goes back in."""
+    mq, lq = M.NIMIWAE56.q(model, B); g = torch.linspace(-zmax, zmax, G, device=mq.device); rest = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)
+    zz = rest.clone(); zz[..., 0] = 0.0; model._cache = None; dec = model.decode(zz, B); model._cache = dict(q=(mq, lq), dec=dec)
+    c2 = 0.5 * math.log(2 * math.pi); out = []
+    try:
+        for gi in g:
+            z = rest.clone(); z[..., 0] = gi
+            lq0 = -0.5 * (gi - mq[:, 0]) ** 2 / torch.exp(lq[:, 0]) - 0.5 * lq[:, 0] - c2
+            out.append(torch.logsumexp(model.joint(B, K, z=z)['lw'] + lq0[None], 0))
+    finally:
+        model._cache = None
+    return g, torch.softmax(torch.stack(out, 1), 1)
+
+def z_quantiles(g, p, q):
+    """quantiles [len(q), n] of a grid posterior, each node holding its cell; piecewise linear in the cumulative probability"""
+    step = g[1] - g[0]; edges = torch.cat([g[:1] - step / 2, g + step / 2]); cdf = torch.cat([torch.zeros_like(p[:, :1]), p.cumsum(1)], 1).contiguous()
+    q_ = torch.as_tensor(q, dtype=cdf.dtype); i = torch.stack([torch.searchsorted(cdf, x.expand(cdf.shape[0], 1).contiguous()).clamp(1, g.shape[0])[:, 0] for x in q_])
+    n_ = torch.arange(cdf.shape[0]); lo, hi = cdf[n_, i - 1], cdf[n_, i]
+    return edges[i - 1] + (q_[:, None] - lo) / (hi - lo).clamp(min=1e-12) * step
 
 def make_model(vocab, age=True):
     m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), age=age)
@@ -115,11 +141,21 @@ class ScheduleFreeAdamW:
     @torch.no_grad()
     def finish(s):
         for p, x in zip(s.ps, s.x): p.copy_(x)
+    @contextlib.contextmanager
+    def averaged(s):
+        """x in the parameters inside the block, y restored after it: score or save at any epoch, then keep training."""
+        y = [p.detach().clone() for p in s.ps]
+        with torch.no_grad():
+            for p, x in zip(s.ps, s.x): p.copy_(x)
+        try: yield
+        finally:
+            with torch.no_grad():
+                for p, y_ in zip(s.ps, y): p.copy_(y_)
 
 def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
-def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw'):
+def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None):
     assert set(tr.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     B, vocab, _ = build(tr); n = B['v'].shape[0]
@@ -156,5 +192,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
                 pm = (w * z0).sum(0); e0 = dict(z0_mean=pm.mean().item(), z0_abs=pm.abs().mean().item(), z0_sd=((w * z0 ** 2).sum(0) - pm ** 2).clamp(min=0).sqrt().median().item(), age_med=al.median().item(), age_max=al.max().item())
         hist.append(dict(epoch=ep, loss=tot / nb, ess_last_batch=ess, sd_disc=torch.exp(model.lsdisc).item(), **e0))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
+        if on_epoch:                                                                         # hist entry first: the hook may add held-out numbers to it
+            with (opt.averaged() if opt_name == 'sf' else contextlib.nullcontext()): on_epoch(ep + 1, model, hist[-1])
     if opt_name == 'sf': opt.finish()                                                        # evaluate and save the averaged weights
     return model.to('cpu'), hist

@@ -67,4 +67,14 @@ if __name__ == '__main__':
         lo, hi = np.exp(jj.af_mu - 1.2816 * jj.af_sd) + sh, np.exp(jj.af_mu + 1.2816 * jj.af_sd) + sh; R[f'cover_{how}'] = float(((jj.truth >= lo) & (jj.truth <= hi)).mean())
         q2 = reading(rv, how); pv = vk.merge(q2, on=M.K_); pv['p'] = np.exp(pv.af_mu) + pv.yr - pv.yr_r; lo, hi = pv.p * np.exp(-1.2816 * pv.af_sd), pv.p * np.exp(1.2816 * pv.af_sd)
         R[f'planted_{how}'] = {c_: dict(n=len(g), field=float(g.fld.median()), bias=float((g.p - g.fld).median())) for c_, g in pv.groupby('cls')}
+    # am. 14: the age posterior on the age latent's own scale. With no slot before the first record neither the gate nor the unborn term can act, and the decoder never reads z0,
+    # so the exact posterior IS the prior: z at 10, 50, 90 % = -1.28, 0, +1.28. Any difference on those trees is sampling, not information
+    fr = tr.sort_values(M.K_ + ['invyr']).groupby(M.K_).agg(iv=('invyr', 'first'), y0=('yr', 'first'), mu=('af_mu', 'first'), sd=('af_sd', 'first')).reset_index()
+    y00 = val.merge(fr[M.K_], on=M.K_).groupby(M.K_).yr.min().rename('yf').reset_index(); fr = fr.merge(y00, on=M.K_); fr['no_pre'] = fr.yf >= fr.y0 - 1e-6
+    q = L.merge(fr, left_on=M.K_ + ['invyr'], right_on=M.K_ + ['iv'])
+    for x in ('q10', 'q50', 'q90'): q['z' + x[1:]] = (np.log(q[x].clip(lower=0.01)) - q.mu) / q.sd
+    jt = j[M.K_ + ['yr', 'truth', 'p_first']].merge(q[M.K_ + ['y0', 'mu', 'sd', 'no_pre', 'z10', 'z50', 'z90']], on=M.K_); jt['zt'] = (np.log((jt.truth - (jt.yr - jt.y0)).clip(lower=0.5)) - jt.mu) / jt.sd
+    jt['q50a'] = np.exp(jt.mu + jt.sd * jt.z50) + jt.yr - jt.y0
+    R['z_posterior'] = {('no_slot_before_first_record' if k_ else 'has_slots_before'): dict(n=len(g), z10=float(g.z10.median()), z50_median=float(g.z50.median()), z50_mean_abs=float(g.z50.abs().mean()), z90=float(g.z90.median()), width_ratio=float(((g.z90 - g.z10) / 2.5631).median()),
+        cover80_joint=float(((g.zt >= g.z10) & (g.zt <= g.z90)).mean()), cover80_prior=float((g.zt.abs() <= 1.2816).mean()), mae_joint=float((g.q50a - g.truth).abs().mean()), mae_prior=float((g.p_first - g.truth).abs().mean()), corr_shift_vs_error=float(np.corrcoef(g.z50, g.zt)[0, 1])) for k_, g in jt.groupby('no_pre')}
     json.dump(R, open(a.out, 'w'), indent=1); print(json.dumps(R, indent=0))

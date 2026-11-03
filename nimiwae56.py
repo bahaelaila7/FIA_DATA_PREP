@@ -295,10 +295,10 @@ class NIMIWAE56(nn.Module):
             if mu_ is not None: rate = rate * mu_[:, :, t]
             Ds.append(Ds[-1] + dt[None, :, t] * rate[..., 0] * B['v'][None, :, t]); Hs.append(Hs[-1] + dt[None, :, t] * rate[..., 1] * B['v'][None, :, t])
         return torch.stack(Ds, -1), torch.stack(Hs, -1)
-    def joint(s, B, K, dreg=False):
+    def joint(s, B, K, dreg=False, z=None):
         """-> log weights lw [K, n], log posterior over (e, f) [K, n, E, 2], latent paths D, H [K, n, T], existence step p1."""
         mq, lq = s.q(B); hs = s._hs; mp, lp = s.p_z(B)
-        z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)
+        if z is None: z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)   # z given: score those draws (D70 age grid)
         c2 = 0.5 * math.log(2 * math.pi)
         u, lpu, lqu = None, 0.0, 0.0
         if s.noise:
@@ -400,9 +400,10 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
     w_int = w_int or {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}
     keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD_raw', 'BA_raw', 'lD', 'lH', 'q10', 'q90', 'BA', 'in_span')
     out = {k: [] for k in keys}
-    ar = torch.arange(T_MAX)
+    ar = torch.arange(T_MAX); dev = next(model.parameters()).device
     for i in range(0, B['v'].shape[0], bs):
-        b = sub(B, slice(i, i + bs)); o = model.joint(b, K)
+        b = sub(B, slice(i, i + bs)); o = model.joint({k: v.to(dev) for k, v in b.items()}, K)        # the network may sit on a GPU; the arithmetic below stays on the CPU
+        o = {k: v.cpu() if torch.is_tensor(v) else v for k, v in o.items()}
         W = torch.softmax(o['lw'], 0)[..., None, None] * torch.exp(o['lpost'])                        # [K, n, E, 2]
         Kk, n = W.shape[:2]
         nv = b['v'].sum(1).long()
@@ -597,7 +598,7 @@ def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
 def predictions(model, bb, K=100, w_int=None):
     B, _, sq = getattr(model, 'build', build)(bb, model.vocab)
     R = impute(model, B, K, w_int=w_int)
-    ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
+    ti, po = sq._tid.to_numpy().copy(), sq._pos.to_numpy().copy()
     for k in ('pE', 'pDie', 'pCut', 'lD', 'lH', 'q10', 'q90', 'BA', 'lD_u'): sq[f'nim_{k}'] = R[k][ti, po].numpy()
     viol = (monotone_violations(R['lD_u'], B),)
     return sq, viol
