@@ -742,9 +742,10 @@ NEW_TREE_RC = (1, 2, 3, 4)   # r7 D36: RECONCILECD new-tree codes (ingrowth, thr
 
 
 def lineage_break_visits(con, st: int) -> pl.DataFrame:
-    """D59 / audit A5, A7; D72: the segment starts of plot_segments (KINDCD 1 / 3, DESIGNCD change): tree numbers do not carry across."""
-    return con.execute(f"""SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, TRUE AS _brk FROM plot_segments
-                           WHERE segment_start AND STATECD = {int(st)}""").pl()
+    """D59 / audit A5, A7; D72 am. 1: every annual plot visit with its lineage segment (plot_segments). A tree number does not carry
+    across a segment change between two of its records, wherever the start fell (1,100 R4 starts are on nonsampled visits, where no record
+    sits; testing only records AT a start missed those)."""
+    return con.execute(f"""SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR, segment AS _segv FROM plot_segments WHERE STATECD = {int(st)}""").pl()
 
 
 def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.DataFrame:
@@ -764,10 +765,14 @@ def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.Data
     the old id's censoring.
     """
     d = (df.join(breaks.with_columns([pl.col(c).cast(df.schema[c]) for c in PLOT_INVYR]), on=PLOT_INVYR, how="left")
-         .with_columns(pl.col("_brk").fill_null(False))).sort(TREE_ID + ["MEASDATE"]).with_columns([
+         .sort(TREE_ID + ["MEASDATE"]).with_columns([
         pl.col("STATUSCD").shift(1).over(TREE_ID, order_by="MEASDATE").alias("_pst"),
         pl.col("MEASDATE").shift(1).over(TREE_ID, order_by="MEASDATE").alias("_pmd"),
-    ])
+        pl.col("_segv").shift(1).over(TREE_ID, order_by="MEASDATE").alias("_psegv"),
+    ]))
+    if d["_segv"].null_count():
+        raise ValueError(f"tree split: {d['_segv'].null_count()} records on a visit without a lineage segment")
+    d = d.with_columns((pl.col("_segv") != pl.col("_psegv")).fill_null(False).alias("_brk"))   # D72 am. 1: the segment changed since the last record
     # D59: FIA records PREV_STATUS_CD on a remeasured tree; a same-number record without one is a new tree
     no_link = pl.col("prev_status_cd").is_null()
     r_dead = no_link & pl.col("_pst").is_in([2, 3])
@@ -785,7 +790,7 @@ def split_reused_tree_numbers(df: pl.DataFrame, breaks: pl.DataFrame) -> pl.Data
     n_rec = d.filter(pl.col("_seg") > 0).height
     why = d.select([pl.col(c).sum().alias(c[3:]) for c in ("_s_dead", "_s_newrc", "_s_closed", "_s_visit")]).row(0, named=True)
     d = d.with_columns((pl.col("TREE") + pl.col("_seg") * TREE_SPLIT_OFFSET).alias("TREE")).drop(
-        ["_pst", "_pmd", "_seg", "_s_dead", "_s_newrc", "_s_closed", "_s_visit", "_brk"])
+        ["_pst", "_pmd", "_seg", "_s_dead", "_s_newrc", "_s_closed", "_s_visit", "_brk", "_segv", "_psegv"])
     print(f"[step4s] tree-number reuse: {n_split:,} keys split, {n_rec:,} records moved to a new tree id; "
           f"segment starts by rule (a record may meet several): {why}")
     return d.sort(TREE_ID + ["MEASDATE"])

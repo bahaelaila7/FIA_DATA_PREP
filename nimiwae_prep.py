@@ -72,7 +72,8 @@ def load54(db: str) -> pl.DataFrame:
                     (t.DRYBIO_AG * 453.592)::DOUBLE drybio_g, t.CONDID condid, t.spcd_resolved::INTEGER spcd, t.spcd_changed,
                     COALESCE(t.spgrpcd_resolved, t.SPGRPCD)::INTEGER spgrpcd, r.SPECIES_SYMBOL::VARCHAR species_symbol,
                     r.MAJOR_SPGRPCD::INTEGER major_spgrpcd, r.SFTWD_HRDWD::VARCHAR sftwd_hrdwd, e.epa_l3, e.epa_l4, plu.land_use,
-                    te.end_reason terminal_fate, tj.age_calc                    -- age_calc: the D49 rule benchmark only, never a model input
+                    te.end_reason terminal_fate, tj.age_calc,                   -- age_calc: the D49 rule benchmark only, never a model input
+                    t.cond_stdorgcd stdorgcd_own                                -- D72 am. 1: the record's own condition origin (the age prior's feature)
              FROM curated_trees t
              LEFT JOIN REF_SPECIES r ON r.SPCD = t.spcd_resolved
              LEFT JOIN data_plot_eco e ON e.statecd = t.STATECD AND e.unitcd = t.UNITCD AND e.countycd = t.COUNTYCD AND e.plot = t.PLOT
@@ -107,19 +108,11 @@ def load54(db: str) -> pl.DataFrame:
                     end_invyr, end_measdate, end_agentcd FROM tree_end),
     rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING ({K})
            WHERE ct.invyr = tr.y0 AND ct.statuscd = 1),
-    dr0 AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.invyr) dead_invyr, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
-           FROM ct JOIN tr USING ({K}) WHERE ct.statuscd IN (2, 3) AND ct.measdate > tr.d1 GROUP BY ALL),   -- 3: cut closures (D65 am. 14)
-    -- D72 (C7, C3): the end and its cause come from tree_end (death, cut, or an inferred removal dated at the first visit that sampled the
-    -- tree's own spot); a tree_end end before the last live record (a data error the misrecorded-death rule does not catch) falls back to
-    -- the first dead / cut record after it, as before
-    dr AS (SELECT tr.statecd, tr.unitcd, tr.countycd, tr.plot, tr.subp, tr.tree,
-                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_invyr ELSE d.dead_invyr END dead_invyr,
-                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_measdate ELSE d.dead_md END dead_md,
-                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_agentcd ELSE d.dead_agent END dead_agent,
-                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_cause WHEN d.dead_md IS NOT NULL THEN
-                       CASE WHEN d.dead_agent = 80 THEN 'cut' ELSE 'death' END END end_cause
-           FROM tr JOIN tseg ts USING ({K}) LEFT JOIN dr0 d USING ({K})
-           WHERE (ts.end_measdate > tr.d1 AND ts.end_kind IN ('cut', 'death', 'inferred_removal')) OR d.dead_md IS NOT NULL),
+    -- D72 (C7, C3; am. 1): the end, its date and cause come from tree_end only (death, cut, or an inferred removal dated at the first visit
+    -- that sampled the tree's own spot). The am. 0 fallback to the first dead record after the last live one read misrecorded deaths and
+    -- ended 2 diverted trees as deaths; no tree_end end precedes a live record (load54 checks it)
+    dr AS (SELECT {K}, ts.end_invyr dead_invyr, ts.end_measdate dead_md, ts.end_agentcd dead_agent, ts.end_cause
+           FROM tseg ts JOIN tr USING ({K}) WHERE ts.end_kind IN ('cut', 'death', 'inferred_removal')),
     s0 AS (SELECT e.STATECD statecd, e.UNITCD unitcd, e.COUNTYCD countycd, e.PLOT plot, e.SUBP subp, e.TREE tree,
                   min(e.MEASDATE) s0_md, arg_min(e.RC, e.MEASDATE) s0_rc, arg_min(e.DIA, e.MEASDATE) s0_dia, arg_min(e.HT, e.MEASDATE) s0_ht,
                   arg_min(e.closure_kind, e.MEASDATE) s0_kind
@@ -167,7 +160,7 @@ def load54(db: str) -> pl.DataFrame:
            rc.rcd0, f.terminal_fate, dr.dead_invyr, dr.dead_md, dr.dead_agent, dr.end_cause, s0.s0_md, s0.s0_rc, s0.s0_dia, s0.s0_ht, s0.s0_kind,
            f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, NULL::INT cond_status,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
-           sa.sicond, sa.siteclcd, sa.physclcd, sa.slope, sa.aspect, sa.fortypcd, sa.canopy_pct, sa.stdorgcd,
+           sa.sicond, sa.siteclcd, sa.physclcd, sa.slope, sa.aspect, sa.fortypcd, sa.canopy_pct, sa.stdorgcd, t.stdorgcd_own,
            NULL::INT trtcd1, NULL::INT trtcd2, NULL::INT trtcd3, NULL::INT dstrbcd1, NULL::INT dstrbcd2, NULL::INT dstrbcd3,
            sa.trt_s10, sa.trt_s20, sa.trt_s30, sa.trt_s40, sa.trt_s50,
            sa.dst_s10, sa.dst_s20, sa.dst_s30, sa.dst_s40, sa.dst_s50, sa.dst_s60, sa.dst_s70, sa.dst_s80, sa.dst_s90
@@ -182,7 +175,11 @@ def load54(db: str) -> pl.DataFrame:
     LEFT JOIN sa USING (statecd, unitcd, countycd, plot, subp, invyr)
     LEFT JOIN mv USING ({K})
     ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr"""
-    df = run_steps(c, q); c.close()
+    df = run_steps(c, q)
+    bad = c.execute(f"SELECT count(*) FROM tseg JOIN tr USING ({K}) WHERE tseg.end_kind IN ('cut', 'death', 'inferred_removal') AND tseg.end_measdate <= tr.d1").fetchone()[0]
+    c.close()
+    if bad:
+        raise SystemExit(f"{bad} trees end in tree_end on or before their last live record: the curation must resolve them, the frame does not")
     return df
 
 # neighbours = trees at or above the design's SUBPLOT-level threshold at both ends of the interval (column nb_thr; 5 in for DESIGNCD 1):

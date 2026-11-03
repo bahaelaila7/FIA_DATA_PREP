@@ -19,6 +19,7 @@ SOIL = [f'soil_{c}' for c in ('clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'cec', 
 NUM = ['ldia', 'lht', 'tm_n', 'pp_n', 'vp_n'] + SOIL
 CAT = ['spcd', 'spgrpcd', 'cc', 'west']
 CC_SITE = 6
+ORIGIN = lambda d: 'stdorgcd_own' if 'stdorgcd_own' in d else 'stdorgcd'     # D72 am. 1: the record's own condition, as the age records carry it
 
 
 def cr_h(a, A, k, p):
@@ -76,7 +77,7 @@ def main(a):
     seq = pd.read_parquet(f'{a.data}/seq.parquet'); val = seq[seq.split == 'val']; del seq
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
     ln = linked(c, val); ln['total'] = ln.a_obs + ln.sftwd_hrdwd.map(L0).fillna(5.0); ln['west'] = False; ln['cc'] = ln.cclcd
-    ln = features(ln[ln.ht.notna() & (ln.ht > 0)]); ln['planted'] = (ln.stdorgcd == 1).astype(int)
+    ln = features(ln[ln.ht.notna() & (ln.ht > 0)]); ln['planted'] = (ln[ORIGIN(ln)] == 1).astype(int)
     t = duckdb.connect(a.db, read_only=True); cur = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees").df()
     ln = ln.merge(cur, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr'], how='inner'); ln = ln[ln.estimated_age.notna()]
     R = dict(n_train=len(tr), G1_current=score(ln.estimated_age.to_numpy(), ln.total.to_numpy()))
@@ -109,7 +110,7 @@ def main(a):
     run(NUM + CAT, 'f'); run(NUM + ['planted'] + CAT, 'f+p')
     if a.export:                                                                     # D70 am. 12: prior on log total age at live records: f+p, read from one record, so no hidden record feeds it
         cols = NUM + ['planted'] + CAT; sq = pd.read_parquet(f'{a.data}/seq.parquet')
-        keep = (sq.slot_kind == 'real') & (sq.dia > 0) & (sq.ht > 0) & ~(pd.to_datetime(sq.measdate) >= pd.to_datetime(sq.dead_md)); real = features(sq[keep].assign(west=False, cc=lambda d: d.cclcd, planted=lambda d: (d.stdorgcd == 1).astype(int)))
+        keep = (sq.slot_kind == 'real') & (sq.dia > 0) & (sq.ht > 0) & ~(pd.to_datetime(sq.measdate) >= pd.to_datetime(sq.dead_md)); real = features(sq[keep].assign(west=False, cc=lambda d: d.cclcd, planted=lambda d: (d[ORIGIN(d)] == 1).astype(int)))
         maps = {c: {v: i for i, v in enumerate(sorted(tr[c].dropna().unique()))} for c in CAT}
         enc = lambda d: d[cols].assign(**{c: d[c].map(maps[c]).astype(float) for c in CAT}); Xt = enc(tr); cats = [cols.index(x) for x in CAT]; yt = np.log(tr.total.to_numpy())
         hash2 = lambda d: (pd.util.hash_pandas_object(d.plot_key, index=False).to_numpy() % 2).astype(int)

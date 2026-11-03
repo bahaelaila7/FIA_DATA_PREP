@@ -592,7 +592,8 @@ def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
         b = s.merge(part.rename(columns={'invyr': '_j'}), on=K_, how='inner')
         at = b.invyr == b._j
         b['hidden'] = (b.invyr >= b._j) & (b.slot_kind == 'real')                                 # the tree's own records from j on
-        b['truth_cut'] = np.where(np.isin(b.terminal_fate, CUT_FATES) | (b.dead_agent == 80), 1.0, 0.0)
+        b['truth_cut'] = (np.where(b.end_cause.to_numpy(object) == 'cut', 1.0, 0.0) if 'end_cause' in b      # D72 am. 1: the one cause definition
+                          else np.where(np.isin(b.terminal_fate, CUT_FATES) | (b.dead_agent == 80), 1.0, 0.0))
         b['end_hidden'] = True; b['terminal_fate'] = 'censored_procedural'; b['dead_invyr'] = np.nan; b['dead_md'] = pd.NaT; b['dead_agent'] = np.nan; b['s0_md'] = pd.NaT
         b['truth_E'] = np.where(at, b._truth, np.nan); b['truth_cut'] = np.where(at & (b._truth == 0), b.truth_cut, np.nan)
         b['tree'] = b.tree * 16 + int(i)

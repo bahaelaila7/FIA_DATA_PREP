@@ -750,14 +750,16 @@ vb AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR FROM (
          FROM f.PLOT P JOIN f.SURVEY SV ON SV.CN = P.SRV_CN AND SV.ANN_INVENTORY = 'Y'
          WINDOW w AS (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY MAKE_DATE(CAST(P.MEASYEAR AS INTEGER), COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15))))
        WHERE k > 1 AND (KINDCD IN (1, 3) OR DESIGNCD IS DISTINCT FROM pd)),
-q AS (SELECT r.*, lag(cn) OVER w qcn, lag(st) OVER w qst, lag(sp) OVER w qsp, lag(dia) OVER w qdia, lag(md) OVER w qmd
+q AS (SELECT r.*, lag(cn) OVER w qcn, lag(st) OVER w qst, lag(sp) OVER w qsp, lag(dia) OVER w qdia, lag(md) OVER w qmd, lag(invyr) OVER w qinv
       FROM r WINDOW w AS (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree ORDER BY md, cn)),
 s AS (SELECT q.*,
         COALESCE(qst IN (2,3) AND ptc IS NULL, FALSE) s_dead,
         COALESCE(ptc IS NOT NULL AND ptc <> qcn, FALSE) s_other,
         COALESCE(ptc IS NULL AND rc IN (1,2,3,4), FALSE) s_newrc,
-        EXISTS (SELECT 1 FROM vb WHERE vb.STATECD = q.STATECD AND vb.UNITCD = q.UNITCD AND vb.COUNTYCD = q.COUNTYCD
-                AND vb.PLOT = q.PLOT AND vb.INVYR = q.invyr) s_visit
+        COALESCE((SELECT any_value(v.seg) FROM vseg v WHERE v.STATECD = q.STATECD AND v.UNITCD = q.UNITCD AND v.COUNTYCD = q.COUNTYCD
+                  AND v.PLOT = q.PLOT AND v.INVYR = q.invyr)
+                 <> (SELECT any_value(v.seg) FROM vseg v WHERE v.STATECD = q.STATECD AND v.UNITCD = q.UNITCD AND v.COUNTYCD = q.COUNTYCD
+                  AND v.PLOT = q.PLOT AND v.INVYR = q.qinv), FALSE) s_visit   -- D72 am. 1: the segment changed since the previous record
       FROM q),
 g AS (SELECT s.*, qcn IS NOT NULL AND (s_dead OR s_other OR s_newrc OR s_visit) newseg FROM s)
 SELECT g.*, CAST(sum(newseg::INT) OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, rtree ORDER BY md, cn

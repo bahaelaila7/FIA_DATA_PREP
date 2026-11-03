@@ -65,6 +65,13 @@ def frame(c, seq):
     a = seq[seq.move_invyr.notna()].drop_duplicates('plot_key'); b = a.merge(mv, on=['statecd', 'unitcd', 'countycd', 'plot']); check('F13 move_invyr only on plots with a flagged move', len(a) == len(b) and len(a) > 0, (len(a), len(b)))
     # D72 invariants: one definition, checked against the shared tables
     lv = one(c, "SELECT count(*) FROM curated_trees WHERE STATUSCD = 1 AND TPA_UNADJ > 0")[0]; rl = int((seq.slot_kind == 'real').sum())
+    if 'stdorgcd_own' in seq:
+        c.register('seqv', seq[k + ['invyr', 'slot_kind', 'stdorgcd_own']])
+        r = one(c, """SELECT count(*), count(*) FILTER (WHERE q.o IS DISTINCT FROM t.cond_stdorgcd) FROM (SELECT statecd, unitcd, countycd, plot, subp, tree, invyr, stdorgcd_own o
+            FROM seqv WHERE slot_kind = 'real') q JOIN curated_trees t ON t.STATECD = q.statecd AND t.UNITCD = q.unitcd AND t.COUNTYCD = q.countycd AND t.PLOT = q.plot
+            AND t.SUBP = q.subp AND t.TREE = q.tree AND t.INVYR = q.invyr""")
+        check('F19 real slots carry their own condition origin (D72 am. 1)', r[1] == 0 and r[0] == rl, r)
+        c.unregister('seqv')
     check('F15 every curated live record is a real slot (C8)', lv == rl, (lv, rl))
     sq = seq[k + ['invyr', 'slot_kind', 'measdate', 'dead_md', 'terminal_fate', 'forest_subpcond_prop', 'forest_micrcond_prop', 'dia'] + (['end_cause'] if 'end_cause' in seq else [])].copy()
     c.register('_sq', sq)
@@ -86,7 +93,7 @@ def frame(c, seq):
                    count(*) FILTER (WHERE f.dead_md IS DISTINCT FROM te.end_measdate)
             FROM f JOIN tree_end te ON te.STATECD = f.statecd AND te.UNITCD = f.unitcd AND te.COUNTYCD = f.countycd AND te.PLOT = f.plot AND te.SUBP = f.subp AND te.TREE = f.tree""")
         check('F18 every cut ends as a cut in the frame, land clearing included (C7)', r[1] == 0 and r[2] == 0 and r[0] > 0, r[:3])
-        print(f'INFO  F18b trees ending on the fallback (tree_end ends before the last live record, a data error): {r[3]:,}')
+        check('F18b every frame end is the tree_end end (no fallback, D72 am. 1)', r[3] == 0, r[3])
     c.unregister('_sq')
     banned = [x_ for x_ in seq.columns if x_.lower() in ('stdage', 'fldage', 'estimated_age', 'age_from_stdage')]; check('F14 no STDAGE or curated age column in the frame', not banned, banned)
 
