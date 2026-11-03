@@ -51,6 +51,20 @@ def run(a):
     t0 = time.time(); A.train(fit, epochs=max(ckpts), k=a.k, bs=a.bs, max_trees=a.trees, seed=a.seed, threads=a.threads, log=pr, age=bool(a.age), device=a.device, opt_name='sf', on_epoch=hook)
     json.dump(dict(seconds=time.time() - t0), open(f'{d}/done.json', 'w')); pr(f'done {time.time() - t0:.0f} s')
 
+def rescore(a):
+    """score saved checkpoints of a finished run with the current code, without training: the age-off arm, which am. 16 does not change"""
+    src, d = f'{a.rescore}/f{a.fold}_age{a.age}', f'{a.out}/f{a.fold}_age{a.age}'; os.makedirs(d, exist_ok=True)
+    if os.path.exists(f'{d}/done.json'): print('already done', d); return
+    assert not a.age, 'only the age-off arm is unchanged by am. 16; the age-on arm must be retrained'
+    tr = pd.read_parquet(f'{a.data}/seq.parquet', filters=[('split', '==', 'train')]); held_k, _, _ = split_plots(sorted(tr.plot_key.unique()), a.fold); held = tr[tr.plot_key.isin(set(held_k))]
+    score_plots = held[held.plot_key.isin(pd.Series(held_k).sample(frac=a.score_frac, random_state=2))]; out = {}
+    for f in sorted(glob.glob(f'{src}/model_e*.pt'), key=lambda x: int(x.split('_e')[-1][:-3])):
+        ep = f.split('_e')[-1][:-3]; m, _ = S.load(src, os.path.basename(f)); m.to(a.device); torch.manual_seed(0)
+        out[ep] = dict(completion=S.completion(m, score_plots)); print(f'[f{a.fold} age0 rescore] epoch {ep}: {json.dumps(out[ep], default=float)[:200]}', flush=True)
+    import shutil
+    if os.path.exists(f'{src}/curve.json'): shutil.copy(f'{src}/curve.json', f'{d}/curve.json')
+    json.dump(out, open(f'{d}/scores.json', 'w'), indent=1, default=float); json.dump(dict(rescored_from=src), open(f'{d}/done.json', 'w'))
+
 def summary(a):
     R = {}
     for f in sorted(glob.glob(f'{a.out}/f*_age*/scores.json')):
@@ -85,5 +99,5 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(); ap.add_argument('--data'); ap.add_argument('--out'); ap.add_argument('--fold', type=int, default=0); ap.add_argument('--age', type=int, default=1); ap.add_argument('--device', default='cpu')
     ap.add_argument('--trees', type=int, default=400000); ap.add_argument('--ckpts', default='12,24,36'); ap.add_argument('--curve-every', type=int, default=2); ap.add_argument('--curve-plots', type=int, default=500); ap.add_argument('--score-frac', type=float, default=0.5); ap.add_argument('--planted-frac', type=float, default=0.25)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=8); ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--summary', action='store_true'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
-    selftest() if a.selftest else summary(a) if a.summary else run(a)
+    ap.add_argument('--summary', action='store_true'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
+    selftest() if a.selftest else summary(a) if a.summary else rescore(a) if a.rescore else run(a)

@@ -4,9 +4,10 @@ Age       log a_l = af_mu + af_sd z0, z0 ~ N(0, 1) under the prior, at the tree'
           (nimiwae_age_direct.py), fitted on TRAIN measured ages only and fixed here, so lineages cannot move them. z0 is a true latent, so the width of age is honest: a penalty on a
           function of z would reward collapsing onto af_mu.
 Birth     b = t_l - a_l. Age at a slot is a_t = t - b at every visit, negative before birth, so it advances exactly with elapsed time. Dates, never INVYR.
-Existence E_t needs t >= b as well as the size step and t < e: the D55 step is multiplied by sigma(KAPPA_B a_t).
-Size      the decoder never reads z0, so growth is not read as age and age does not bend the size path. Only the birth gate and the unborn term below tie the two.
-Unborn    a slot before birth is scored below the smallest tally level, so the size path cannot carry a tree that does not exist.
+Existence E_t needs the tree to have reached breast height, t >= b + l0, as well as the size step and t < e: DIA is measured at 4.5 ft, and total age is breast-height age + l0
+          (2 yr softwood, 5 yr hardwood, as the age targets define it). The D55 step is multiplied by sigma(KAPPA_B (a_t - l0)) (am. 16).
+Size      the decoder never reads z0, so growth is not read as age and age does not bend the size path. Only the gate and the short-tree term below tie the two.
+Short     before breast height a tree cannot be at tally size: per slot log[P(at BH) + P(not) P(D < level)], a mixture over the two cases (am. 16).
 E1        a microplot debut on a moved plot: slots before the move carry no FALSE label, because that spot was not sampled then (D65 item 2). The birth date decides instead."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import math, time, json, contextlib
@@ -18,6 +19,7 @@ SOIL_COLS = [f'soil_{c}' for c in ('clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'c
 NSOIL = len(SOIL_COLS)
 KAPPA_B = 2.0                 # per year: the birth step is about half a year wide
 AF_MU0, AF_SD0 = math.log(25.0), 0.8     # trees with no usable record: wide default, not a measurement
+L0 = dict(S=2.0, H=5.0)                  # years from germination to breast height; the age targets use the same values
 ITYR = COV.index('tyr')
 
 def soil_vocab(seq):
@@ -26,7 +28,8 @@ def soil_vocab(seq):
 def e1_mask(seq):
     """Slots whose FALSE label is dropped: before the plot's move, for a tree first recorded at or after it."""
     if 'move_invyr' not in seq: return pd.Series(False, index=seq.index)
-    first = seq[seq.slot_kind == 'real'].groupby(M.K_).invyr.min().rename('_first')
+    vis = (seq.slot_kind == 'real') & ~(seq.hidden.fillna(False).astype(bool) if 'hidden' in seq else False)   # visible records only: a hidden debut must not decide which labels drop
+    first = seq[vis].groupby(M.K_).invyr.min().rename('_first')
     deb = seq.join(first, on=M.K_)._first.to_numpy(float)
     mv = seq.move_invyr.to_numpy(float); iy = seq.invyr.to_numpy(float)
     return pd.Series((iy < mv) & (deb >= mv), index=seq.index)
@@ -39,7 +42,8 @@ def build(seq, vocab=None):
     st = sq.drop_duplicates('_tid').sort_values('_tid')
     B['soil'] = torch.tensor(np.stack([np.nan_to_num((st[c].to_numpy(float) - vocab['_soil'][c][0]) / vocab['_soil'][c][1], nan=0.0) for c in SOIL_COLS], 1), dtype=torch.float32)
     n = B['v'].shape[0]; ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
-    mu, sd, la = np.full(n, AF_MU0, np.float32), np.full(n, AF_SD0, np.float32), B['l'].clone()
+    mu, sd, la = np.full(n, AF_MU0, np.float32), np.full(n, AF_SD0, np.float32), B['f'].clone()      # no prior: still anchored at the first visible record
+    B['l0'] = torch.tensor(np.where(st.sftwd_hrdwd.to_numpy() == 'S', L0['S'], L0['H']), dtype=torch.float32)
     if 'af_mu' in sq:                                                                          # the first visible slot with a prior; hidden records never feed it
         hid = sq.hidden.fillna(False).to_numpy(bool) if 'hidden' in sq else np.zeros(len(sq), bool)
         ok = (sq.slot_kind == 'real').to_numpy() & ~hid & sq.af_mu.notna().to_numpy()
@@ -84,13 +88,17 @@ class NIMIWAE70(M.NIMIWAE56):
         al = torch.exp((B['af_mu'][None] + B['af_sd'][None] * z[..., 0]).clamp(max=7.0))     # [K, n]; up to about 1100 yr
         t = B['cov'][..., ITYR] * 20.0                                                        # [n, T] years since 2000, from measurement dates
         return al[..., None] + (t - t.gather(1, B['la'][:, None]))[None]
+    def bh_age(s, z, B):
+        """years since reaching breast height [K, n, T]; negative before it"""
+        return s.ages(z, B) - B['l0'][None, :, None]
     def born_gate(s, lp1, lp0, z, B):
         if not s.age: return super().born_gate(lp1, lp0, z, B)
-        a = s.ages(z, B); l1 = lp1 + F.logsigmoid(KAPPA_B * a)
-        return l1, torch.log(-torch.expm1(l1.clamp(max=-1e-6))), a > 0
+        u = s.bh_age(z, B); l1 = lp1 + F.logsigmoid(KAPPA_B * u)
+        return l1, torch.log(-torch.expm1(l1.clamp(max=-1e-6))), u > 0
     def extra_lw(s, lDp, z, B, mp, lp):
         if not s.age: return 0.0
-        return (F.logsigmoid(-M.KAPPA * (lDp - B['lex'][None])) * torch.sigmoid(-KAPPA_B * s.ages(z, B)) * B['v'][None]).sum(-1)   # same soft step as the gate, so z0 feels it
+        u = s.bh_age(z, B)                                                                    # mixture: at breast height (no constraint) or not yet (below the level)
+        return (torch.logaddexp(F.logsigmoid(KAPPA_B * u), F.logsigmoid(-KAPPA_B * u) + F.logsigmoid(-M.KAPPA * (lDp - B['lex'][None]))) * B['v'][None]).sum(-1)
 
 @torch.no_grad()
 def age_posterior(model, B, K=100, G=61, zmax=3.6):

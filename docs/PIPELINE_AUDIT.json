@@ -212,7 +212,7 @@
  {
   "name": "M3 log weights are finite on real data",
   "ok": true,
-  "detail": "-3331.415771484375"
+  "detail": "-3330.13134765625"
  },
  {
   "name": "M4 gradients are finite",

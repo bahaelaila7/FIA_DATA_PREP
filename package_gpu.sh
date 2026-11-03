@@ -12,17 +12,21 @@ pyarrow==24.0.0
 R
 cat > "$W/nimiwae70/run.sh" <<'R'
 #!/usr/bin/env bash
-# Usage: bash run.sh [device]   5 folds, age on and off, 36 epochs, scored at 12, 24 and 36. Finished runs are skipped, so it can be restarted.
-# Runs 5 at a time by default: all age-on folds, then all age-off folds. P=2 bash run.sh cuda runs fewer at once; FOLDS="0 1" runs some folds only.
-# With several GPUs, runs are spread over them. CPU threads are shared out across the runs. Each run also writes out/cv/fN_ageA/run.log. Copy the out/cv folder back.
+# D70 am. 16 cross-validation into out/cv16. Usage: bash run.sh [device] [OLD_CV]
+# OLD_CV = the finished out/cv of the am. 15 run: its age-off checkpoints are rescored, not retrained (am. 16 does not change that arm). Without it, age off is retrained too.
+# Runs 5 at a time (P=...), CPU threads shared out, runs spread over GPUs. Finished runs are skipped, so it can be restarted. Copy out/cv16 back.
 set -uo pipefail
-D=${1:-cuda}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
+D=${1:-cuda}; OLD=${2:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
 python -I nimiwae70_verify.py data | tail -1 || exit 1
 python -I nimiwae70_cv.py --selftest || exit 1
 echo "$P at a time, $T CPU threads each, $G GPU(s)"
-for a in 1 0; do for f in $FOLDS; do echo "$f $a"; done; done | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out out/cv --fold $0 --age $1 --device '"$D --threads $T ${ARGS:-}"
+if [ -n "$OLD" ]; then
+  for f in $FOLDS; do [ -f "$OLD/f${f}_age0/model_e36.pt" ] || { echo "missing $OLD/f${f}_age0/model_e36.pt: let the old run finish first"; exit 1; }; done
+  ARMS="1"
+else ARMS="1 0"; fi
+{ for a in $ARMS; do for f in $FOLDS; do echo "$f $a train"; done; done; [ -n "$OLD" ] && for f in $FOLDS; do echo "$f 0 rescore"; done; } | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'R=""; [ "$2" = rescore ] && R="--rescore '"$OLD"'"; CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out out/cv16 --fold $0 --age $1 $R --device '"$D --threads $T ${ARGS:-}"
 rc=$?
-python -I nimiwae70_cv.py --out out/cv --summary | tail -60
-[ "$rc" -eq 0 ] || echo "SOME RUNS FAILED: rerun this script, finished runs are skipped. See out/cv/*/run.log"
+python -I nimiwae70_cv.py --out out/cv16 --summary | tail -60
+[ "$rc" -eq 0 ] || echo "SOME RUNS FAILED: rerun this script, finished runs are skipped. See out/cv16/*/run.log"
 R
 tar -cf "$OUT" -C "$W" nimiwae70; rm -rf "$W"; tar -tvf "$OUT" | awk '{printf "%8.1f MB  %s\n", $3/1048576, $NF}'

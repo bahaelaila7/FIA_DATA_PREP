@@ -23,7 +23,7 @@ def batch(n=6):
     for k in ('sp', 'l3', 'maj', 'fty', 'spc', 'moved', 'ndef', 'cause', 'scl', 'phy', 'rcd'): B[k] = torch.ones(n, dtype=torch.long)
     B['moved'][:] = 0; B['ndef'][:] = 0; B['f'] = torch.full((n,), 2, dtype=torch.long); B['l'] = torch.full((n,), 3, dtype=torch.long)
     B['snum'] = torch.zeros(n, 9); B['summ'] = torch.zeros(n, M.NSUMM)
-    B['soil'] = torch.randn(n, A.NSOIL); B['af_mu'] = torch.full((n,), math.log(30.0)); B['af_sd'] = torch.full((n,), 0.4); B['la'] = torch.full((n,), 3, dtype=torch.long); B['af_has'] = torch.ones(n)
+    B['soil'] = torch.randn(n, A.NSOIL); B['af_mu'] = torch.full((n,), math.log(30.0)); B['af_sd'] = torch.full((n,), 0.4); B['la'] = torch.full((n,), 3, dtype=torch.long); B['af_has'] = torch.ones(n); B['l0'] = torch.full((n,), 2.0)
     return B
 
 def model(age=True):
@@ -46,8 +46,8 @@ check('no learned parameter moves the age prior', not any('bhead' in k or 'curve
 lp1 = F.logsigmoid(40 * (torch.randn(4, 6, M.T_MAX))); lp0 = torch.log(-torch.expm1(lp1.clamp(max=-1e-6)))
 with torch.no_grad():
     l1, l0, born = m.born_gate(lp1, lp0, z, B)
-    e = torch.exp(lp1) * torch.sigmoid(A.KAPPA_B * m.ages(z, B))
-check('P(exists) = P(size step) x sigma(kappa a_t)', float((torch.exp(l1) - e).abs().max()) < 1e-5)
+    e = torch.exp(lp1) * torch.sigmoid(A.KAPPA_B * (m.ages(z, B) - B['l0'][None, :, None]))
+check('P(exists) = P(size step) x sigma(kappa (a_t - l0)): breast height first', float((torch.exp(l1) - e).abs().max()) < 1e-5)
 check('P(exists) + P(not) = 1', float((torch.exp(l1) + torch.exp(l0) - 1).abs().max()) < 1e-4)
 late = (m.ages(z, B).detach() < -2)
 if late.any(): check('no existence 2 yr before birth', float(torch.exp(l1)[late].max()) < 0.02)
@@ -88,7 +88,7 @@ check('birth can fall after the first slots', float(aY[0]) < 0 and float(aY[3]) 
 L = M.sample_lineages(young, B8, n_draws=5, K=8)
 check('sampled lineages have no tree before birth', float(np.nansum(L['exists'][:, :, :4])) == 0.0)
 Pr = M.impute(young, B8, K=16, nsamp=20)
-lim = torch.sigmoid(A.KAPPA_B * aY[:4].detach())
+lim = torch.sigmoid(A.KAPPA_B * (aY[:4].detach() - B8['l0'][0]))
 check('P(exists) never exceeds the birth step before birth', bool((Pr['pE'][:, :4] <= lim + 1e-5).all()), f'limit by slot {[round(float(x), 5) for x in lim]}')
 # 9. a tree cannot carry tally size before birth
 tall = model(); B9 = batch()
@@ -110,6 +110,18 @@ Bl['real'][:, 4] = 1; Bl['mD'][:, 4] = 1; Bl['lD'][:, 4] = math.log(3.0); Bl['ev
 gl, pl_ = A.age_posterior(mx, Bl, K=16); zl = A.z_quantiles(gl, pl_, [0.1, 0.5, 0.9])
 check('a birth limit moves the posterior older', float(zl[1].min()) > 0.2, f'median z0 {float(zl[1].min()):.2f}')
 tq = A.z_quantiles(torch.linspace(-1, 1, 3), torch.tensor([[0.25, 0.5, 0.25]]), [0.25, 0.5, 0.75]); check('grid quantiles against a hand case', float((tq[:, 0] - torch.tensor([-0.5, 0.0, 0.5])).abs().max()) < 1e-5, f'{tq[:, 0].tolist()}')
+# 16. am. 16: the short-tree term is the mixture, and it is 0 when the tree is surely at breast height
+Bm = batch(); um = model(); zm = torch.zeros(1, 6, M.DZ); smallm = torch.full((1, 6, M.T_MAX), math.log(0.2)); bigm = torch.full((1, 6, M.T_MAX), math.log(3.0))
+with torch.no_grad():
+    uu = um.bh_age(zm, Bm); want = (torch.log(torch.sigmoid(A.KAPPA_B * uu) + torch.sigmoid(-A.KAPPA_B * uu) * torch.sigmoid(-M.KAPPA * (bigm - Bm['lex'][None]))) * Bm['v'][None]).sum(-1)
+    got = um.extra_lw(bigm, zm, Bm, None, None)
+check('short-tree term = log[P(at BH) + P(not) P(below level)]', float((got - want).abs().max()) < 1e-4, f'{float((got - want).abs().max()):.1e}')
+Bo = batch(); Bo['af_mu'][:] = math.log(80.0); Bo['af_sd'][:] = 1e-3; Bo['la'][:] = 0
+with torch.no_grad(): check('surely past breast height: no short-tree penalty', float(um.extra_lw(bigm, zm, Bo, None, None).abs().max()) < 1e-3)
+Bh = batch(); Bh['l0'][:] = 5.0
+with torch.no_grad(): check('hardwoods need more years before tally size', float(um.extra_lw(bigm, zm, Bh, None, None).sum()) <= float(um.extra_lw(bigm, zm, Bm, None, None).sum()))
+s10 = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1], 'invyr': [2002, 2007, 2012], 'slot_kind': ['real', 'real', 'real'], 'hidden': [True, False, False], 'move_invyr': [2007, 2007, 2007]})
+check('E1 mask reads visible records only', A.e1_mask(s10).tolist() == [True, False, False], str(A.e1_mask(s10).tolist()))
 # 10. E1 mask: only slots before the move, only trees first recorded at or after it
 s_ = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1, 2, 2, 2, 3, 3], 'invyr': [2002, 2007, 2012, 2002, 2007, 2012, 2002, 2007],
                    'slot_kind': ['pre', 'pre', 'real', 'real', 'real', 'post', 'pre', 'real'], 'move_invyr': [2007, 2007, 2007, 2007, 2007, 2007, np.nan, np.nan]})
@@ -141,6 +153,9 @@ if len(sys.argv) > 1:
     bs_ = M.bench_sizes(f_); Bh, _, sh = A.build(bs_, vf); ti, po = sh._tid.to_numpy(), sh._pos.to_numpy(); hi = sh.hidden.fillna(False).to_numpy(bool)
     check('frame: no hidden slot feeds the prior', int(((Bh['af_has'].numpy()[ti[hi]] > 0) & (Bh['la'].numpy()[ti[hi]] == po[hi])).sum()) == 0, f'{int(hi.sum()):,} hidden slots')
     check('frame: no visible record falls before birth under any draw', bool((Bf['la'] == Bf['f']).all()), f'{int((Bf["la"] == Bf["f"]).sum()):,} trees')
+    fz = f_.copy(); fz.loc[fz.index[::3], 'af_mu'] = np.nan; Bz, _, _ = A.build(fz, vf); nz = Bz['af_has'] == 0
+    check('frame: a tree with no prior anchors at its first visible record', bool((Bz['la'][nz] == Bz['f'][nz]).all()), f'{int(nz.sum()):,} trees without a prior')
+    check('frame: l0 is 2 for softwoods and 5 for hardwoods', set(Bf['l0'].unique().tolist()) <= {2.0, 5.0} and bool((Bf['l0'] == 2.0).any()))
     zf = torch.zeros(1, Bf['v'].shape[0], M.DZ)
     mf = A.make_model(vf); af = mf.ages(zf, Bf).detach()[0].numpy(); ti, po = sf_._tid.to_numpy(), sf_._pos.to_numpy(); sa = sf_.assign(a=af[ti, po], yr=(pd.to_datetime(sf_.measdate) - pd.Timestamp('2000-01-01')) / pd.Timedelta(days=365.25))
     r_ = sa.groupby(M.K_).apply(lambda g: float(((g.a - g.a.iloc[0]) - (g.yr - g.yr.iloc[0])).abs().max()), include_groups=False).max()
