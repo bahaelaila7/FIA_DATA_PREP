@@ -37,7 +37,6 @@ import duckdb
 import polars as pl
 from fia_ids import pick, maybe_shuffle
 
-from fia_curation_v3 import _next_visit   # shared next-visit / nonforest lookup (r2 M6)
 from cohorts_landis import (
     PLOT_KEY, SUBPLOT_ID, TREE_ID,
     MIN_BACKFILL_DRYBIO_G,       # r7 C F5: the per-tree (grams) phantom floor
@@ -469,74 +468,27 @@ def add_alt_age_axes(body: pl.DataFrame) -> pl.DataFrame:
 # Step 4: terminal fate (per tree)
 # =============================================================================
 
-def classify_terminal_fate(full: pl.DataFrame, visits: pl.DataFrame,
-                           landuse_exits: pl.DataFrame | None = None) -> pl.DataFrame:
-    """Per tree, derive terminal_fate + death_cause from its last real record and
-    whether the subplot was visited again afterwards."""
-    # r3 I1: the terminal record is the FIRST dead/cut record when the tree has one (later
-    # dead records are re-records of the same death); otherwise the last (live) record
-    cols = TREE_ID + ["MEASDATE", "STATUSCD", "tree_fate", "AGENTCD",
-                      "dist_death_def", "censor_last_measdate", "censor_last_reason"]
-    first_dead = (full.filter(pl.col("STATUSCD").is_in([2, 3]))
-                  .pipe(pick, TREE_ID, ["MEASDATE"], "first").select(cols))
-    last_live = (full.pipe(pick, TREE_ID, ["MEASDATE"], "last").select(cols)
-                 .join(first_dead.select(TREE_ID), on=TREE_ID, how="anti"))
-    last = pl.concat([first_dead, last_live]).rename({"MEASDATE": "terminal_measdate"})
-    # was the subplot visited strictly after the tree's last record, and was that next
-    # visit entirely nonforest / did the tree turn up live on a nonforest/water condition
-    # (r2 M6 -> diverted_landuse)?
-    nxt = _next_visit(last.select(TREE_ID + [pl.col("terminal_measdate").alias("_last_md")]), visits)
-    last = last.join(nxt, on=TREE_ID, how="left").with_columns(
-        pl.col("_later").fill_null(False).alias("_later_visit"))
-    if landuse_exits is not None and landuse_exits.height:
-        lex = (last.select(TREE_ID + ["terminal_measdate"]).join(landuse_exits, on=TREE_ID, how="inner")
-               .filter(pl.col("exit_measdate") > pl.col("terminal_measdate"))
-               .select(TREE_ID).unique().with_columns(pl.lit(True).alias("_lu_exit")))
-        last = last.join(lex, on=TREE_ID, how="left")
-    else:
-        last = last.with_columns(pl.lit(None, dtype=pl.Boolean).alias("_lu_exit"))
-    diverted = pl.col("_later_visit") & (pl.col("_lu_exit").fill_null(False) |
-                                         pl.col("_next_nonforest").fill_null(False))
-
-    is_dist = pl.col("dist_death_def")   # r7 D41 (cohorts_landis.disturbance_death_expr)
-
-    last = last.with_columns(
-        pl.when(pl.col("tree_fate").is_in(["silvicultural_death", "harvest_inferred", "diverted_landuse"]))
-            .then(pl.col("tree_fate"))      # r3 M6: a cut on now-nonforest land = diverted_landuse
-        .when((pl.col("STATUSCD") == 2) & is_dist)
-            .then(pl.lit("dead_disturbance"))
-        .when(pl.col("STATUSCD") == 2)
-            .then(pl.lit("dead_natural"))
-        # curation-fix 2026-10-26: STATUSCD=0 + RECONCILECD 5/6/8/9 after the last live
-        # record = CENSORING (shrank / moved / procedural / nonsampled), not a removal
-        .when((pl.col("STATUSCD") == 1) & pl.col("censor_last_measdate").is_not_null() &
-              (pl.col("censor_last_measdate") > pl.col("terminal_measdate")))
-            .then(pl.lit("censored_") + pl.col("censor_last_reason"))
-        .when((pl.col("STATUSCD") == 1) & diverted)
-            .then(pl.lit("diverted_landuse"))
-        .when((pl.col("STATUSCD") == 1) & pl.col("_later_visit"))
-            .then(pl.lit("disappeared_inferred_removal"))
-        .when(pl.col("STATUSCD") == 1)
-            .then(pl.lit("alive_censored"))
-        .otherwise(pl.lit("unknown"))
-        .alias("terminal_fate")
+def classify_terminal_fate(con, states: list[int] | None = None) -> pl.DataFrame:
+    """D72: terminal_fate + death_cause per tree, read from tree_end (the one end definition, fia_curation_v3.tree_end_table):
+    a death is split by the D41 disturbance definition (dead_disturbance / dead_natural), alive with no later visit is alive_censored,
+    every other end reason is kept. terminal_measdate = the tree's last record (its first dead / cut record if it has one)."""
+    ws = f"WHERE STATECD IN ({','.join(map(str, states))})" if states else ""
+    te = con.execute(f"""SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, end_reason, death_kind, last_record_measdate
+                         FROM tree_end {ws}""").pl()
+    last = te.with_columns(
+        pl.when(pl.col("end_reason") == "dead").then(pl.lit("dead_") + pl.col("death_kind"))
+          .when(pl.col("end_reason") == "alive").then(pl.lit("alive_censored"))
+          .otherwise(pl.col("end_reason")).alias("terminal_fate"),
+        pl.col("last_record_measdate").alias("terminal_measdate")
     ).with_columns(
-        pl.when(pl.col("terminal_fate").is_in(["dead_disturbance"]))
-            .then(pl.lit("disturbance"))
-        .when(pl.col("terminal_fate") == "dead_natural")
-            .then(pl.lit("natural"))
-        .when(pl.col("terminal_fate").is_in(["silvicultural_death", "harvest_inferred"]))
-            .then(pl.col("terminal_fate"))
-        .when(pl.col("terminal_fate") == "disappeared_inferred_removal")
-            .then(pl.lit("harvest_inferred"))
-        .otherwise(pl.lit(None).cast(pl.Utf8))
-        .alias("death_cause")
-    )
-
-    print("[fate] terminal_fate distribution:")
+        pl.when(pl.col("terminal_fate") == "dead_disturbance").then(pl.lit("disturbance"))
+        .when(pl.col("terminal_fate") == "dead_natural").then(pl.lit("natural"))
+        .when(pl.col("terminal_fate").is_in(["silvicultural_death", "harvest_inferred"])).then(pl.col("terminal_fate"))
+        .when(pl.col("terminal_fate") == "disappeared_inferred_removal").then(pl.lit("harvest_inferred"))
+        .otherwise(pl.lit(None).cast(pl.Utf8)).alias("death_cause"))
+    print("[fate] terminal_fate distribution (from tree_end):")
     for f, n in last.group_by("terminal_fate").len().sort("len", descending=True).iter_rows():
         print(f"        {str(f):30s}: {n:>10,}")
-
     return last.select(TREE_ID + ["terminal_measdate", "terminal_fate", "death_cause"])
 
 
@@ -755,7 +707,7 @@ def build_tree_trajectories(con, states: list[int] | None = None) -> pl.DataFram
     _ws = f"WHERE STATECD IN ({','.join(map(str, states))})" if states else ""
     landuse_exits = con.execute(f"""SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, exit_measdate
                                     FROM tree_landuse_exits {_ws}""").pl()
-    fate   = classify_terminal_fate(full, visits, landuse_exits)
+    fate   = classify_terminal_fate(con, states)        # D72: from tree_end
     lu     = derive_land_use(full, events)
 
     # trajectory body (live + phantom + interpolated)

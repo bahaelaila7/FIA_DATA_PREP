@@ -78,13 +78,14 @@ def build(seq: pd.DataFrame, vocab=None):
     agent = seq.dead_agent.to_numpy(float)
     # definitive end slot (first slot at which the tree is gone) and its cause
     is_dead_end = (md >= dead_md).to_numpy() & ~end_hidden                                       # first slot ON OR AFTER the dead record
-    is_inf_cut = np.isin(fate, ['harvest_inferred', 'disappeared_inferred_removal']) & (kind == 'post') & ~end_hidden
+    has_end = 'end_cause' in seq                                                                   # D72 frames date every end, inferred removals too
+    is_inf_cut = np.isin(fate, ['harvest_inferred', 'disappeared_inferred_removal']) & (kind == 'post') & ~end_hidden & (not has_end)
     is_moved = (fate == 'censored_moved') & (md >= s0_md).to_numpy() & ~end_hidden
     end_here = is_dead_end | is_moved
     first_post = (kind == 'post') & (pos == L_ + 1)
     end_here = end_here | (is_inf_cut & first_post)
     endpos = per_tree_minmax(end_here, 'min'); EP = endpos[tid]
-    cause_cut = np.isin(fate, CUT_FATES) | (agent == 80)
+    cause_cut = (seq.end_cause.to_numpy(object) == 'cut') if has_end else (np.isin(fate, CUT_FATES) | (agent == 80))   # D72: the cause from tree_end
     tree_cause = pd.Series(np.where(cause_cut, 1, 0), index=tid).groupby(level=0).max().reindex(range(n)).fillna(0).to_numpy().astype(int)
     tree_moved = pd.Series(fate == 'censored_moved', index=tid).groupby(level=0).max().reindex(range(n)).fillna(False).to_numpy(bool)
     # existence evidence

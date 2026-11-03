@@ -174,80 +174,27 @@ def load_base_data(con) -> pl.DataFrame:
 #   * cohort_tracking's n_disturbance_dead (curated_cohorts),
 #   * tree_trajectories' terminal_fate 'dead_disturbance',
 #   * the Sim B drops (cohort_disturbance: a removal counts only at its event visit).
-DISTURBANCE_AGENTS = (10, 20, 30, 40, 50)
-NON_DISTURBANCE_DSTRBCD = (0, 60)
-HARVEST_FATES = ("silvicultural_death", "harvest_inferred")
-
-
-def disturbance_death_sql(alias: str = "") -> str:
-    """SQL boolean: the record's death is a disturbance death (D41); `alias` = table alias."""
-    a = f"{alias}." if alias else ""
-    ag = ", ".join(map(str, DISTURBANCE_AGENTS))
-    nd = ", ".join(map(str, NON_DISTURBANCE_DSTRBCD))
-    return (f"(COALESCE({a}AGENTCD IN ({ag}), FALSE)"
-            + "".join(f" OR COALESCE({a}DSTRBCD{i} NOT IN ({nd}), FALSE)" for i in (1, 2, 3)) + ")")
-
-
-def disturbance_death_expr() -> pl.Expr:
-    """polars twin of disturbance_death_sql (columns AGENTCD, DSTRBCD1-3)."""
-    e = pl.col("AGENTCD").is_in(list(DISTURBANCE_AGENTS)).fill_null(False)
-    for i in (1, 2, 3):
-        c = pl.col(f"DSTRBCD{i}")
-        e = e | (c.is_not_null() & ~c.is_in(list(NON_DISTURBANCE_DSTRBCD))).fill_null(False)
-    return e
+from fia_rules import (DISTURBANCE_AGENTS, NON_DISTURBANCE_DSTRBCD, disturbance_death_sql, disturbance_death_expr,   # D72: defined once
+                       HARVEST_REASONS as HARVEST_FATES)
 
 
 def disturbance_events(con, states=None) -> pl.DataFrame:
-    """r7 D41 / D38: one row per tree with a disturbance REMOVAL event (TREE_ID + event_invyr, its
-    event_measdate, event_kind, first_record_dead). The event is
-      * 'cut' / 'disturbance_death': the tree's FIRST dead / cut record (misrecorded deaths, D26,
-        are not records of death; a first record that is a re-record, PREV_STATUS_CD = 2, is not
-        an event: the death preceded the record's interval), with tree_fate silvicultural_death /
-        harvest_inferred, or tree_fate 'dead' under the disturbance definition above. A cut on
-        now-nonforest land is 'diverted_landuse' (r3 M6), not a cut event.
-      * 'inferred_removal': final_tree_fate 'disappeared_inferred_removal' (alive at the last
-        record, the subplot revisited without it; death_cause harvest_inferred) at the FIRST
-        scaffold visit after the tree's last record.
-    first_record_dead (D38, from curated_trees) is carried so consumers can exclude first-seen
-    deaths from mortality and drops."""
+    """r7 D41 / D38; D72: one row per tree with a disturbance REMOVAL event, read from tree_end (the one end definition):
+      * 'cut': end_kind cut with a harvest reason (a cut on land leaving forest, diverted_landuse, is not a cut event);
+      * 'disturbance_death': end_kind death with death_kind disturbance (AGENTCD 10-50 or a DSTRBCD other than 0 / 60);
+      * 'inferred_removal': end_kind inferred_removal, at its end visit (the first later visit that sampled the tree's own tally area).
+    A first dead record that is a re-record (PREV_STATUS_CD 2) is no event. first_record_dead (D38) is carried."""
     import dbconn
-    dbconn.require_tables(con, "curated_trees", "clean_subplot_years")
-    need = {"first_record_dead", "misrecorded_death", "rerecord_dead", "final_tree_fate"}
-    miss = need - dbconn.column_names(con, "curated_trees")
-    if miss:
-        raise SystemExit(f"curated_trees lacks {sorted(miss)} (r7 D38 / D41 need them; rerun step 1)")
+    dbconn.require_tables(con, "tree_end")
     ws = dbconn.state_filter(states, col="STATECD", prefix="AND")
     harv = ", ".join(f"'{f}'" for f in HARVEST_FATES)
     return con.execute(f"""
-        WITH fd AS (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, INVYR, MEASDATE, tree_fate,
-                   COALESCE(rerecord_dead, FALSE) AS _rerec,
-                   COALESCE(first_record_dead, FALSE) AS first_record_dead,
-                   {disturbance_death_sql()} AS _dist
-            FROM curated_trees
-            WHERE STATUSCD IN (2, 3) AND NOT COALESCE(misrecorded_death, FALSE) {ws}
-            QUALIFY row_number() OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
-                                       ORDER BY INVYR) = 1),
-        ev_dead AS (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, INVYR AS event_invyr, MEASDATE AS event_measdate,
-                   CASE WHEN tree_fate IN ({harv}) THEN 'cut' ELSE 'disturbance_death' END AS event_kind,
-                   first_record_dead
-            FROM fd
-            WHERE NOT _rerec AND (tree_fate IN ({harv}) OR (tree_fate = 'dead' AND _dist))),
-        dis AS (
-            SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, max(INVYR) AS _last
-            FROM curated_trees
-            WHERE final_tree_fate = 'disappeared_inferred_removal' AND NOT COALESCE(misrecorded_death, FALSE) {ws}
-            GROUP BY ALL),
-        ev_dis AS (
-            SELECT d.STATECD, d.UNITCD, d.COUNTYCD, d.PLOT, d.SUBP, d.TREE, min(v.INVYR) AS event_invyr,
-                   min(v.MEASDATE) AS event_measdate,
-                   'inferred_removal' AS event_kind, FALSE AS first_record_dead
-            FROM dis d JOIN clean_subplot_years v
-              ON v.STATECD = d.STATECD AND v.UNITCD = d.UNITCD AND v.COUNTYCD = d.COUNTYCD
-             AND v.PLOT = d.PLOT AND v.SUBP = d.SUBP AND v.INVYR > d._last
-            GROUP BY ALL)
-        SELECT * FROM ev_dead UNION ALL SELECT * FROM ev_dis
+        SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, end_invyr AS event_invyr, end_measdate AS event_measdate,
+               CASE end_kind WHEN 'cut' THEN 'cut' WHEN 'death' THEN 'disturbance_death' ELSE 'inferred_removal' END AS event_kind,
+               COALESCE(first_record_dead, FALSE) AS first_record_dead
+        FROM tree_end
+        WHERE ((end_kind = 'cut' AND end_reason IN ({harv})) OR (end_kind = 'death' AND death_kind = 'disturbance') OR end_kind = 'inferred_removal')
+          AND NOT end_rerecord {ws}
         ORDER BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE
     """).pl()
 
@@ -673,7 +620,7 @@ def load_backfill_context(con) -> dict:
               visit between p and D was invisible before)
       censor  every censoring event (tree_censor_events) for the cohort-pass gap members"""
     import dbconn
-    dbconn.require_tables(con, "procedural_breaks", "clean_subplot_years", "tree_censor_events")
+    dbconn.require_tables(con, "procedural_breaks", "visit_status", "tree_censor_events")
     breaks = con.execute("""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, MEASDATE AS break_date,
                bool_or(break_kind = 'rc8') AS _brk_rc8,
@@ -684,8 +631,9 @@ def load_backfill_context(con) -> dict:
     visit = con.execute("""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR AS prior_invyr, MEASDATE AS prior_measdate,
                MAX(COALESCE(forest_micrcond_prop, 0)) AS _micro_prop,
-               MAX(COALESCE(forest_subpcond_prop, 0) + COALESCE(forest_micrcond_prop, 0)) AS _forest_prop
-        FROM clean_subplot_years GROUP BY ALL
+               MAX(COALESCE(forest_subpcond_prop, 0) + COALESCE(forest_micrcond_prop, 0)) AS _forest_prop,
+               any_value(segment) AS segment                                            -- D72: the plot's lineage segment
+        FROM visit_status GROUP BY STATECD, UNITCD, COUNTYCD, PLOT, SUBP, INVYR, MEASDATE
     """).pl()
     censor = con.execute("""
         SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, MEASDATE AS _cdate
@@ -789,6 +737,17 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
     n0 = prior.height
     prior = prior.filter(~pl.col("_bf_none"))
     n_none = n0 - prior.height
+    # D72 (C1): never across a lineage segment start (KINDCD 1 / 3, DESIGNCD change): the earlier visits are another physical plot
+    n_seg = 0
+    if "segment" in visit.columns and "INVYR" in prior.columns:
+        sg = visit.select(SUBPLOT_ID + ["prior_invyr", "segment"])
+        n1s = prior.height
+        prior = (prior.join(sg.rename({"prior_invyr": "INVYR", "segment": "_seg_d"}).with_columns(pl.col("INVYR").cast(prior.schema["INVYR"])),
+                            on=SUBPLOT_ID + ["INVYR"], how="left")
+                      .join(sg.rename({"segment": "_seg_p"}).with_columns(pl.col("prior_invyr").cast(prior.schema["prior_invyr"])),
+                            on=SUBPLOT_ID + ["prior_invyr"], how="left")
+                      .filter(pl.col("_seg_p") == pl.col("_seg_d")).drop(["_seg_d", "_seg_p"]))
+        n_seg = n1s - prior.height
 
     # (n) nonforest: latest entirely-nonforest scaffold visit before D (full scaffold, M1).
     # r7 D44 (C F4): a SAPLING debut (tallied on the microplot) tests the MICROPLOT forest
@@ -815,7 +774,7 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
                  .filter(pl.col("_last_dd").is_null() | (pl.col("prior_measdate") > pl.col("_last_dd")))
                  .drop("_last_dd"))
         n_z = n2z - prior.height
-    prior = prior.join(visit.drop("prior_measdate"), on=SUBPLOT_ID + ["prior_invyr"], how="left")
+    prior = prior.join(visit.drop([c for c in ("prior_measdate", "segment") if c in visit.columns]), on=SUBPLOT_ID + ["prior_invyr"], how="left")
 
     # (b) plot-level procedural break in (p, D]: the SAPLING part only for sapling re-tally
     # breaks (closed RC8 saplings, or unrecorded saplings: r2 M9), the RC8-entry part for
@@ -843,7 +802,7 @@ def apply_backfill_blocks(prior: pl.DataFrame, ctx, key, rule_c: bool = True) ->
         prior = prior.filter(pl.col("_last_micro").is_null() |
                              (pl.col("prior_measdate") > pl.col("_last_micro"))).drop("_last_micro")
         n_c = n3 - prior.height
-    print(f"[backfill blocks] of {n0:,} candidate slots dropped: {n_none:,} RC6/9 entry, "
+    print(f"[backfill blocks] of {n0:,} candidate slots dropped: {n_none:,} RC6/9 entry, {n_seg:,} across a lineage segment start, "
           f"{n_nf:,} at/before a nonforest visit, {n_z:,} at/before a pre-debut dead record, "
           f"{n_break:,} across a plot procedural break, "
           f"{n_c:,} >=5in ingrowth/microplot" + ("" if rule_c else " (rule c off)"))

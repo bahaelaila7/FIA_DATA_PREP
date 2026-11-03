@@ -801,25 +801,51 @@ con.execute(f"""CREATE TEMP TABLE rlx AS {_rekey(f'''
     FROM f.TREE T JOIN f.PLOT P ON P.CN = T.PLT_CN JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
     JOIN f.COND C ON C.PLT_CN = T.PLT_CN AND C.CONDID = T.CONDID
     WHERE T.STATUSCD = 1 AND T.SUBP <= 4 AND C.COND_STATUS_CD IN (2, 3, 4) AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y' AND {scope('T')}''', 'md')}""")
+# D72: lineage segments re-derived from raw PLOT (a segment starts at KINDCD 1 / 3 or a DESIGNCD change after a plot's first annual visit)
+con.execute(f"""CREATE TEMP TABLE vseg AS
+SELECT STATECD, UNITCD, COUNTYCD, PLOT, INVYR,
+       sum(CASE WHEN k > 1 AND (KINDCD IN (1, 3) OR DESIGNCD IS DISTINCT FROM pd) THEN 1 ELSE 0 END)
+           OVER (PARTITION BY STATECD, UNITCD, COUNTYCD, PLOT ORDER BY md, INVYR ROWS UNBOUNDED PRECEDING) seg
+FROM (SELECT P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT, P.INVYR, P.KINDCD, P.DESIGNCD, x.md,
+             lag(P.DESIGNCD) OVER w pd, row_number() OVER w k
+      FROM f.PLOT P JOIN f.SURVEY S ON S.CN = P.SRV_CN AND S.ANN_INVENTORY = 'Y'
+      CROSS JOIN LATERAL (SELECT MAKE_DATE(CAST(P.MEASYEAR AS INTEGER), COALESCE(NULLIF(CAST(P.MEASMON AS INTEGER), 0), 6), COALESCE(NULLIF(CAST(P.MEASDAY AS INTEGER), 0), 15)) md) x
+      WHERE {scope('P')}
+      WINDOW w AS (PARTITION BY P.STATECD, P.UNITCD, P.COUNTYCD, P.PLOT ORDER BY x.md, P.INVYR))""")
+con.execute("CREATE TEMP TABLE rvs AS SELECT rv.*, v.seg FROM rv JOIN vseg v USING (STATECD, UNITCD, COUNTYCD, PLOT, INVYR)")
+# D72: a tree alive at its last record whose next visit starts a new segment is censored (lineage_break); one removed only where a later
+# visit of its own segment had forest in its own tally area (microplot below 5 in, else subplot), dated at the first such visit; else
+# censored_unobserved
 con.execute(f"""
 CREATE TEMP TABLE myfate AS
-WITH t AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, max(MEASDATE) lmd, any_value(final_tree_fate) pf,
-                  bool_or(STATUSCD IN (2,3) AND NOT COALESCE(misrecorded_death, FALSE)) has_dead
+WITH t0 AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, max(MEASDATE) lmd, any_value(final_tree_fate) pf,
+                  bool_or(STATUSCD IN (2,3) AND NOT COALESCE(misrecorded_death, FALSE)) has_dead,
+                  arg_max(DIA, MEASDATE) ldia, arg_min(INVYR, MEASDATE) finv
            FROM new.curated_trees WHERE {scope()} GROUP BY ALL),
+t AS (SELECT t0.*, v.seg tseg FROM t0 LEFT JOIN vseg v ON v.STATECD = t0.STATECD AND v.UNITCD = t0.UNITCD AND v.COUNTYCD = t0.COUNTYCD
+      AND v.PLOT = t0.PLOT AND v.INVYR = t0.finv),
 c AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, max(MEASDATE) cmd, arg_max(reason, (MEASDATE, reason)) creason
       FROM new.tree_censor_events GROUP BY ALL),
 x AS (SELECT t.*, c.cmd, c.creason,
              (SELECT min(rv.md) FROM rv WHERE rv.STATECD = t.STATECD AND rv.UNITCD = t.UNITCD AND rv.COUNTYCD = t.COUNTYCD
               AND rv.PLOT = t.PLOT AND rv.SUBP = t.SUBP AND rv.md > t.lmd) nmd,
+             (SELECT min(rv.md) FROM rvs rv WHERE rv.STATECD = t.STATECD AND rv.UNITCD = t.UNITCD AND rv.COUNTYCD = t.COUNTYCD
+              AND rv.PLOT = t.PLOT AND rv.SUBP = t.SUBP AND rv.md > t.lmd AND rv.seg = t.tseg
+              AND (CASE WHEN COALESCE(t.ldia, 0) < 5 THEN rv.fmic ELSE rv.fsub END) > 0) smd,
              EXISTS (SELECT 1 FROM rlx WHERE rlx.STATECD = t.STATECD AND rlx.UNITCD = t.UNITCD AND rlx.COUNTYCD = t.COUNTYCD
                      AND rlx.PLOT = t.PLOT AND rlx.SUBP = t.SUBP AND rlx.TREE = t.TREE AND rlx.md > t.lmd) lux
-      FROM t LEFT JOIN c USING (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE) WHERE NOT t.has_dead)
-SELECT x.*, CASE WHEN cmd > lmd THEN 'censored_' || creason
-                 WHEN nmd IS NOT NULL AND (lux OR (SELECT rv.fsub + rv.fmic <= 0 FROM rv WHERE rv.STATECD = x.STATECD AND rv.UNITCD = x.UNITCD
-                      AND rv.COUNTYCD = x.COUNTYCD AND rv.PLOT = x.PLOT AND rv.SUBP = x.SUBP AND rv.md = x.nmd)) THEN 'diverted_landuse'
-                 WHEN nmd IS NOT NULL THEN 'disappeared_inferred_removal'
-                 ELSE 'alive' END ef
-FROM x""")
+      FROM t LEFT JOIN c USING (STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE) WHERE NOT t.has_dead),
+y AS (SELECT x.*, (SELECT any_value(rv.seg) FROM rvs rv WHERE rv.STATECD = x.STATECD AND rv.UNITCD = x.UNITCD AND rv.COUNTYCD = x.COUNTYCD
+                   AND rv.PLOT = x.PLOT AND rv.SUBP = x.SUBP AND rv.md = x.nmd) nseg,
+             (SELECT bool_and(rv.fsub + rv.fmic <= 0) FROM rv WHERE rv.STATECD = x.STATECD AND rv.UNITCD = x.UNITCD
+              AND rv.COUNTYCD = x.COUNTYCD AND rv.PLOT = x.PLOT AND rv.SUBP = x.SUBP AND rv.md = x.nmd) nnf FROM x)
+SELECT y.*, CASE WHEN cmd > lmd THEN 'censored_' || creason
+                 WHEN nmd IS NULL THEN 'alive'
+                 WHEN nseg IS DISTINCT FROM tseg THEN 'censored_lineage_break'
+                 WHEN lux OR nnf THEN 'diverted_landuse'
+                 WHEN smd IS NOT NULL THEN 'disappeared_inferred_removal'
+                 ELSE 'censored_unobserved' END ef
+FROM y""")
 r = con.execute("SELECT count(*), count(*) FILTER (WHERE ef IS DISTINCT FROM pf) FROM myfate").fetchone()
 check_n("(n20) E10: final_tree_fate of trees without a dead/cut record = re-derived (censoring, land-use exit, revisit)",
         r[1] == 0, r[0], f"({r[1]:,} of {r[0]:,} trees differ)")
@@ -1051,7 +1077,21 @@ WHERE is_first AND NOT rr
       OR (cls = 'dead' AND (COALESCE(AGENTCD IN (10, 20, 30, 40, 50), FALSE) OR COALESCE(DSTRBCD1 NOT IN (0, 60), FALSE)
                             OR COALESCE(DSTRBCD2 NOT IN (0, 60), FALSE) OR COALESCE(DSTRBCD3 NOT IN (0, 60), FALSE))))
 UNION ALL
-SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, nmd, 'inferred_removal' FROM myfate WHERE ef = 'disappeared_inferred_removal'""")
+SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, smd, 'inferred_removal' FROM myfate WHERE ef = 'disappeared_inferred_removal'""")   # D72: dated where the spot was seen
+# D72: no phantom at a visit of another lineage segment than the tree's own (C1): trajectories and the Sim A tree-pass sources
+for _t, _k, _p, _d in (("tree_trajectories", "c.tree", "c.measdate", None), ("phantom_tree_sources", "c.TREE", "c.prior_measdate", "c.debut_measdate")):
+    if not con.execute(f"SELECT count(*) FROM duckdb_tables() WHERE database_name = 'new' AND table_name = '{_t}'").fetchone()[0]:
+        continue
+    _cols = ("c.statecd", "c.unitcd", "c.countycd", "c.plot", "c.subp") if _t == "tree_trajectories" else ("c.STATECD", "c.UNITCD", "c.COUNTYCD", "c.PLOT", "c.SUBP")
+    _w = f"c.intro_type = 'phantom_backfill' AND {scope('c', 'statecd', 'countycd')}" if _t == "tree_trajectories" else scope('c')
+    r = con.execute(f"""WITH ph AS (SELECT {', '.join(_cols)}, {_k} tree, {_p} pmd FROM new.{_t} c WHERE {_w}),
+        deb AS (SELECT STATECD, UNITCD, COUNTYCD, PLOT, SUBP, TREE, arg_min(INVYR, MEASDATE) finv FROM new.curated_trees WHERE STATUSCD = 1 AND {scope()} GROUP BY ALL)
+        SELECT count(*), count(*) FILTER (WHERE vp.seg IS DISTINCT FROM vd.seg) FROM ph
+        JOIN deb d ON d.STATECD = ph.{_cols[0][2:]} AND d.UNITCD = ph.{_cols[1][2:]} AND d.COUNTYCD = ph.{_cols[2][2:]} AND d.PLOT = ph.{_cols[3][2:]}
+             AND d.SUBP = ph.{_cols[4][2:]} AND d.TREE = ph.tree
+        LEFT JOIN rvs vp ON vp.STATECD = d.STATECD AND vp.UNITCD = d.UNITCD AND vp.COUNTYCD = d.COUNTYCD AND vp.PLOT = d.PLOT AND vp.SUBP = d.SUBP AND vp.md = ph.pmd
+        LEFT JOIN vseg vd ON vd.STATECD = d.STATECD AND vd.UNITCD = d.UNITCD AND vd.COUNTYCD = d.COUNTYCD AND vd.PLOT = d.PLOT AND vd.INVYR = d.finv""").fetchone()
+    check_n(f"(n27) D72: no phantom of {_t} on another lineage segment than its tree's debut", r[1] == 0, r[0], f"({r[1]:,} of {r[0]:,} phantoms)")
 # trajectories' terminal_fate / death_cause (D41 / E23): the tree's final fate, with a death split
 # into dead_disturbance / dead_natural by the ONE disturbance definition on its first dead record
 # and 'alive' as alive_censored; death_cause follows (disappeared -> harvest_inferred)

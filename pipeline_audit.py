@@ -63,6 +63,28 @@ def frame(c, seq):
     check('F12 climate normals on every slot', seq.tm_n.notna().mean() >= 0.999, f'{seq.tm_n.notna().mean():.5f}')
     mv = c.execute("SELECT DISTINCT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot FROM procedural_breaks WHERE is_microplot_move").df()
     a = seq[seq.move_invyr.notna()].drop_duplicates('plot_key'); b = a.merge(mv, on=['statecd', 'unitcd', 'countycd', 'plot']); check('F13 move_invyr only on plots with a flagged move', len(a) == len(b) and len(a) > 0, (len(a), len(b)))
+    # D72 invariants: one definition, checked against the shared tables
+    lv = one(c, "SELECT count(*) FROM curated_trees WHERE STATUSCD = 1 AND TPA_UNADJ > 0")[0]; rl = int((seq.slot_kind == 'real').sum())
+    check('F15 every curated live record is a real slot (C8)', lv == rl, (lv, rl))
+    sq = seq[k + ['invyr', 'slot_kind', 'measdate', 'dead_md', 'terminal_fate', 'forest_subpcond_prop', 'forest_micrcond_prop', 'dia'] + (['end_cause'] if 'end_cause' in seq else [])].copy()
+    c.register('_sq', sq)
+    r = one(c, """SELECT count(*), count(*) FILTER (WHERE s.segment IS DISTINCT FROM te.segment) FROM _sq q
+        JOIN tree_end te ON te.STATECD = q.statecd AND te.UNITCD = q.unitcd AND te.COUNTYCD = q.countycd AND te.PLOT = q.plot AND te.SUBP = q.subp AND te.TREE = q.tree
+        LEFT JOIN plot_segments s ON s.STATECD = q.statecd AND s.UNITCD = q.unitcd AND s.COUNTYCD = q.countycd AND s.PLOT = q.plot AND s.INVYR = q.invyr""")
+    check('F16 every slot lies in its tree\'s lineage segment (C1)', r[1] == 0 and r[0] == len(sq), r)
+    r = one(c, """WITH ld AS (SELECT statecd, unitcd, countycd, plot, subp, tree, arg_max(dia, measdate) ldia FROM _sq WHERE slot_kind = 'real' GROUP BY ALL)
+        SELECT count(*), count(*) FILTER (WHERE (CASE WHEN ld.ldia < 5 THEN q.forest_micrcond_prop ELSE q.forest_subpcond_prop END) IS DISTINCT FROM NULL
+                                               AND (CASE WHEN ld.ldia < 5 THEN q.forest_micrcond_prop ELSE q.forest_subpcond_prop END) <= 0)
+        FROM _sq q JOIN ld USING (statecd, unitcd, countycd, plot, subp, tree)
+        WHERE q.terminal_fate = 'disappeared_inferred_removal' AND q.measdate = q.dead_md""")
+    check('F17 an inferred removal ends where the tree\'s own tally area was sampled (C3)', r[1] == 0 and r[0] > 0, r)
+    if 'end_cause' in seq:
+        r = one(c, """WITH f AS (SELECT DISTINCT statecd, unitcd, countycd, plot, subp, tree, end_cause FROM _sq WHERE dead_md IS NOT NULL)
+            SELECT count(*), count(*) FILTER (WHERE (te.cause = 'cut') IS DISTINCT FROM (f.end_cause = 'cut')),
+                   count(*) FILTER (WHERE te.end_reason = 'diverted_landuse' AND te.end_kind = 'cut' AND f.end_cause IS DISTINCT FROM 'cut')
+            FROM f JOIN tree_end te ON te.STATECD = f.statecd AND te.UNITCD = f.unitcd AND te.COUNTYCD = f.countycd AND te.PLOT = f.plot AND te.SUBP = f.subp AND te.TREE = f.tree""")
+        check('F18 every cut ends as a cut in the frame, land clearing included (C7)', r[1] == 0 and r[2] == 0, r)
+    c.unregister('_sq')
     banned = [x_ for x_ in seq.columns if x_.lower() in ('stdage', 'fldage', 'estimated_age', 'age_from_stdage')]; check('F14 no STDAGE or curated age column in the frame', not banned, banned)
 
 

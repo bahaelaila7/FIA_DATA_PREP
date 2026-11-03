@@ -11,7 +11,7 @@ Usage: python -I nimiwae_prep.py --out DIR DB [DB ...]"""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse, zlib
 import duckdb, numpy as np, polars as pl
-from cohorts_landis import estimate_sapling_growth_rates, MIN_BACKFILL_DRYBIO_G, TREE_ID
+from cohorts_landis import estimate_sapling_growth_rates, MIN_BACKFILL_DRYBIO_G, TREE_ID, plot_land_use_sql
 
 PSEUDO_IN = 3.0          # D49 pseudo tally limit (in)
 # Plot-design tally levels are DERIVED FROM THE DATA (D54 am. 9; no hard-coded TPA): per (DESIGNCD, TPA_UNADJ class) the minimum DIA
@@ -55,7 +55,8 @@ def run_steps(c, q: str) -> pl.DataFrame:
 def load54(db: str) -> pl.DataFrame:
     """D54 lineage frame. Counted plot visits = at least one subplot with a forested condition; a subplot's span = its first to last
     such visit; a tree's lineage = every counted visit in its subplot's span (before its debut, during and after its record).
-    slot_kind real / pre / gap / post. Per slot (D55 am. 7): the condition fields are SUBPLOT-level at the visit, area-weighted by
+    slot_kind real / pre / gap / post. D72: real slots = every curated live record (C8); slots within the tree's lineage segment (C1);
+    the end, its date and cause from tree_end (C3, C7); move_invyr = the latest microplot move at or before the debut (C2). Per slot (D55 am. 7): the condition fields are SUBPLOT-level at the visit, area-weighted by
     SUBPCOND_PROP over the subplot's accessible-forest conditions (all its conditions when it has none): weighted means (SICOND, SLOPE,
     canopy; ASPECT circular), area-dominant classes (FORTYPCD, SITECLCD, PHYSCLCD, STDORGCD), the area share carrying each treatment /
     disturbance code group (trt_s*, dst_s*). No CONDID is carried between visits (CONDIDs are per visit in FIADB); the subplot / microplot
@@ -65,14 +66,30 @@ def load54(db: str) -> pl.DataFrame:
     c = duckdb.connect(db, read_only=True)
     K = "statecd, unitcd, countycd, plot, subp, tree"
     q = f"""
-    WITH real AS (SELECT * FROM tree_trajectories WHERE intro_type = 'real'),
+    WITH plu AS ({plot_land_use_sql(c)}),
+    real AS (SELECT t.STATECD statecd, t.UNITCD unitcd, t.COUNTYCD countycd, t.PLOT plot, t.SUBP subp, t.TREE tree, t.INVYR invyr, t.MEASDATE measdate,
+                    t.DIA::DOUBLE dia, t.HT::DOUBLE ht, t.CR::DOUBLE cr, t.TPA_UNADJ::DOUBLE tpa, (t.DIA * t.DIA * 0.005454 * t.TPA_UNADJ)::DOUBLE ba,
+                    (t.DRYBIO_AG * 453.592)::DOUBLE drybio_g, t.CONDID condid, t.spcd_resolved::INTEGER spcd, t.spcd_changed,
+                    COALESCE(t.spgrpcd_resolved, t.SPGRPCD)::INTEGER spgrpcd, r.SPECIES_SYMBOL::VARCHAR species_symbol,
+                    r.MAJOR_SPGRPCD::INTEGER major_spgrpcd, r.SFTWD_HRDWD::VARCHAR sftwd_hrdwd, e.epa_l3, e.epa_l4, plu.land_use,
+                    te.end_reason terminal_fate, tj.age_calc                    -- age_calc: the D49 rule benchmark only, never a model input
+             FROM curated_trees t
+             LEFT JOIN REF_SPECIES r ON r.SPCD = t.spcd_resolved
+             LEFT JOIN data_plot_eco e ON e.statecd = t.STATECD AND e.unitcd = t.UNITCD AND e.countycd = t.COUNTYCD AND e.plot = t.PLOT
+             LEFT JOIN plu ON plu.statecd = t.STATECD AND plu.unitcd = t.UNITCD AND plu.countycd = t.COUNTYCD AND plu.plot = t.PLOT
+             LEFT JOIN tree_end te ON te.STATECD = t.STATECD AND te.UNITCD = t.UNITCD AND te.COUNTYCD = t.COUNTYCD AND te.PLOT = t.PLOT AND te.SUBP = t.SUBP AND te.TREE = t.TREE
+             LEFT JOIN tree_trajectories tj ON tj.statecd = t.STATECD AND tj.unitcd = t.UNITCD AND tj.countycd = t.COUNTYCD AND tj.plot = t.PLOT
+                  AND tj.subp = t.SUBP AND tj.tree = t.TREE AND tj.invyr = t.INVYR AND tj.intro_type = 'real'
+             WHERE t.STATUSCD = 1 AND t.TPA_UNADJ > 0),           -- D72 (C8): every curated live record is a real slot, aged or not
     csy AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, INVYR invyr, MEASDATE measdate,
-                   forest_subpcond_prop fsp, forest_micrcond_prop fmp FROM clean_subplot_years),
-    pv AS (SELECT statecd, unitcd, countycd, plot, invyr, measdate FROM csy GROUP BY ALL HAVING max(fsp) > 0),
-    span AS (SELECT statecd, unitcd, countycd, plot, subp, min(measdate) s0, max(measdate) s1 FROM csy WHERE fsp > 0 GROUP BY ALL),
-    sv AS (SELECT sp.statecd, sp.unitcd, sp.countycd, sp.plot, sp.subp, pv.invyr, pv.measdate, csy.fsp, csy.fmp FROM span sp
-           JOIN pv USING (statecd, unitcd, countycd, plot)
-           LEFT JOIN csy USING (statecd, unitcd, countycd, plot, subp, invyr) WHERE pv.measdate BETWEEN sp.s0 AND sp.s1),
+                   forest_subpcond_prop fsp, forest_micrcond_prop fmp, segment seg FROM visit_status),
+    pv AS (SELECT statecd, unitcd, countycd, plot, seg, invyr, measdate FROM csy GROUP BY ALL HAVING max(fsp) > 0),
+    span AS (SELECT statecd, unitcd, countycd, plot, subp, seg, min(measdate) s0, max(measdate) s1 FROM csy WHERE fsp > 0 GROUP BY ALL),
+    sv AS (SELECT sp.statecd, sp.unitcd, sp.countycd, sp.plot, sp.subp, sp.seg, pv.invyr, pv.measdate, c2.fsp, c2.fmp FROM span sp
+           JOIN pv ON pv.statecd = sp.statecd AND pv.unitcd = sp.unitcd AND pv.countycd = sp.countycd AND pv.plot = sp.plot AND pv.seg = sp.seg
+           LEFT JOIN csy c2 ON c2.statecd = sp.statecd AND c2.unitcd = sp.unitcd AND c2.countycd = sp.countycd AND c2.plot = sp.plot
+                AND c2.subp = sp.subp AND c2.invyr = pv.invyr
+           WHERE pv.measdate BETWEEN sp.s0 AND sp.s1),                 -- D72 (C1): a subplot's span within one lineage segment
     ct AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, MEASDATE measdate, STATUSCD statuscd,
                   CCLCD cclcd, RECONCILECD rcd, AGENTCD agentcd, INVYR invyr, TREECLCD treeclcd, ACTUALHT actualht,
                   unitcd_raw, countycd_raw, plot_raw FROM curated_trees),
@@ -86,17 +103,32 @@ def load54(db: str) -> pl.DataFrame:
                   arg_min(land_use, measdate) land_use, arg_max(terminal_fate, measdate) terminal_fate,
                   arg_max(spcd, measdate) spcd, bool_or(coalesce(spcd_changed, false)) sp_revised
            FROM real GROUP BY ALL),
+    tseg AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, segment seg, end_kind, cause end_cause,
+                    end_invyr, end_measdate, end_agentcd FROM tree_end),
     rc AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, ct.rcd rcd0 FROM ct JOIN tr USING ({K})
            WHERE ct.invyr = tr.y0 AND ct.statuscd = 1),
-    dr AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.invyr) dead_invyr, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
+    dr0 AS (SELECT ct.statecd, ct.unitcd, ct.countycd, ct.plot, ct.subp, ct.tree, min(ct.invyr) dead_invyr, min(ct.measdate) dead_md, arg_min(ct.agentcd, ct.measdate) dead_agent
            FROM ct JOIN tr USING ({K}) WHERE ct.statuscd IN (2, 3) AND ct.measdate > tr.d1 GROUP BY ALL),   -- 3: cut closures (D65 am. 14)
+    -- D72 (C7, C3): the end and its cause come from tree_end (death, cut, or an inferred removal dated at the first visit that sampled the
+    -- tree's own spot); a tree_end end before the last live record (a data error the misrecorded-death rule does not catch) falls back to
+    -- the first dead / cut record after it, as before
+    dr AS (SELECT tr.statecd, tr.unitcd, tr.countycd, tr.plot, tr.subp, tr.tree,
+                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_invyr ELSE d.dead_invyr END dead_invyr,
+                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_measdate ELSE d.dead_md END dead_md,
+                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_agentcd ELSE d.dead_agent END dead_agent,
+                  CASE WHEN ts.end_measdate > tr.d1 THEN ts.end_cause WHEN d.dead_md IS NOT NULL THEN
+                       CASE WHEN d.dead_agent = 80 THEN 'cut' ELSE 'death' END END end_cause
+           FROM tr JOIN tseg ts USING ({K}) LEFT JOIN dr0 d USING ({K})
+           WHERE (ts.end_measdate > tr.d1 AND ts.end_kind IN ('cut', 'death', 'inferred_removal')) OR d.dead_md IS NOT NULL),
     s0 AS (SELECT e.STATECD statecd, e.UNITCD unitcd, e.COUNTYCD countycd, e.PLOT plot, e.SUBP subp, e.TREE tree,
                   min(e.MEASDATE) s0_md, arg_min(e.RC, e.MEASDATE) s0_rc, arg_min(e.DIA, e.MEASDATE) s0_dia, arg_min(e.HT, e.MEASDATE) s0_ht,
                   arg_min(e.closure_kind, e.MEASDATE) s0_kind
            FROM tree_status0_events e JOIN tr ON tr.statecd = e.STATECD AND tr.unitcd = e.UNITCD AND tr.countycd = e.COUNTYCD
                 AND tr.plot = e.PLOT AND tr.subp = e.SUBP AND tr.tree = e.TREE AND e.MEASDATE > tr.d1
                 AND e.closure_kind IS DISTINCT FROM 'dead_cut' GROUP BY ALL),
-    fr AS (SELECT tr.*, sv.invyr, sv.measdate, sv.fsp, sv.fmp FROM tr JOIN sv USING (statecd, unitcd, countycd, plot, subp)
+    fr AS (SELECT tr.*, sv.invyr, sv.measdate, sv.fsp, sv.fmp FROM tr JOIN tseg ts USING ({K})
+           JOIN sv ON sv.statecd = tr.statecd AND sv.unitcd = tr.unitcd AND sv.countycd = tr.countycd AND sv.plot = tr.plot AND sv.subp = tr.subp
+                AND sv.seg = ts.seg
            UNION ALL
            SELECT tr.*, r.invyr, r.measdate, NULL, NULL FROM tr JOIN real r USING ({K})
            WHERE NOT EXISTS (SELECT 1 FROM sv WHERE sv.statecd = r.statecd AND sv.unitcd = r.unitcd AND sv.countycd = r.countycd
@@ -122,7 +154,9 @@ def load54(db: str) -> pl.DataFrame:
                   {", ".join(f"sum(wt * (len(list_filter(dst, x -> x >= {c} AND x < {c + 10})) > 0)::INT) / nullif(sum(wt), 0) dst_s{c}" for c in (10, 20, 30, 40, 50, 60, 70, 80, 90))}
            FROM bw GROUP BY ALL),
     pc AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, INVYR invyr, DESIGNCD designcd FROM PLOT),
-    mv AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, max(INVYR) move_invyr FROM procedural_breaks WHERE is_microplot_move GROUP BY ALL)
+    mvl AS (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, INVYR minv FROM procedural_breaks WHERE is_microplot_move),
+    mv AS (SELECT tr.statecd, tr.unitcd, tr.countycd, tr.plot, tr.subp, tr.tree, max(m.minv) move_invyr FROM tr JOIN mvl m USING (statecd, unitcd, countycd, plot)
+           WHERE m.minv <= tr.y0 GROUP BY ALL)                       -- D72 (C2): the latest move at or before the tree's debut
     SELECT f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr, f.measdate, pc.designcd, mv.move_invyr,
            CASE WHEN t.tree IS NOT NULL THEN 'real' WHEN f.measdate < f.d0 THEN 'pre' WHEN f.measdate <= f.d1 THEN 'gap' ELSE 'post' END slot_kind,
            CASE WHEN t.tree IS NOT NULL THEN 'real' ELSE 'missing' END intro_type,
@@ -130,7 +164,7 @@ def load54(db: str) -> pl.DataFrame:
            f.species_symbol, f.spcd, f.sp_revised, f.spgrpcd, f.major_spgrpcd, f.sftwd_hrdwd, f.epa_l3, f.epa_l4, f.land_use,
            CASE WHEN t.tree IS NOT NULL THEN ct.treeclcd END treeclcd, CASE WHEN t.tree IS NOT NULL THEN ct.actualht END actualht,
            CASE WHEN t.tree IS NOT NULL THEN dm.dmg1 END dmg1, CASE WHEN t.tree IS NOT NULL THEN dm.dmg2 END dmg2, CASE WHEN t.tree IS NOT NULL THEN dm.dmg3 END dmg3,   -- in the ON clause this forced a nested-loop join
-           rc.rcd0, f.terminal_fate, dr.dead_invyr, dr.dead_md, dr.dead_agent, s0.s0_md, s0.s0_rc, s0.s0_dia, s0.s0_ht, s0.s0_kind,
+           rc.rcd0, f.terminal_fate, dr.dead_invyr, dr.dead_md, dr.dead_agent, dr.end_cause, s0.s0_md, s0.s0_rc, s0.s0_dia, s0.s0_ht, s0.s0_kind,
            f.fsp forest_subpcond_prop, f.fmp forest_micrcond_prop, NULL::INT cond_status,
            coalesce(sub.sub_ba, 0) sub_ba, coalesce(sub.sub_tpa, 0) sub_tpa,
            sa.sicond, sa.siteclcd, sa.physclcd, sa.slope, sa.aspect, sa.fortypcd, sa.canopy_pct, sa.stdorgcd,
@@ -146,7 +180,7 @@ def load54(db: str) -> pl.DataFrame:
     LEFT JOIN sub USING (statecd, unitcd, countycd, plot, subp, invyr)
     LEFT JOIN pc ON pc.statecd = f.statecd AND pc.unitcd = f.unitcd AND pc.countycd = f.countycd AND pc.plot = f.plot AND pc.invyr = f.invyr
     LEFT JOIN sa USING (statecd, unitcd, countycd, plot, subp, invyr)
-    LEFT JOIN mv ON mv.statecd = f.statecd AND mv.unitcd = f.unitcd AND mv.countycd = f.countycd AND mv.plot = f.plot
+    LEFT JOIN mv USING ({K})
     ORDER BY f.statecd, f.unitcd, f.countycd, f.plot, f.subp, f.tree, f.invyr"""
     df = run_steps(c, q); c.close()
     return df
