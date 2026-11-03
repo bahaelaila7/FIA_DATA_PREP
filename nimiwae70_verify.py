@@ -90,13 +90,19 @@ check('sampled lineages have no tree before birth', float(np.nansum(L['exists'][
 Pr = M.impute(young, B8, K=16, nsamp=20)
 lim = torch.sigmoid(A.KAPPA_B * (aY[:4].detach() - B8['l0'][0]))
 check('P(exists) never exceeds the birth step before birth', bool((Pr['pE'][:, :4] <= lim + 1e-5).all()), f'limit by slot {[round(float(x), 5) for x in lim]}')
-# 9. a tree cannot carry tally size before birth
-tall = model(); B9 = batch()
-B9['af_mu'][:] = math.log(3.0); B9['af_sd'][:] = 1e-3
-zz9 = torch.zeros(1, 6, M.DZ); aa = tall.ages(zz9, B9); neg = (aa < 0) & (B9['v'][None] > 0)
-small = torch.full((1, 6, M.T_MAX), math.log(0.2)); big = torch.full((1, 6, M.T_MAX), math.log(3.0)); mp0 = torch.zeros(6, M.DZ); lp0 = torch.zeros(6, M.DZ)
-check('unborn slots penalise tally size', float((tall.extra_lw(small, zz9, B9, mp0, lp0) - tall.extra_lw(big, zz9, B9, mp0, lp0)).min()) > 0 or not bool(neg.any()), f'{int(neg.sum())} unborn slots')
-zg = torch.zeros(1, 6, M.DZ, requires_grad=True); (tall.extra_lw(big, zg, B9, mp0, lp0)).sum().backward(); check('the unborn term reaches z0', float(zg.grad[..., 0].abs().sum()) > 0)
+# 9. D72: the cut-off term is log(1 - p_s g sigma(x)); age off it is the D55 term; no other age factor remains
+tall = model(); B9 = batch(); B9['af_mu'][:] = math.log(3.0); B9['af_sd'][:] = 0.5
+zz9 = torch.randn(2, 6, M.DZ); xt9 = torch.randn(2, 6, M.T_MAX) * 3; ps9 = torch.rand(6, M.T_MAX)[None].expand(2, -1, -1).clone(); ps9[..., 0] = 1.0
+with torch.no_grad():
+    g9 = torch.sigmoid(A.KAPPA_B * (tall.ages(zz9, B9) - B9['l0'][None, :, None])); want9 = torch.log(1 - ps9 * g9 * torch.sigmoid(xt9))
+    check('cut-off term = log(1 - p_s g sigma(x))', float((tall.cutoff_term(xt9, ps9, zz9, B9) - want9).abs().max()) < 1e-4, f'{float((tall.cutoff_term(xt9, ps9, zz9, B9) - want9).abs().max()):.1e}')
+    b09 = model(age=False); base9 = M.NIMIWAE56.cutoff_term(b09, xt9, ps9, zz9, B9)
+    check('age off: the cut-off term is the D55 one', float((b09.cutoff_term(xt9, ps9, zz9, B9) - base9).abs().max()) == 0.0)
+    check('surely past breast height: the gated term equals the D55 one', float((tall.cutoff_term(xt9, ps9, torch.full_like(zz9, 6.0), B9) - base9).abs().max()) < 1e-3)
+    check('before breast height a sampled spot without a record costs nothing', float(tall.cutoff_term(xt9.abs() + 5, ps9, torch.full_like(zz9, -6.0), {**B9, 'af_mu': torch.full((6,), math.log(0.5)), 'l0': torch.full((6,), 5.0)})[..., :4].abs().max()) < 1e-3)   # slots 0-3 lie before breast height for this tree
+    check('no separate age factor in the weights', tall.extra_lw(torch.zeros(1, 6, M.T_MAX), zz9[:1], B9, None, None) == 0.0)
+zg = torch.zeros(1, 6, M.DZ, requires_grad=True); tall.cutoff_term(torch.full((1, 6, M.T_MAX), 2.0), torch.ones(1, 6, M.T_MAX), zg, B9).sum().backward()
+check('the gated cut-off term reaches z0', float(zg.grad[..., 0].abs().sum()) > 0)
 # 15. the exact age posterior: no slot before the first record means the prior, whatever the draws; a limit moves it
 mx = model(); Bx = batch(); Bx['la'][:] = 0; Bx['f'][:] = 0; Bx['af_mu'][:] = math.log(60.0); Bx['af_sd'][:] = 0.3; mx.eval()
 torch.manual_seed(4); ox = mx.joint(Bx, 6); zx = ox['z'].detach()
@@ -110,16 +116,6 @@ Bl['real'][:, 4] = 1; Bl['mD'][:, 4] = 1; Bl['lD'][:, 4] = math.log(3.0); Bl['ev
 gl, pl_ = A.age_posterior(mx, Bl, K=16); zl = A.z_quantiles(gl, pl_, [0.1, 0.5, 0.9])
 check('a birth limit moves the posterior older', float(zl[1].min()) > 0.2, f'median z0 {float(zl[1].min()):.2f}')
 tq = A.z_quantiles(torch.linspace(-1, 1, 3), torch.tensor([[0.25, 0.5, 0.25]]), [0.25, 0.5, 0.75]); check('grid quantiles against a hand case', float((tq[:, 0] - torch.tensor([-0.5, 0.0, 0.5])).abs().max()) < 1e-5, f'{tq[:, 0].tolist()}')
-# 16. am. 16: the short-tree term is the mixture, and it is 0 when the tree is surely at breast height
-Bm = batch(); um = model(); zm = torch.zeros(1, 6, M.DZ); smallm = torch.full((1, 6, M.T_MAX), math.log(0.2)); bigm = torch.full((1, 6, M.T_MAX), math.log(3.0))
-with torch.no_grad():
-    uu = um.bh_age(zm, Bm); want = (torch.log(torch.sigmoid(A.KAPPA_B * uu) + torch.sigmoid(-A.KAPPA_B * uu) * torch.sigmoid(-M.KAPPA * (bigm - Bm['lex'][None]))) * Bm['v'][None]).sum(-1)
-    got = um.extra_lw(bigm, zm, Bm, None, None)
-check('short-tree term = log[P(at BH) + P(not) P(below level)]', float((got - want).abs().max()) < 1e-4, f'{float((got - want).abs().max()):.1e}')
-Bo = batch(); Bo['af_mu'][:] = math.log(80.0); Bo['af_sd'][:] = 1e-3; Bo['la'][:] = 0
-with torch.no_grad(): check('surely past breast height: no short-tree penalty', float(um.extra_lw(bigm, zm, Bo, None, None).abs().max()) < 1e-3)
-Bh = batch(); Bh['l0'][:] = 5.0
-with torch.no_grad(): check('hardwoods need more years before tally size', float(um.extra_lw(bigm, zm, Bh, None, None).sum()) <= float(um.extra_lw(bigm, zm, Bm, None, None).sum()))
 s10 = pd.DataFrame({'statecd': 1, 'unitcd': 1, 'countycd': 1, 'plot': 1, 'subp': 1, 'tree': [1, 1, 1], 'invyr': [2002, 2007, 2012], 'slot_kind': ['real', 'real', 'real'], 'hidden': [True, False, False], 'move_invyr': [2007, 2007, 2007]})
 check('E1 mask reads visible records only', A.e1_mask(s10).tolist() == [True, False, False], str(A.e1_mask(s10).tolist()))
 # 10. E1 mask: only slots before the move, only trees first recorded at or after it

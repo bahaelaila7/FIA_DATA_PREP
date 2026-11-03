@@ -230,6 +230,10 @@ class NIMIWAE56(nn.Module):
         return lp1, lp0, torch.ones_like(lp1, dtype=torch.bool)
     def extra_lw(s, lDp, z, B, mp, lp):
         return 0.0
+    def cutoff_term(s, xt, ps, z, B):
+        """log P(no record) at a sampled, unrecorded slot: the spot was sampled with probability p_s, and a sampled tree is missed only below the limit"""
+        psc = ps.clamp(1e-6, 1 - 1e-6)                                                               # both where-branches finite (gradients)
+        return torch.where(ps >= 1, F.logsigmoid(-xt), torch.logaddexp(torch.log(psc) + F.logsigmoid(-xt), torch.log1p(-psc)))
     def enc_params(s):
         mods = (s.st_q, s.ercd, s.ecc, s.qin, s.qtr, s.qout) + ((s.u_net,) if s.noise else ())
         return [p for m in mods for p in m.parameters()]
@@ -334,8 +338,7 @@ class NIMIWAE56(nn.Module):
             above_ex = ((B['llim'] > B['lex'] + 1e-6) | post_)[None]   # pre-debut microplot level: the soft FALSE label carries it
             unrec = (1 - real) * B['sampled'][None]
             ps = B['psamp'][None].expand_as(xt)                                                          # am. 6: P(the tree's spot was sampled)
-            psc = ps.clamp(1e-6, 1 - 1e-6)                                                               # both where-branches finite (gradients)
-            lcut = torch.where(ps >= 1, F.logsigmoid(-xt), torch.logaddexp(torch.log(psc) + F.logsigmoid(-xt), torch.log1p(-psc)))
+            lcut = s.cutoff_term(xt, ps, z, B)                                                         # log P(no record | sampled with p_s)
             cens = (real * F.logsigmoid(xt)                                                             # tallied: at or above the limit
                     + unrec * torch.where((mode == MODE['cutoff']) & above_ex, lcut, torch.zeros_like(xt))   # not tallied: below (if the spot was sampled)
                     + unrec * torch.where(mode == MODE['missed'], F.logsigmoid(xt), torch.zeros_like(xt))                  # missed: at / above

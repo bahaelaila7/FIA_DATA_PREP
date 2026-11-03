@@ -1,14 +1,19 @@
-"""D70 — joint NIMIWAE age model: NIMIWAE56 with flexible growth and the known design rule, plus one birth date per tree (design of D70 am. 12; the curve version is nimiwae70_curve.py).
+"""D70 — joint NIMIWAE age model: NIMIWAE56 with flexible growth and the known design rule, plus one birth date per tree (D70 am. 12-16, D72).
 
-Age       log a_l = af_mu + af_sd z0, z0 ~ N(0, 1) under the prior, at the tree's first visible live measured record l (am. 13: the direct model's age rises 0.5-0.6 yr per year, so reading a later record and walking back runs young). af_mu and af_sd come from the direct age model
-          (nimiwae_age_direct.py), fitted on TRAIN measured ages only and fixed here, so lineages cannot move them. z0 is a true latent, so the width of age is honest: a penalty on a
-          function of z would reward collapsing onto af_mu.
-Birth     b = t_l - a_l. Age at a slot is a_t = t - b at every visit, negative before birth, so it advances exactly with elapsed time. Dates, never INVYR.
-Existence E_t needs the tree to have reached breast height, t >= b + l0, as well as the size step and t < e: DIA is measured at 4.5 ft, and total age is breast-height age + l0
-          (2 yr softwood, 5 yr hardwood, as the age targets define it). The D55 step is multiplied by sigma(KAPPA_B (a_t - l0)) (am. 16).
-Size      the decoder never reads z0, so growth is not read as age and age does not bend the size path. Only the gate and the short-tree term below tie the two.
-Short     before breast height a tree cannot be at tally size: per slot log[P(at BH) + P(not) P(D < level)], a mixture over the two cases (am. 16).
-E1        a microplot debut on a moved plot: slots before the move carry no FALSE label, because that spot was not sampled then (D65 item 2). The birth date decides instead."""
+Age       log a_l = af_mu + af_sd z0, z0 ~ N(0, 1) under the prior, at the tree's first visible live measured record l (am. 13). af_mu and af_sd come from the direct age model
+          (nimiwae_age_direct.py), fitted on TRAIN measured ages only and fixed here. z0 is a true latent, so the width of age is honest.
+Birth     b = t_l - a_l; a_t = t - b at every visit, from measurement dates, never INVYR. Breast height at b + l0 (2 yr softwood, 5 yr hardwood, as the targets define total age).
+Size      the decoder never reads z0, so growth is not read as age.
+
+Observation model (D72): every factor, once. g_t = P(at breast height at t | z0) = sigma(KAPPA_B (a_t - l0)); s_t = P(D_t at the smallest level | z) = sigma(KAPPA x_e).
+  existence evidence, TRUE / FALSE     P(exists) = g_t s_t (the D55 step times the gate; soft labels with error rate rho as in D55)
+  tallied record                       log sigma(x_t)        given existence (D >= limit); existence itself is the TRUE label
+  missed visit (codes 3 / 6 / 7)       log sigma(x_t)        given existence, which the soft TRUE label carries
+  sampled, no record (cut-off mode)    log(1 - p_s g_t sigma(x_t))   a tree too short to measure cannot be tallied either
+  measurements, crown, damage          as D55, at visible records
+There is no separate short-tree factor: before breast height the gate removes existence and the tally, so the size path there is unobserved (am. 16's term double-counted g_t
+at every TRUE slot and was not a likelihood). Age off: g_t = 1 everywhere, the D55 model.
+E1        a microplot debut on a moved plot: slots before the move carry no FALSE label (D65 item 2)."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import math, time, json, contextlib
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
@@ -95,10 +100,11 @@ class NIMIWAE70(M.NIMIWAE56):
         if not s.age: return super().born_gate(lp1, lp0, z, B)
         u = s.bh_age(z, B); l1 = lp1 + F.logsigmoid(KAPPA_B * u)
         return l1, torch.log(-torch.expm1(l1.clamp(max=-1e-6))), u > 0
-    def extra_lw(s, lDp, z, B, mp, lp):
-        if not s.age: return 0.0
-        u = s.bh_age(z, B)                                                                    # mixture: at breast height (no constraint) or not yet (below the level)
-        return (torch.logaddexp(F.logsigmoid(KAPPA_B * u), F.logsigmoid(-KAPPA_B * u) + F.logsigmoid(-M.KAPPA * (lDp - B['lex'][None]))) * B['v'][None]).sum(-1)
+    def cutoff_term(s, xt, ps, z, B):
+        """log(1 - p_s g_t sigma(x_t)): unrecorded at a sampled slot, gated by breast height (D72)"""
+        if not s.age: return super().cutoff_term(xt, ps, z, B)
+        lq = torch.log(ps.clamp(1e-6, 1.0)) + F.logsigmoid(KAPPA_B * s.bh_age(z, B))            # log(p_s g_t)
+        return torch.logaddexp(torch.log((-torch.expm1(lq)).clamp(min=1e-12)), lq + F.logsigmoid(-xt))
 
 @torch.no_grad()
 def age_posterior(model, B, K=100, G=61, zmax=3.6):
