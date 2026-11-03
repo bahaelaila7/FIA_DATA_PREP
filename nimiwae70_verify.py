@@ -187,6 +187,57 @@ check('flow, age off: every dimension flows', model_q('flow', age=False).f0 == 0
 voc = {k: [0, 1, 2] for k in ('spgrpcd', 'epa_l3', 'major_spgrpcd', 'spcd')}; voc['fortypcd'] = [0, 1]
 ms_ = A.make_model(voc, q='flow', flow=dict(layers=4)); mr_ = A.model_from_cfg(voc, ms_.cfg); mr_.load_state_dict(ms_.state_dict())
 check('flow: a checkpoint rebuilds from its cfg', mr_.qfam == 'flow' and len(mr_.flow.layers) == 4 and A.model_from_cfg(voc, dict(age=True)).qfam == 'gauss')
+# 17. D74: rate and features from visible records, the coupling formula, the anchor term, the Student-t height model, calibration recovers a planted delta
+B17 = batch(); n17, T17 = B17['v'].shape
+sq17 = pd.DataFrame(dict(slot_kind=np.where(np.tile(np.arange(T17), n17) < 5, 'real', 'pre'), anc_agedia=np.nan, htcd=np.nan))
+ti17, po17 = np.repeat(np.arange(n17), T17), np.tile(np.arange(T17), n17)
+sq17.loc[(ti17 == 0) & (po17 == 3), 'anc_agedia'] = 40.0; sq17.loc[(po17 == 2), 'htcd'] = 2; sq17.loc[(ti17 == 1) & (po17 == 3), 'htcd'] = 4
+B17['mcc'][:, 3] = 1; B17['cc'][:, 3] = 3; B17['mH'][:, 2:4] = 1
+A.d74_features(B17, sq17, ti17, po17)
+t17 = B17['cov'][..., A.ITYR] * 20; want_r = (3.0 - 2.0) / float(t17[0, 3] - t17[0, 2])
+check('D74 rate = DIA change / years between the first and last measured visible records', abs(float(B17['lrate'][0]) - math.log(want_r)) < 1e-4 and float(B17['has_rate'][0]) == 1.0, f'{math.exp(float(B17["lrate"][0])):.4f} vs {want_r:.4f} in/yr')
+check('D74 DIA and crown class read at the prior slot la', abs(float(B17['dia_la'][0]) - 3.0) < 1e-4 and int(B17['cc_la'][0]) == 3)
+check('D74 anchor at its slot only', float(B17['anc_m'].sum()) == 1.0 and float(B17['anc_m'][0, 3]) == 1.0 and abs(float(B17['anc_y'][0, 3]) - math.log(40.0)) < 1e-5)
+check('D74 HTCD 2 / 3 -> visual class, HTCD 4 height masked', int(B17['htcls'][:, 2].min()) == 1 and int(B17['htcls'][:, 3].max()) == 0 and float(B17['mH'][1, 3]) == 0.0 and float(B17['mH'][0, 3]) == 1.0)
+h17 = B17.copy(); h17['mD'] = B17['mD'].clone(); h17['mD'][:, 3] = 0; sq_h = sq17.copy(); A.d74_features(h17, sq_h, ti17, po17)
+check('D74 a single measured record gives no rate', float(h17['has_rate'].max()) == 0.0)
+cp17 = dict(delta={'1': -0.2, '2': -0.2, '3': -0.2, '4': -0.12, '5': -0.09}, m={str(k): -1.5 for k in range(1, 6)}, w={'1': 0.9, '2': 0.9, '3': 0.9, '4': 1.0, '5': 1.0})
+B17['af_has'][:] = 1; B17['dia_la'][:] = 8.0; B17['dia_la'][1] = 4.0; B17['cc_la'][2] = 5; A.apply_coupling(B17, cp17)   # trees 0, 2.. eligible at 8 in; tree 1 below 5 in
+want0 = -0.2 * (float(B17['lrate'][0]) + 1.5); want2 = -0.09 * (float(B17['lrate'][2]) + 1.5)
+check('D74 shift = delta_c (lrate - m_c); none below 5 in; class 5 uses its own delta', abs(float(B17['af_shift'][0]) - want0) < 1e-5 and float(B17['af_shift'][1]) == 0.0 and abs(float(B17['af_shift'][2]) - want2) < 1e-5,
+      f'{float(B17["af_shift"][0]):.4f} {float(B17["af_shift"][2]):.4f}')
+check('D74 width factor on coupled trees only', abs(float(B17['af_sdf'][0]) - 0.9) < 1e-6 and float(B17['af_sdf'][1]) == 1.0 and float(B17['af_sdf'][2]) == 1.0)
+m17 = model(); z17 = torch.randn(3, n17, M.DZ)
+with torch.no_grad():
+    a17 = m17.ages(z17, B17); la17 = B17['la']; al17 = a17.gather(2, la17[None, :, None].expand(3, -1, 1))[..., 0]
+    want_al = torch.exp(B17['af_mu'] + B17['af_shift'] + B17['af_sd'] * B17['af_sdf'] * z17[..., 0])
+check('D74 log a_l = af_mu + shift + af_sd w z0', float((al17 - want_al).abs().max()) < 1e-3)
+with torch.no_grad():
+    ex = m17.extra_lw(None, z17, B17, None, None); bh = (a17 - B17['l0'][None, :, None]).clamp(min=0.1)
+    want_ex = (-0.5 * ((math.log(40.0) - torch.log(bh[:, 0, 3])) / A.S_ANCHOR) ** 2 - math.log(A.S_ANCHOR) - 0.5 * math.log(2 * math.pi))
+check('D74 anchor term = log N(log AGEDIA; log(a_t - l0), S_ANCHOR) at the anchor, 0 elsewhere', float((ex[:, 0] - want_ex).abs().max()) < 1e-4 and float(ex[:, 1:].abs().max()) == 0.0)
+mt = A.NIMIWAE70(3, 3, 3, 3, 3, age=True, height='t')
+with torch.no_grad():
+    mt.lsHc.copy_(torch.tensor([-2.3, -1.6])); lHp = torch.randn(2, n17, T17) * 0.2 + 2.0
+    got = mt.height_ll(lHp, B17); sc = torch.exp(mt.lsHc[B17['htcls']])[None]
+    want = torch.distributions.StudentT(A.T_NU, lHp, sc).log_prob(B17['lH'][None].expand_as(lHp))
+check('D74 height: Student-t log density by method, against torch.distributions', float((got - want).abs().max()) < 1e-4, f'{float((got - want).abs().max()):.1e}')
+check('D74 height off: the Gaussian base term', float((model().height_ll(lHp, B17) - M.NIMIWAE56.height_ll(model(), lHp, B17)).abs().max()) == 0.0)
+# calibration recovers a planted delta (synthetic anchors)
+g17 = torch.Generator().manual_seed(5); N = 4000
+Bc = dict(af_has=torch.ones(N), has_rate=torch.ones(N), dia_la=torch.full((N,), 8.0), cc_la=torch.randint(1, 4, (N,), generator=g17), lrate=torch.randn(N, generator=g17) * 0.6 - 1.6,
+          af_mu=torch.randn(N, generator=g17) * 0.3 + math.log(40), l0=torch.full((N,), 2.0), la=torch.zeros(N, dtype=torch.long), cov=torch.zeros(N, M.T_MAX, M.NCOV),
+          anc_m=torch.zeros(N, M.T_MAX), anc_y=torch.zeros(N, M.T_MAX))
+Bc['cov'][..., A.ITYR] = (torch.arange(M.T_MAX) * 5.0 / 20.0)[None]
+true_tot_la = torch.exp(Bc['af_mu'] - 0.25 * (Bc['lrate'] + 1.6) + 0.15 * torch.randn(N, generator=g17))
+Bc['anc_m'][:, 2] = 1; Bc['anc_y'][:, 2] = torch.log(true_tot_la + 10.0 - 2.0)                          # anchor 10 yr after la, as breast-height age
+cpc = A.calibrate_coupling(Bc, log=lambda *_: None)
+check('D74 calibration recovers a planted delta (-0.25)', abs(cpc['delta']['3'] + 0.25) < 0.02 and abs(cpc['delta']['4'] - cpc['delta']['3'] * 0.61) < 1e-9 and cpc['w']['5'] == 1.0, f"delta {cpc['delta']['3']:+.3f}, w {cpc['w']['3']:.3f}")
+# the exact grid still returns the prior on z0 when nothing limits age, with a coupling shift present
+mx2 = model(); mx2.eval(); Bx2 = batch(); Bx2['la'][:] = 0; Bx2['f'][:] = 0; Bx2['af_mu'][:] = math.log(60.0); Bx2['af_sd'][:] = 0.3
+Bx2['af_shift'] = torch.full((6,), 0.4); Bx2['af_sdf'] = torch.full((6,), 0.8)
+gq2, pq2 = A.age_posterior(mx2, Bx2, K=16); zq2 = A.z_quantiles(gq2, pq2, [0.1, 0.5, 0.9])
+check('D74 grid with a coupling shift: z0 posterior is still N(0, 1) without limits', float(zq2[1].abs().max()) < 0.02 and float((zq2[2] - 1.2816).abs().max()) < 0.03)
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()

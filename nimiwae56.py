@@ -235,6 +235,9 @@ class NIMIWAE56(nn.Module):
         """log P(no record) at a sampled, unrecorded slot: the spot was sampled with probability p_s, and a sampled tree is missed only below the limit"""
         psc = ps.clamp(1e-6, 1 - 1e-6)                                                               # both where-branches finite (gradients)
         return torch.where(ps >= 1, F.logsigmoid(-xt), torch.logaddexp(torch.log(psc) + F.logsigmoid(-xt), torch.log1p(-psc)))
+    def height_ll(s, lHp, B):
+        """log density of measured log HT given the latent path [K, n, T] (unmasked). D74 hook; base: Gaussian with one learned scale."""
+        return -0.5 * ((B['lH'][None] - lHp) / torch.exp(s.lsH)) ** 2 - s.lsH - 0.5 * math.log(2 * math.pi)
     def sample_z(s, mq, lq, K):
         """K draws from q(z | x) and their log density: (z [K, n, DZ], log q [K, n]). D73 hook; base: the diagonal Gaussian."""
         z = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=mq.device)
@@ -331,7 +334,7 @@ class NIMIWAE56(nn.Module):
         rho = RHO_MAX * torch.sigmoid(s.lrho); lr, l1r = torch.log(rho), torch.log(1 - rho)
         v, real, ev, mode = B['v'][None], B['real'][None], B['ev'][None], B['mode'][None]
         sdD = 0.5 * torch.log(torch.exp(2 * ls_dia(B['lD'])) + torch.exp(2 * s.lsdisc))
-        meas = (nl(B['lD'][None], lDp, sdD[None]) * B['mD'][None] + nl(B['lH'][None], lHp, s.lsH) * B['mH'][None])
+        meas = (nl(B['lD'][None], lDp, sdD[None]) * B['mD'][None] + s.height_ll(lHp, B) * B['mH'][None])             # D74 hook: height noise model
         lse = torch.logaddexp
         ev_alive = torch.where(ev == EV['true_hard'], lp1,
                    torch.where(ev == EV['false_hard'], lp0,

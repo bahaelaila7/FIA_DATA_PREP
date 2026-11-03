@@ -9,23 +9,15 @@ Read-only. Two questions.
    False links are estimated by placebo: the same match after shifting tally DIA by +-0.2 to +-0.5 in. CCLCD is an independent check,
    because site trees are dominant or codominant. Ages are never used to choose or score a link.
 2. What do TOTAGE and BHAGE offer by region: counts by size, crown class, and previous age."""
-import argparse, json, os
+import argparse, json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import duckdb
 
-KV = "STATECD, UNITCD, COUNTYCD, PLOT, INVYR"
-R4 = (1, 12, 13, 21, 28, 37, 45, 47)
+from site_links import KV, R4, load, links
+
 SHIFTS = (-5, -4, -3, -2, 2, 3, 4, 5)    # tenths of an inch; +-1 is left out as a near miss rather than chance
 BAR = 0.95                               # D70, set before the first run: estimated precision a tier needs to be an anchor
 TIERS = {"dia": "TRUE", "dia_subp": "subp_same", "dia_ht": "ht_near", "dia_subp_ht": "subp_same and ht_near", "dia_exact_ht": "dht == 0", "dia_subp_exact_ht": "subp_same and dht == 0"}   # the last two added after the first run (D70 am. 1)
-
-
-def links(c, shift):
-    """one-to-one site tree <-> tally matches with tally DIA moved by `shift` tenths of an inch"""
-    return c.execute(f"""
-      WITH m AS (SELECT s.scn, t.tid, t.CCLCD cc, COALESCE(s.SUBP = t.SUBP, FALSE) subp_same, COALESCE(abs(s.HT - t.HT) <= 5, FALSE) ht_near, s.HT - t.HT dht
-                 FROM st s JOIN tt t USING ({KV}, CONDID, SPCD) WHERE s.d10 = t.d10 + ({shift})),
-      u AS (SELECT * FROM m QUALIFY count(*) OVER (PARTITION BY scn) = 1 AND count(*) OVER (PARTITION BY tid) = 1)
-      SELECT * FROM u""").df()
 
 
 def tier_table(c):
@@ -43,23 +35,6 @@ def tier_table(c):
                          exact_ht_real=float((r.dht == 0).mean()) if n else None,      # diagnostic only: not part of the D70 bar
                          exact_ht_placebo=float((__import__("pandas").concat(pool).dht == 0).mean()) if pool else None)
     return out
-
-
-def load(c, fiadb):
-    c.execute(f"ATTACH '{fiadb}' AS f (READ_ONLY)")
-    st = ",".join(map(str, R4))
-    a = "(SELECT DISTINCT STATECD, INVYR FROM f.main.SURVEY WHERE ANN_INVENTORY = 'Y' AND P3_OZONE_IND = 'N')"
-    c.execute(f"""CREATE TEMP TABLE st AS SELECT row_number() OVER (ORDER BY S.STATECD, S.UNITCD, S.COUNTYCD, S.PLOT, S.INVYR, S.CONDID, S.TREE, S.SPCD, S.DIA, S.HT, S.AGEDIA) scn,
-          S.STATECD, S.UNITCD, S.COUNTYCD, S.PLOT, S.INVYR, S.CONDID, S.SPCD, S.SUBP, S.HT, round(S.DIA * 10)::INT d10
-        FROM f.main.SITETREE S JOIN {a} A USING (STATECD, INVYR)
-        WHERE S.STATECD IN ({st}) AND TRY_CAST(S.AGEDIA AS DOUBLE) > 0
-          AND NOT EXISTS (SELECT 1 FROM f.main.SITETREE E WHERE E.STATECD = S.STATECD AND E.UNITCD = S.UNITCD AND E.COUNTYCD = S.COUNTYCD AND E.PLOT = S.PLOT
-                          AND E.TREE = S.TREE AND E.SPCD = S.SPCD AND E.INVYR < S.INVYR AND E.AGEDIA = S.AGEDIA AND E.DIA = S.DIA AND E.HT = S.HT)""")
-    c.execute(f"""CREATE TEMP TABLE tt AS SELECT T.STATECD, T.UNITCD, T.COUNTYCD, T.PLOT, T.INVYR, T.CONDID, T.SPCD, T.SUBP, T.TREE,
-          T.STATECD || '_' || T.UNITCD || '_' || T.COUNTYCD || '_' || T.PLOT || '_' || T.INVYR || '_' || T.SUBP || '_' || T.TREE tid,
-          T.HT, T.CCLCD, round(T.DIA * 10)::INT d10
-        FROM f.main.TREE T JOIN {a} A USING (STATECD, INVYR)
-        WHERE T.STATECD IN ({st}) AND T.STATUSCD = 1 AND T.SUBP <= 4 AND T.DIA IS NOT NULL AND COALESCE(T.P2A_GRM_FLG, '') <> 'Y'""")
 
 
 def coverage(c):

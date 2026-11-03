@@ -38,7 +38,8 @@ def lineage_age(m, val, keys, K=100):
         zq = A.z_quantiles(g.cpu(), p.cpu(), [0.1, 0.5, 0.9]); z = torch.zeros(3, zq.shape[1], M.DZ, device=dev); z[..., 0] = zq.to(dev)
         out.append(m.ages(z, s).cpu())                                                     # [3, n, T]
     q = torch.cat(out, 1).numpy(); ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
-    return sq.assign(q10=q[0, ti, po], q50=q[1, ti, po], q90=q[2, ti, po])[M.K_ + ['invyr', 'q10', 'q50', 'q90']]
+    tr_ = {x: B[x].numpy()[ti] for x in ('lrate', 'af_shift', 'cc_la', 'has_rate')}                     # D74: the tree's observed rate and coupling shift (the residual check)
+    return sq.assign(q10=q[0, ti, po], q50=q[1, ti, po], q90=q[2, ti, po], **tr_)[M.K_ + ['invyr', 'q10', 'q50', 'q90', 'lrate', 'af_shift', 'cc_la', 'has_rate']]
 
 def prior_first(held):
     """the direct model alone, read at the first record: the joint must not be worse than this"""
@@ -46,13 +47,22 @@ def prior_first(held):
     f = r.sort_values(M.K_ + ['invyr']).groupby(M.K_).first()[['yr', 'af_mu']].rename(columns=dict(yr='y0', af_mu='mu0')).reset_index()
     return r[M.K_ + ['invyr', 'yr']].merge(f, on=M.K_).assign(prior=lambda d: np.exp(d.mu0) + d.yr - d.y0)[M.K_ + ['invyr', 'prior']]
 
-def age_scores(m, held, site, planted, seed=0, planted_frac=0.25):
-    """G1, G5 and the planted diagnostic on one held-out set. site: linked site trees; planted: field age, a diagnostic only"""
+def age_scores(m, held, site, planted, seed=0, planted_frac=0.25, site_old=None, rows=None):
+    """G1, G5 and the planted diagnostic on one held-out set. site: linked site trees (D70 am. 17 rule); site_old: the earlier G1 set, scored on the
+    same posterior draws for continuity (G1_d70); planted: field age, a diagnostic only. rows: a list that receives the scored G1 rows (D74 guard)."""
     torch.manual_seed(seed); k = M.K_ + ['invyr']
-    j = site.merge(held[held.slot_kind == 'real'][k].drop_duplicates(), on=k); j = j[j.estimated_age.notna()]
-    j = j.merge(lineage_age(m, held, j), on=k).merge(prior_first(held), on=k).merge(held[held.slot_kind == 'real'][k + ['af_mu']], on=k); t = j.truth; direct = np.exp(j.af_mu)   # f+p at the scored record, as am. 12 registered it
-    o = dict(G1=dict(n=len(j), mae_joint=float((j.q50 - t).abs().mean()), bias_joint=med(j.q50 - t), mae_direct=float((direct - t).abs().mean()), bias_direct=med(direct - t), mae_prior=float((j.prior - t).abs().mean()), bias_prior=med(j.prior - t), mae_current=float((j.estimated_age - t).abs().mean()), bias_current=med(j.estimated_age - t)),
-             G5=dict(cover80=float(((t >= j.q10) & (t <= j.q90)).mean()), width=float((j.q90 / j.q10.clip(lower=0.1)).median())))
+    hk = held[held.slot_kind == 'real'][k].drop_duplicates()
+    sets = {'G1': site} | ({'G1_d70': site_old} if site_old is not None else {})
+    js = {nm: x.merge(hk, on=k).pipe(lambda d: d[d.estimated_age.notna()]) for nm, x in sets.items()}
+    L = lineage_age(m, held, pd.concat([j[k] for j in js.values()]).drop_duplicates())                  # one exact-grid pass for both sets
+    L = L.merge(prior_first(held), on=k).merge(held[held.slot_kind == 'real'][k + ['af_mu']], on=k)
+    o = {}
+    for nm, j in js.items():
+        j = j.merge(L, on=k); t = j.truth; direct = np.exp(j.af_mu)                                    # f+p at the scored record, as am. 12 registered it
+        o[nm] = dict(n=len(j), mae_joint=float((j.q50 - t).abs().mean()), bias_joint=med(j.q50 - t), mae_direct=float((direct - t).abs().mean()), bias_direct=med(direct - t),
+                     mae_prior=float((j.prior - t).abs().mean()), bias_prior=med(j.prior - t), mae_current=float((j.estimated_age - t).abs().mean()), bias_current=med(j.estimated_age - t))
+        o[nm.replace('G1', 'G5')] = dict(cover80=float(((t >= j.q10) & (t <= j.q90)).mean()), width=float((j.q90 / j.q10.clip(lower=0.1)).median()))
+        if nm == 'G1' and rows is not None: rows.append(j)
     p = planted.merge(held[held.slot_kind == 'real'][k + ['dia', 'plot_key']], on=k); p = p[p.plot_key.isin(p.plot_key.drop_duplicates().sample(frac=planted_frac, random_state=3))]
     q = lineage_age(m, held[held.plot_key.isin(p.plot_key)], p).merge(p, on=k); q['cls'] = pd.cut(q.dia, [0, 3, 5, 7, 9, 15, 99], right=False).astype(str)
     o['planted_field'] = {c: dict(n=len(g), field=med(g.fld), bias=med(g.q50 - g.fld), cover80=float(((g.fld >= g.q10) & (g.fld <= g.q90)).mean())) for c, g in q.groupby('cls')}

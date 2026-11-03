@@ -14,6 +14,9 @@ Observation model (D72): every factor, once. g_t = P(at breast height at t | z0)
 There is no separate short-tree factor: before breast height the gate removes existence and the tally, so the size path there is unobserved (am. 16's term double-counted g_t
 at every TRUE slot and was not a likelihood). Age off: g_t = 1 everywhere, the D55 model.
 E1        a microplot debut on a moved plot: slots before the move carry no FALSE label (D65 item 2).
+D74       (opt-in) measured-age anchors: log AGEDIA ~ N(log(a_t - l0), S_ANCHOR) at linked visits on fit plots; the age prior shifted by the tree's observed
+          log DIA growth rate, log a_l = af_mu + delta_c (r - m_c) + af_sd w_c z0, delta, m and w fixed by calibrate_coupling() before training; height
+          residuals Student-t (nu 4) with one scale per height method (HTCD 1 / null vs 2, 3), HTCD 4 (modelled) heights masked.
 q         'gauss' (diagonal Gaussian, the default) or 'flow' (D73): z0 keeps its own Gaussian, the other dimensions go through a conditional rational-quadratic spline
           coupling flow on the encoder's tree state (nimiwae_flow.py). q(z) = q(z0) q(z_rest) either way, which the exact age grid needs."""
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +34,12 @@ KAPPA_B = 2.0                 # per year: the birth step is about half a year wi
 AF_MU0, AF_SD0 = math.log(25.0), 0.8     # trees with no usable record: wide default, not a measurement
 L0 = dict(S=2.0, H=5.0)                  # years from germination to breast height; the age targets use the same values
 ITYR = COV.index('tyr')
+S_ANCHOR = 0.10                          # D74: log-scale width of a ring-count breast-height age (sensitivity 0.05 / 0.20 reported)
+T_NU = 4.0                               # D74: Student-t degrees of freedom for log HT residuals
+RATE_FLOOR = 0.02                        # D74: in / yr; an observed DIA change at or below it reads as this rate (12 % of anchor increments are <= 0)
+COUPLE_MIN_DIA = 5.0                     # D74: no coupling below 5 in at the prior's slot (no R4 sapling has an age)
+COUPLE_MIN_YEARS = 1.0                   # D74: a growth rate needs measured DIA at least this far apart
+WEST_RATIO = {4: 0.61, 5: 0.43}          # D74: coupling strength of intermediate / overtopped relative to classes 1-3 (western BHAGE, 229k trees)
 
 def soil_vocab(seq):
     return {c: (float(seq[c].mean()), float(seq[c].std()) or 1.0) for c in SOIL_COLS}
@@ -63,7 +72,65 @@ def build(seq, vocab=None):
     else:
         B['af_has'] = torch.zeros(n)
     B['af_mu'], B['af_sd'], B['la'] = torch.tensor(mu), torch.tensor(sd), la
+    d74_features(B, seq_cols=sq, ti=ti, po=po)
+    if 'age_coupling' in vocab: apply_coupling(B, vocab['age_coupling'])
     return B, vocab, sq
+
+def d74_features(B, seq_cols, ti, po):
+    """D74 per-tree and per-slot inputs, all from visible records: observed log DIA growth rate, DIA and crown class at the prior's slot la,
+    anchor ages (column anc_agedia, fit plots only), height method classes (column htcd; HTCD 4 heights masked). Absent columns leave the model as before."""
+    n, T = B['v'].shape; t = B['cov'][..., ITYR] * 20.0; m = B['mD'] > 0; ar = torch.arange(T)[None].expand(n, -1)
+    first = torch.where(m, ar, torch.full_like(ar, T)).min(1).values; last = torch.where(m, ar, torch.full_like(ar, -1)).max(1).values
+    ok = (first < T) & (last > first); fi, la_ = first.clamp(max=T - 1)[:, None], last.clamp(min=0)[:, None]
+    dt = (t.gather(1, la_) - t.gather(1, fi))[:, 0]; D = torch.exp(B['lD'])
+    rate = (D.gather(1, la_) - D.gather(1, fi))[:, 0] / dt.clamp(min=1e-6)
+    B['has_rate'] = (ok & (dt >= COUPLE_MIN_YEARS)).float(); B['lrate'] = torch.log(rate.clamp(min=RATE_FLOOR)) * B['has_rate']
+    li = B['la'][:, None]
+    B['dia_la'] = torch.where(B['mD'].gather(1, li)[:, 0] > 0, D.gather(1, li)[:, 0], torch.zeros(n))
+    B['cc_la'] = torch.where(B['mcc'].gather(1, li)[:, 0] > 0, B['cc'].gather(1, li)[:, 0], torch.zeros(n)).long()
+    real_vis = (seq_cols.slot_kind == 'real').to_numpy() & ~(seq_cols.hidden.fillna(False).to_numpy(bool) if 'hidden' in seq_cols else np.zeros(len(seq_cols), bool))
+    B['anc_y'], B['anc_m'] = torch.zeros(n, T), torch.zeros(n, T)
+    if 'anc_agedia' in seq_cols:                                                              # breast-height ages of linked site trees (fit plots only)
+        y = seq_cols.anc_agedia.to_numpy(float); k = real_vis & np.isfinite(y) & (np.nan_to_num(y) > 0)
+        B['anc_y'][ti[k], po[k]] = torch.tensor(np.log(y[k]), dtype=torch.float32); B['anc_m'][ti[k], po[k]] = 1.0
+    B['htcls'] = torch.zeros(n, T, dtype=torch.long)
+    if 'htcd' in seq_cols:
+        h = seq_cols.htcd.to_numpy(float)
+        vis = np.isin(h, (2.0, 3.0)); mdl = h == 4.0
+        B['htcls'][ti[vis], po[vis]] = 1; B['mH'][ti[mdl], po[mdl]] = 0.0                      # modelled heights repeat the previous height: not observations
+    B['af_shift'], B['af_sdf'] = torch.zeros(n), torch.ones(n)
+
+def coupling_eligible(B):
+    """trees the coupling applies to: a prior, an observed growth rate, DIA >= 5 in and a crown class at the prior's slot"""
+    return (B['af_has'] > 0) & (B['has_rate'] > 0) & (B['dia_la'] >= COUPLE_MIN_DIA) & (B['cc_la'] >= 1) & (B['cc_la'] <= 5)
+
+def apply_coupling(B, cp):
+    """log a_l = af_mu + delta_c (lrate - m_c) + af_sd w_c z0 on eligible trees; others unchanged"""
+    el = coupling_eligible(B); c = B['cc_la'].clamp(0, 5)
+    dl = torch.tensor([0.0] + [cp['delta'][str(k)] for k in range(1, 6)]); mm = torch.tensor([0.0] + [cp['m'][str(k)] for k in range(1, 6)]); ww = torch.tensor([1.0] + [cp['w'][str(k)] for k in range(1, 6)])
+    B['af_shift'] = torch.where(el, dl[c] * (B['lrate'] - mm[c]), torch.zeros_like(B['af_mu']))
+    B['af_sdf'] = torch.where(el, ww[c], torch.ones_like(B['af_sd']))
+
+def calibrate_coupling(B, log=print):
+    """D74: fixed coupling from the anchors in B (fit plots), before training; nothing here is learned in the joint.
+    Total age at la from each anchor: AGEDIA + l0 - (t_anchor - t_la). Regress log total age - af_mu on the log rate (classes 1-3 pooled): delta, and the
+    width factor w = residual sd with the rate / without. Classes 4, 5: delta x WEST_RATIO, w = 1. m_c = mean log rate of every eligible tree of class c,
+    so each class keeps its prior level and the coupling only reorders trees within it."""
+    el = coupling_eligible(B); t = B['cov'][..., ITYR] * 20.0; li = B['la'][:, None]
+    ti, pj = torch.nonzero(B['anc_m'] > 0, as_tuple=True)
+    keep = el[ti] & (B['cc_la'][ti] <= 3); ti, pj = ti[keep], pj[keep]
+    tot = torch.exp(B['anc_y'][ti, pj]) + B['l0'][ti] - (t[ti, pj] - t.gather(1, li)[ti, 0])
+    ok = tot > 0.5; ti, tot = ti[ok], tot[ok]
+    y = (torch.log(tot) - B['af_mu'][ti]).double().numpy(); x = B['lrate'][ti].double().numpy()
+    assert len(y) >= 200, f'too few anchors to calibrate the coupling: {len(y)}'
+    X = np.column_stack([np.ones_like(x), x]); b, *_ = np.linalg.lstsq(X, y, rcond=None); r1 = y - X @ b; r0 = y - y.mean()
+    d = float(b[1]); w = float(r1.std() / r0.std())
+    cp = dict(delta={str(k): d for k in (1, 2, 3)} | {str(k): d * WEST_RATIO[k] for k in (4, 5)}, w={str(k): w for k in (1, 2, 3)} | {'4': 1.0, '5': 1.0},
+              m={str(k): float(B['lrate'][el & (B['cc_la'] == k)].double().mean()) if bool((el & (B['cc_la'] == k)).any()) else 0.0 for k in range(1, 6)},
+              n_anchor_rows=int(len(y)), n_anchor_trees=int(len(torch.unique(ti))), intercept=float(b[0]), rate_floor=RATE_FLOOR)
+    log(f'D74 coupling calibrated on {cp["n_anchor_rows"]:,} anchor rows ({cp["n_anchor_trees"]:,} trees): delta {d:+.3f} per log (in / yr), width factor {w:.3f}, '
+        f'intercept {b[0]:+.3f}; m by class {", ".join(f"{k}: {v:.2f}" for k, v in cp["m"].items())}')
+    return cp
 
 class Static70(M.Static):
     """Soil joins the statics of the prior and the decoder. The encoder also reads the age prior, so it knows how close a tree sits to its birth limits."""
@@ -72,19 +139,31 @@ class Static70(M.Static):
         s.out = nn.Linear(s.out.in_features + NSOIL + (2 if use_af else 0), D_MODEL)
     def forward(s, B):
         x = [s.e[0](B['sp']), s.e[1](B['l3']), s.e[2](B['maj']), s.e[3](B['fty']), s.e[4](B['scl']), s.e[5](B['phy']), s.e[6](B['spc']), B['snum'], B['soil']]
-        if s.use_af: x.append(torch.stack([B['af_mu'] - AF_MU0, B['af_sd']], -1))
+        if s.use_af: x.append(torch.stack([B['af_mu'] + B.get('af_shift', 0.0) - AF_MU0, B['af_sd'] * B.get('af_sdf', 1.0)], -1))   # D74: the prior the model uses
         return s.out(torch.cat(x + ([B['summ']] if s.use_summ else []), -1))
 
 class NIMIWAE70(M.NIMIWAE56):
     build = staticmethod(lambda seq, vocab: build(seq, vocab))                             # predictions and stand totals use the joint build
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, age=True, q='gauss', flow=None):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, age=True, q='gauss', flow=None, height='gauss'):
         super().__init__(nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=False, prior_ctx=False)
-        assert q in ('gauss', 'flow')
-        s.age, s.qfam = age, q
+        assert q in ('gauss', 'flow') and height in ('gauss', 't')
+        s.age, s.qfam, s.height = age, q, height
+        if height == 't': s.lsHc = nn.Parameter(torch.full((2,), -2.0))                       # D74: log scale per height method (1 / null, 2-3)
         s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc, use_af=age); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False)
         if q == 'flow':                                                                       # D73: z0 (age) stays Gaussian and separate; age off, every dimension flows
             fc = {**FLOW_DEFAULT, **(flow or {})}; s.f0 = 1 if age else 0
             s.flow = NF.CondFlow(DZ - s.f0, D_MODEL, layers=fc['layers'], hidden=fc['hidden'], bins=fc['bins'], B=fc['bound'])
+    def height_ll(s, lHp, B):
+        """D74: Student-t log density of log HT, scale by height method"""
+        if s.height != 't': return super().height_ll(lHp, B)
+        ls = s.lsHc[B['htcls']][None]; r = (B['lH'][None] - lHp) / torch.exp(ls); nu = T_NU
+        return (math.lgamma((nu + 1) / 2) - math.lgamma(nu / 2) - 0.5 * math.log(nu * math.pi)) - ls - (nu + 1) / 2 * torch.log1p(r ** 2 / nu)
+    def extra_lw(s, lDp, z, B, mp, lp):
+        """D74: measured breast-height ages of linked site trees, at their visits (fit plots only; zero where B has none)"""
+        if not s.age or 'anc_m' not in B: return 0.0
+        bh = s.bh_age(z, B).clamp(min=0.1)
+        ll = -0.5 * ((B['anc_y'][None] - torch.log(bh)) / S_ANCHOR) ** 2 - math.log(S_ANCHOR) - 0.5 * math.log(2 * math.pi)
+        return (ll * B['anc_m'][None]).sum(-1)
     def enc_params(s):
         return super().enc_params() + (list(s.flow.parameters()) if s.qfam == 'flow' else [])
     def sample_z(s, mq, lq, K):
@@ -117,7 +196,8 @@ class NIMIWAE70(M.NIMIWAE56):
         return super().decode(z, B, u)
     def ages(s, z, B):
         """a_t [K, n, T]: one birth date per tree. a_l > 0 at the prior's slot, the debut or the first visible record; other slots add elapsed years exactly, so a_t < 0 before birth."""
-        al = torch.exp((B['af_mu'][None] + B['af_sd'][None] * z[..., 0]).clamp(max=7.0))     # [K, n]; up to about 1100 yr
+        mu = B['af_mu'] + B.get('af_shift', 0.0); sd = B['af_sd'] * B.get('af_sdf', 1.0)        # D74: the coupled prior (no shift when not calibrated)
+        al = torch.exp((mu[None] + sd[None] * z[..., 0]).clamp(max=7.0))                          # [K, n]; up to about 1100 yr
         t = B['cov'][..., ITYR] * 20.0                                                        # [n, T] years since 2000, from measurement dates
         return al[..., None] + (t - t.gather(1, B['la'][:, None]))[None]
     def bh_age(s, z, B):
@@ -158,13 +238,13 @@ def z_quantiles(g, p, q):
     n_ = torch.arange(cdf.shape[0]); lo, hi = cdf[n_, i - 1], cdf[n_, i]
     return edges[i - 1] + (q_[:, None] - lo) / (hi - lo).clamp(min=1e-12) * step
 
-def make_model(vocab, age=True, q='gauss', flow=None):
-    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), age=age, q=q, flow=flow)
-    m.vocab = vocab; m.cfg = dict(censor='known', growth='flex', noise=False, prior_ctx=False, age=age, q=q, **({'flow': {**FLOW_DEFAULT, **(flow or {})}} if q == 'flow' else {})); return m
+def make_model(vocab, age=True, q='gauss', flow=None, height='gauss'):
+    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), age=age, q=q, flow=flow, height=height)
+    m.vocab = vocab; m.cfg = dict(censor='known', growth='flex', noise=False, prior_ctx=False, age=age, q=q, height=height, **({'flow': {**FLOW_DEFAULT, **(flow or {})}} if q == 'flow' else {})); return m
 
 def model_from_cfg(vocab, cfg):
     """rebuild a saved model's architecture; checkpoints from before D73 have no 'q' and are Gaussian"""
-    return make_model(vocab, age=cfg['age'], q=cfg.get('q', 'gauss'), flow=cfg.get('flow'))
+    return make_model(vocab, age=cfg['age'], q=cfg.get('q', 'gauss'), flow=cfg.get('flow'), height=cfg.get('height', 'gauss'))
 
 class ScheduleFreeAdamW:
     """Schedule-Free AdamW (Defazio et al. 2024, arXiv 2405.15682). Three sequences: z takes the Adam step, x is the weighted average of z and the model to evaluate,
@@ -202,12 +282,19 @@ class ScheduleFreeAdamW:
 def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
-def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None):
+def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None, d74=False):
     assert set(tr.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     B, vocab, _ = build(tr); n = B['v'].shape[0]
+    if d74: assert 'htcd' in tr, 'D74 needs HTCD in the fitting rows'                         # both arms: the height model (G6, G8 compare like with like)
+    if d74 and age:                                                                          # age on: anchors and the coupling, calibrated once on every fit tree, before any subsample
+        assert 'anc_agedia' in tr, 'D74 age on needs anchors in the fitting rows'
+        vocab['age_coupling'] = calibrate_coupling(B, log=log); apply_coupling(B, vocab['age_coupling'])
+        log(f'D74 coupling shifts {int((B["af_shift"] != 0).sum()):,} of {n:,} trees (mean shift {float(B["af_shift"][B["af_shift"] != 0].mean()):+.3f}); anchors on {int((B["anc_m"].sum(1) > 0).sum()):,} trees')
+    else:
+        assert float(B['anc_m'].sum()) == 0, 'anchors in the fitting rows without D74 age on'
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
-    model = make_model(vocab, age=age, q=q, flow=flow).to(device)
+    model = make_model(vocab, age=age, q=q, flow=flow, height='t' if d74 else 'gauss').to(device)
     phi = model.enc_params(); pid = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in pid]
     nb_ep = (n + bs - 1) // bs
     if opt_name == 'sf':                                                                     # warmup = the 5 % of steps OneCycleLR uses
@@ -235,7 +322,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         e0 = {}
         if age:
             with torch.no_grad():
-                w = torch.softmax(o['lw'], 0); z0 = o['z'][..., 0]; al = torch.exp(b['af_mu'][None] + b['af_sd'][None] * z0)
+                w = torch.softmax(o['lw'], 0); z0 = o['z'][..., 0]; al = torch.exp(b['af_mu'][None] + b['af_shift'][None] + b['af_sd'][None] * b['af_sdf'][None] * z0)   # age at the prior's slot, coupled prior
                 pm = (w * z0).sum(0); e0 = dict(z0_mean=pm.mean().item(), z0_abs=pm.abs().mean().item(), z0_sd=((w * z0 ** 2).sum(0) - pm ** 2).clamp(min=0).sqrt().median().item(), age_med=al.median().item(), age_max=al.max().item())
         hist.append(dict(epoch=ep, loss=tot / nb, ess_last_batch=ess, sd_disc=torch.exp(model.lsdisc).item(), **e0))
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
