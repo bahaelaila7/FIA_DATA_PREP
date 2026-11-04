@@ -2,7 +2,7 @@
 # Bundle what a GPU machine needs for the D70 cross-validation; it needs no database. Usage: bash package_gpu.sh DATA_DIR OUT.tar
 set -euo pipefail
 DATA=$1; OUT=$2; W=$(mktemp -d); mkdir -p "$W/nimiwae70/data"
-cp nimiwae56.py nimiwae_flow.py nimiwae70.py nimiwae70_score.py nimiwae70_cv.py nimiwae70_verify.py "$W/nimiwae70/"
+cp nimiwae56.py nimiwae_flow.py nimiwae70.py nimiwae70_score.py nimiwae70_cv.py nimiwae70_verify.py nimiwae70_flowcheck.py "$W/nimiwae70/"
 cp "$DATA/seq.parquet" "$DATA/site_refs.parquet" "$DATA/site_refs_d70.parquet" "$DATA/planted_refs.parquet" "$DATA/ht_refs.parquet" "$W/nimiwae70/data/"
 cat > "$W/nimiwae70/requirements.txt" <<R
 torch
