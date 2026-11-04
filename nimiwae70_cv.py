@@ -48,12 +48,18 @@ def run(a):
     log_f = open(f'{d}/run.log', 'a'); pr = lambda s: (print(f'[f{a.fold} age{a.age}] {s}', flush=True), log_f.write(s + '\n'), log_f.flush())
     pr(f'plots held {len(held_k):,}, monitor {len(mon_k):,}, fit {len(fit_k):,}')
     score_plots = held[held.plot_key.isin(pd.Series(held_k).sample(frac=a.score_frac, random_state=2))]; ckpts = sorted(int(x) for x in a.ckpts.split(',')); state = dict(curve=[], ckpt={}, Bm=None, Bt=None)
+    sp = f'{d}/train_state.{"pkl" if a.backend == "jax" else "pt"}'                         # resumable training state, saved after every epoch
+    if os.path.exists(sp):                                                                    # resuming: keep what earlier epochs wrote, append to it
+        if os.path.exists(f'{d}/curve.json'): state['curve'] = json.load(open(f'{d}/curve.json'))
+        if os.path.exists(f'{d}/scores.json'): state['ckpt'] = json.load(open(f'{d}/scores.json'))
+        pr(f'resuming from {sp}: {len(state["curve"])} curve points and checkpoints {sorted(state["ckpt"])} kept')
     rng = np.random.default_rng(a.seed); mon_s = mon[mon.plot_key.isin(set(rng.permutation(mon_k)[:a.curve_plots]))]; fit_s = fit[fit.plot_key.isin(set(rng.permutation(fit_k)[:a.curve_plots]))]
     def hook(ep, m, h):
         if ep % a.curve_every and ep not in ckpts: return
         m.eval()
         if state['Bm'] is None: state['Bm'] = A.build(mon_s, m.vocab)[0]; state['Bt'] = A.build(fit_s.drop(columns=['anc_agedia'], errors='ignore'), m.vocab)[0]   # bounds without anchor terms, like the monitor
         dev = next(m.parameters()).device; lm, em = bound(m, state['Bm'], a.k, dev); lt, et = bound(m, state['Bt'], a.k, dev)
+        state['curve'] = [c for c in state['curve'] if c['epoch'] != ep]                        # a resumed run may redo an epoch whose hook was cut short
         state['curve'].append(dict(epoch=ep, fit_bound=lt, monitor_bound=lm, gap=lt - lm, fit_ess=et, monitor_ess=em)); pr(json.dumps(state['curve'][-1])); json.dump(state['curve'], open(f'{d}/curve.json', 'w'), indent=0)
         if ep in ckpts:
             if 'age_coupling' in m.vocab and not os.path.exists(f'{d}/coupling.json'): json.dump(m.vocab['age_coupling'], open(f'{d}/coupling.json', 'w'), indent=1)
@@ -66,7 +72,7 @@ def run(a):
     trainer = A.train
     if a.backend == 'jax':                                                                    # D75: the same training in JAX; scoring stays in PyTorch
         from nimiwae_jax import train as JT; trainer = JT.train
-    t0 = time.time(); trainer(fit, epochs=max(ckpts), k=a.k, bs=a.bs, max_trees=a.trees, seed=a.seed, threads=a.threads, log=pr, age=bool(a.age), device=a.device, opt_name='sf', on_epoch=hook, q=qc['q'], flow=qc['flow'], d74=bool(a.d74))
+    t0 = time.time(); trainer(fit, epochs=max(ckpts), k=a.k, bs=a.bs, max_trees=a.trees, seed=a.seed, threads=a.threads, log=pr, age=bool(a.age), device=a.device, opt_name='sf', on_epoch=hook, q=qc['q'], flow=qc['flow'], d74=bool(a.d74), state_path=sp)
     json.dump(dict(seconds=time.time() - t0), open(f'{d}/done.json', 'w')); pr(f'done {time.time() - t0:.0f} s')
 
 def rescore(a):

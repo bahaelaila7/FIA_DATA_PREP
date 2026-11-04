@@ -53,6 +53,27 @@ def check(tm, B, K=4, seed=0, log=print):
     log(json.dumps(R)); return R
 
 
+def check_optimizer(steps=5, lr=1e-2, wd=1e-5, seed=0, log=print):
+    """optax clip_by_global_norm + contrib.schedule_free_adamw against nimiwae70.ScheduleFreeAdamW with clip_grad_norm_: the same gradient sequence
+    through both, then the training weights y and the averaged weights x must agree. PyTorch's warmup is 1 step and optax's off, so both run at the
+    full learning rate from the first step (their warmups differ by design, see train.py)."""
+    import optax
+    g = np.random.default_rng(seed); shapes = dict(a=(4, 3), b=(5,), c=())
+    p0 = {k: g.normal(size=s_).astype(np.float32) for k, s_ in shapes.items()}
+    grads = [{k: (g.normal(size=s_) * (8.0 if i % 2 else 0.3)).astype(np.float32) for k, s_ in shapes.items()} for i in range(steps)]   # big ones get clipped
+    tp = [torch.nn.Parameter(torch.tensor(p0[k])) for k in shapes]; opt = A.ScheduleFreeAdamW(tp, lr=lr, wd=wd, warmup=1)
+    for gi in grads:
+        for p_, k in zip(tp, shapes): p_.grad = torch.tensor(gi[k])
+        torch.nn.utils.clip_grad_norm_(tp, 5.0); opt.step()
+    tx = optax.chain(optax.clip_by_global_norm(5.0), optax.contrib.schedule_free_adamw(lr, warmup_steps=None, b1=0.9, b2=0.999, eps=1e-8, weight_decay=wd))
+    jp = {k: jnp.asarray(v) for k, v in p0.items()}; st = tx.init(jp)
+    for gi in grads:
+        up, st = tx.update({k: jnp.asarray(v) for k, v in gi.items()}, st, jp); jp = optax.apply_updates(jp, up)
+    jx = optax.contrib.schedule_free_eval_params(st[1], jp)
+    R = dict(optimizer_y=max(_rel(jp[k], p_.detach().numpy()) for p_, k in zip(tp, shapes)), optimizer_x=max(_rel(jx[k], x.numpy()) for x, k in zip(opt.x, shapes)))
+    R['pass'] = bool(max(R['optimizer_y'], R['optimizer_x']) < 1e-5); log(json.dumps(R)); return R
+
+
 def _perturb(tm, seed=1):
     """move zero-initialised parameters off zero so the check exercises them: flow weights by 0.02 (a trained flow's last layers average
     |w| ~ 0.004; at 0.2 the splines are so steep that inverting them is ill-conditioned in both frameworks, even in float64), others by 0.2"""
@@ -82,4 +103,12 @@ if __name__ == '__main__':
     for age, q, height in ((True, 'gauss', 'gauss'), (True, 'flow', 'gauss'), (True, 'gauss', 't'), (True, 'flow', 't'), (False, 'gauss', 't'), (False, 'flow', 'gauss')):
         torch.manual_seed(0); tm = _perturb(A.make_model(vocab, age=age, q=q, height=height))
         print(f'age {age}, q {q}, height {height}:', end=' '); ok &= check(tm, B)['pass']
+    # branches this batch lacks: moved trees (no cause hazard) and the benchmark-only interval mode
+    Bf = {k_: v.clone() for k_, v in B.items()}; Bf['moved'][:20] = 1
+    un = ((Bf['real'] == 0) & (Bf['sampled'] > 0) & (Bf['v'] > 0)).nonzero()[:30]
+    Bf['mode'][un[:, 0], un[:, 1]] = M.MODE['interval']; Bf['llo'][un[:, 0], un[:, 1]] = 0.0
+    for q in ('gauss', 'flow'):
+        torch.manual_seed(0); tm = _perturb(A.make_model(vocab, age=True, q=q, height='t'))
+        print(f'forced branches (20 moved, 30 interval slots), q {q}:', end=' '); ok &= check(tm, Bf)['pass']
+    print('optimizer:', end=' '); ok &= check_optimizer()['pass']
     print('equivalence', 'PASS' if ok else 'FAIL'); sys.exit(0 if ok else 1)

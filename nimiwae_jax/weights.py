@@ -102,5 +102,5 @@ def to_torch(m: NIMIWAE70, tm, params=None):
     """copy Flax weights (or the parameter State `params`, e.g. Schedule-Free's evaluation weights) into the PyTorch module `tm`; returns tm"""
     if params is not None: m = nnx.merge(nnx.graphdef(m), params, nnx.state(m, nnx.Not(nnx.Param)))
     sd = tm.state_dict()
-    for name, a in torch_layout(m).items(): sd[name] = torch.from_numpy(a).to(sd[name].dtype)
+    for name, a in torch_layout(m).items(): sd[name] = torch.from_numpy(np.array(a)).to(sd[name].dtype)   # a writable copy of the JAX-backed array
     tm.load_state_dict(sd); return tm

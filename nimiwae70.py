@@ -265,6 +265,14 @@ class ScheduleFreeAdamW:
                 z.add_(p, alpha=-g_ * s.wd).addcdiv_(p.grad, torch.sqrt(v / bc) + s.eps, value=-g_)
             x.lerp_(z, c)
             p.copy_(s.beta * x + (1 - s.beta) * z)
+    def state_dict(s):
+        """everything a resumed run needs: the step count, the weight sum and the z, x and second-moment tensors"""
+        return dict(t=s.t, W=s.W, z=[a.clone() for a in s.z], x=[a.clone() for a in s.x], v=[a.clone() for a in s.v])
+    @torch.no_grad()
+    def load_state_dict(s, d):
+        assert len(d['z']) == len(s.z), 'optimizer state for another model'
+        s.t, s.W = d['t'], d['W']
+        for dst, src in zip(s.z + s.x + s.v, d['z'] + d['x'] + d['v']): dst.copy_(src.to(dst.device))
     @torch.no_grad()
     def finish(s):
         for p, x in zip(s.ps, s.x): p.copy_(x)
@@ -279,10 +287,18 @@ class ScheduleFreeAdamW:
             with torch.no_grad():
                 for p, y_ in zip(s.ps, y): p.copy_(y_)
 
+def save_atomic(obj, path):
+    """torch.save to a temporary file, then rename: an interruption never leaves a half-written state"""
+    tmp = f'{path}.tmp'; torch.save(obj, tmp); os.replace(tmp, path)
+
 def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
-def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None, d74=False):
+def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None, d74=False,
+          state_path=None):
+    """state_path: after every completed epoch (and its hook) the full training state is saved there; if the file exists, training resumes after its
+    epoch. It holds the parameters, the optimizer (and scheduler) state, the batch-order and noise RNG states and the history, plus a fingerprint of the
+    setup; a different setup refuses to resume."""
     assert set(tr.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     B, vocab, _ = build(tr); n = B['v'].shape[0]
@@ -303,8 +319,19 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * nb_ep, pct_start=0.05, anneal_strategy='cos')
     log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; prior on {int(B["af_has"].sum()):,} trees; K {k} (DReG); age {age}; q {q}{" " + json.dumps(model.cfg["flow"]) if q == "flow" else ""}; device {device}; optimizer {opt_name}')
-    hist = []
-    for ep in range(epochs):
+    hist, start = [], 0
+    fp = dict(backend='torch', n=n, epochs=epochs, k=k, bs=bs, seed=seed, lr=lr, age=age, q=q, cfg=model.cfg, d74=d74, opt=opt_name, coupling=vocab.get('age_coupling'))
+    cuda = str(device).startswith('cuda')
+    if state_path and os.path.exists(state_path):                                            # resume after the last completed epoch
+        ck = torch.load(state_path, weights_only=False, map_location=device)
+        assert ck['fingerprint'] == fp, f'{state_path} was saved by another setup: {ck["fingerprint"]} vs {fp}'
+        model.load_state_dict(ck['model']); opt.load_state_dict(ck['opt'])
+        if sched is not None: sched.load_state_dict(ck['sched'])
+        rng.bit_generator.state = ck['np_rng']; torch.set_rng_state(ck['torch_rng'])
+        if cuda and ck.get('cuda_rng') is not None: torch.cuda.set_rng_state(ck['cuda_rng'], device)
+        hist, start = ck['hist'], ck['epoch'] + 1
+        log(f'resumed after epoch {start} of {epochs} from {state_path}')
+    for ep in range(start, epochs):
         t0, tot, nb = time.time(), 0.0, 0
         for ix in torch.split(torch.tensor(rng.permutation(n)), bs):
             b = to_dev(sub(B, ix), device); o = model.joint(b, k, dreg=True)
@@ -328,5 +355,8 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
         if on_epoch:                                                                         # hist entry first: the hook may add held-out numbers to it
             with (opt.averaged() if opt_name == 'sf' else contextlib.nullcontext()): on_epoch(ep + 1, model, hist[-1])
+        if state_path:                                                                       # after the hook: an interrupted hook redoes its epoch
+            save_atomic(dict(epoch=ep, fingerprint=fp, model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict() if sched is not None else None,
+                             np_rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state(device) if cuda else None, hist=hist), state_path)
     if opt_name == 'sf': opt.finish()                                                        # evaluate and save the averaged weights
     return model.to('cpu'), hist
