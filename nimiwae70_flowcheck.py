@@ -23,17 +23,19 @@ def scores(m, B, K, dev, bs=512, seed=0):
 @torch.no_grad()
 def movement(m, B, dev, K=32, bs=512):
     """|T(e) - e| / sigma_q per transformed coordinate and log |dT/de| per draw"""
-    d, ld, inside = [], [], []
+    d, ld, inside, rt = [], [], [], []
     for i in range(0, B['v'].shape[0], bs):
         b = {k: v.to(dev) for k, v in M.sub(B, slice(i, i + bs)).items()}; mq, lq = M.NIMIWAE56.q(m, b)
         e = mq + torch.exp(0.5 * lq) * torch.randn(K, *mq.shape, device=dev); er = e[..., m.f0:]
         zr, l = m.flow(er, m._hq)
+        eb, _ = m.flow(zr, m._hq, inverse=True); rt.append((eb - er).abs().flatten().cpu())      # forward then inverse: the DReG density's inverse must invert
         d.append(((zr - er).abs() / torch.exp(0.5 * lq[..., m.f0:])[None]).flatten().cpu()); ld.append(l.flatten().cpu())
         inside.append(((er.abs() < m.flow.layers[0].B).float().mean()).cpu()[None])
-    d, ld = torch.cat(d), torch.cat(ld)
+    d, ld, rt = torch.cat(d), torch.cat(ld), torch.cat(rt)
     q = lambda x, p: float(torch.quantile(x[torch.randperm(len(x))[:200000]], p))
     return dict(shift_sd_median=q(d, 0.5), shift_sd_p90=q(d, 0.9), shift_sd_p99=q(d, 0.99), logdet_mean=float(ld.mean()), logdet_sd=float(ld.std()),
-                logdet_p01=q(ld, 0.01), logdet_p99=q(ld, 0.99), share_inside_spline_range=float(torch.cat(inside).mean()))
+                logdet_p01=q(ld, 0.01), logdet_p99=q(ld, 0.99), share_inside_spline_range=float(torch.cat(inside).mean()),
+                roundtrip_max=float(rt.max()), roundtrip_p99=q(rt, 0.99))
 
 
 def main():

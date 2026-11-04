@@ -3,26 +3,32 @@
 set -euo pipefail
 DATA=$1; OUT=$2; W=$(mktemp -d); mkdir -p "$W/nimiwae70/data"
 cp nimiwae56.py nimiwae_flow.py nimiwae70.py nimiwae70_score.py nimiwae70_cv.py nimiwae70_verify.py nimiwae70_flowcheck.py "$W/nimiwae70/"
+mkdir -p "$W/nimiwae70/nimiwae_jax" && cp nimiwae_jax/*.py "$W/nimiwae70/nimiwae_jax/"
 cp "$DATA/seq.parquet" "$DATA/site_refs.parquet" "$DATA/site_refs_d70.parquet" "$DATA/planted_refs.parquet" "$DATA/ht_refs.parquet" "$W/nimiwae70/data/"
 cat > "$W/nimiwae70/requirements.txt" <<R
 torch
+# BACKEND=jax only (D75): pip install -U "jax[cuda12]" flax optax   (tested with jax 0.12.0.1, flax 0.12.12, optax 0.2.8)
 numpy==2.4.6
 pandas==3.0.3
 pyarrow==24.0.0
 R
 cat > "$W/nimiwae70/run.sh" <<'R'
 #!/usr/bin/env bash
-# Cross-validation on the GPU machine. Usage: [D74=1] [Q=flow] [G1RESCORE=out/cv72] bash run.sh [device]
+# Cross-validation on the GPU machine. Usage: [D74=1] [Q=flow] [BACKEND=jax] [G1RESCORE=out/cv72] bash run.sh [device]
 #   default        Gaussian q, no D74, into out/cv72                       (Q=flow: out/cv72flow, D73)
 #   D74=1          anchors + calibrated age-vigour coupling + HTCD heights, into out/cv74 (DECISIONS D74)
+#   BACKEND=jax    train with nimiwae_jax (D75), score with the same PyTorch code; output folder gets _jax (e.g. out/cv74flow_jax)
 #   G1RESCORE=DIR  no training: score DIR's saved age-on checkpoints on both G1 sets into DIR_g1 (cv72 vs cv74 on the same trees), then exit
 # Order for D74: G1RESCORE=out/cv72 bash run.sh cuda; D74=1 bash run.sh cuda; python -I nimiwae70_cv.py --out out/cv74 --compare out/cv72_g1
 # Runs P at a time (P=5), CPU threads shared out, runs spread over GPUs. Finished runs are skipped, so it can be restarted. Copy the out dir back.
 set -uo pipefail
-D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; G1R=${G1RESCORE:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
+D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; BK=${BACKEND:-torch}; G1R=${G1RESCORE:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
 case "$Q" in gauss|flow) ;; *) echo "Q must be gauss or flow, not $Q"; exit 1;; esac
 case "$D74" in 0) O=out/cv72;; 1) O=out/cv74;; *) echo "D74 must be 0 or 1, not $D74"; exit 1;; esac
 [ "$Q" = flow ] && O=${O}flow
+case "$BK" in torch) ;; jax) O=${O}_jax; export XLA_PYTHON_CLIENT_PREALLOCATE=false
+  python -I nimiwae_jax/equivalence.py data | tail -1 || exit 1;;   # the JAX port must match PyTorch on this machine first
+  *) echo "BACKEND must be torch or jax, not $BK"; exit 1;; esac
 python -I nimiwae70_verify.py data | tail -1 || exit 1
 python -I nimiwae70_cv.py --selftest || exit 1
 if [ -n "$G1R" ]; then
@@ -31,8 +37,8 @@ if [ -n "$G1R" ]; then
   for f in $FOLDS; do echo "$f"; done | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out '"${G1R}_g1"' --fold $0 --rescore-g1 '"$G1R"' --device '"$D --threads $T"
   exit $?
 fi
-echo "q $Q, D74 $D74, into $O; $P at a time, $T CPU threads each, $G GPU(s)"
-{ for a in 1 0; do for f in $FOLDS; do echo "$f $a"; done; done; } | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out '"$O"' --fold $0 --age $1 --q '"$Q"' --d74 '"$D74"' --device '"$D --threads $T ${ARGS:-}"
+echo "q $Q, D74 $D74, backend $BK, into $O; $P at a time, $T CPU threads each, $G GPU(s)"
+{ for a in 1 0; do for f in $FOLDS; do echo "$f $a"; done; done; } | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out '"$O"' --fold $0 --age $1 --q '"$Q"' --d74 '"$D74"' --backend '"$BK"' --device '"$D --threads $T ${ARGS:-}"
 rc=$?
 python -I nimiwae70_cv.py --out "$O" --summary | tail -60
 [ "$rc" -eq 0 ] || echo "SOME RUNS FAILED: rerun this script, finished runs are skipped. See $O/*/run.log"
