@@ -302,6 +302,14 @@ rate = torch.where(miss, torch.full((nd,), 1.5), torch.full((nd,), 0.05))
 Bc['f'][half:] = 1; Bc['lD'][half:, 1] = torch.log(5.0 + 5.0 * rate); Bc['mD'][half:, 1] = 1; Bc['real'][half:, 1] = 1
 eps19 = A.calibrate_miss(Bc, log=lambda *_: None)
 check('D76: calibration recovers a planted miss rate (3 %)', abs(eps19 - float(miss.float().mean())) < 1e-9, f'eps {eps19:.4f} vs planted {float(miss.float().mean()):.4f}')
+# debuts outside the calibration population change nothing: coded misses (missed mode), partly sampled spots, microplot level, a record at the earlier visit
+Bx = {k: torch.cat([v, v[half:half + 400]]) if v.dim() and v.shape[0] == N else v for k, v in Bc.items()}; x0 = N
+Bx['lD'][x0:, 1] = math.log(5.0 + 5.0 * 1.5)                                                # every extra debut grew implausibly fast
+Bx['mode'][x0:x0 + 100, 0] = M.MODE['missed']; Bx['psamp'][x0 + 100:x0 + 200, 0] = 0.5; Bx['llim'][x0 + 200:x0 + 300, 0] = Bx['lex'][x0 + 200:x0 + 300, 0]
+Bx['real'][x0 + 300:, 0] = 1
+check('D76: calibration ignores coded, partly sampled, microplot-level and previously recorded debuts', abs(A.calibrate_miss(Bx, log=lambda *_: None) - eps19) < 1e-12)
+B19m = {k: v.clone() for k, v in B19.items()}; B19m['llim'][0, 0] = B19m['lex'][0, 0]; A.apply_miss(B19m, 0.02)
+check('D76: no factor at a pre-debut microplot-level slot', float(B19m['miss_keep'][0, 0]) == 1.0 and float(B19m['miss_keep'][0, 1]) < 1.0)
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()

@@ -241,14 +241,21 @@ def noise_off(seq):
     va = seq[seq.split == 'val']; x = va[va.plot_key.isin(va.plot_key.drop_duplicates().sample(40, random_state=11))]
     tr = seq[seq.split == 'train']; vocab = M.build(tr[tr.plot_key.isin(tr.plot_key.drop_duplicates().sample(3000, random_state=1))])[1]
     for censor, growth in (('known', 'flex'), ('mar', 'struct')):
-        torch.manual_seed(3); m55 = M55.make_model(vocab, censor=censor, growth=growth); m55.eval()
-        m56 = M.make_model(vocab, censor=censor, growth=growth, noise=False); m56.load_state_dict(m55.state_dict(), strict=True); m56.eval()
-        B, _, _ = M55.build(x, vocab); B['psamp'] = B['sampled'].float()                    # same tensors; the share binarised (am. 6 differs by design)
-        with torch.no_grad():
-            torch.manual_seed(0); a_ = m55.joint(B, 4); torch.manual_seed(0); b_ = m56.joint(B, 4)
-        # lw relative to its scale: an untrained model gives |lw| ~ 6e4 on some D72 trees, where float32 spacing is 4e-3 (2 ulps failed the old absolute 1e-5)
-        d = max(float((a_['lw'] - b_['lw']).abs().max()) / max(1.0, float(a_['lw'].abs().max())), float((torch.exp(a_['lpost']) - torch.exp(b_['lpost'])).abs().max()))
-        check(f'[{censor}+{growth}] N1 noise off reproduces D55 exactly (same tensors, binary sampling)', d < 1e-5, f'max |Δ| (lw relative) {d:.1e}')
+        # in float64: an untrained model gives |lw| ~ 6e4 on some D72 trees, where float32 spacing is 4e-3; in float32 the two passes differ by a few
+        # ulps from run to run (vectorised kernels), which moves posteriors built from such terms by ~1e-3 (2026-11-05: N1 failed 1 run in 3)
+        torch.set_default_dtype(torch.float64)
+        try:
+            torch.manual_seed(3); m55 = M55.make_model(vocab, censor=censor, growth=growth).double(); m55.eval()
+            m56 = M.make_model(vocab, censor=censor, growth=growth, noise=False).double(); m56.load_state_dict(m55.state_dict(), strict=True); m56.eval()
+            B, _, _ = M55.build(x, vocab); B['psamp'] = B['sampled'].float()                # same tensors; the share binarised (am. 6 differs by design)
+            B = {k: v.double() if v.is_floating_point() else v for k, v in B.items()}
+            with torch.no_grad():
+                torch.manual_seed(0); a_ = m55.joint(B, 4); torch.manual_seed(0); b_ = m56.joint(B, 4)
+        finally:
+            torch.set_default_dtype(torch.float32)
+        assert a_['lw'].dtype == torch.float64
+        dl = float((a_['lw'] - b_['lw']).abs().max()) / max(1.0, float(a_['lw'].abs().max())); dp = float((torch.exp(a_['lpost']) - torch.exp(b_['lpost'])).abs().max())
+        check(f'[{censor}+{growth}] N1 noise off reproduces D55 exactly (same tensors, binary sampling; float64)', max(dl, dp) < 1e-9, f'lw relative {dl:.1e}, posterior {dp:.1e}')
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); a = ap.parse_args()

@@ -4,7 +4,8 @@
 Held trees of each fold, DIA >= 5 in at the prior's slot, whose visit just before their first visible record was sampled, unrecorded, in the
 cutoff mode (no missed code) and at subplot level: the share whose posterior median of the age latent z0 is below -2 (also -1, -3), on the product
 grid (nimiwae70.PRODUCT_GRID, wide enough that no posterior is clipped). Microplot-level debuts are reported alongside (not a bar).
-Writes RUN/gatepull_e{epoch}.json: counts per fold and pooled (pooled share = sum of counts / sum of trees)."""
+Writes RUN/gatepull_e{epoch}.json: counts per fold and pooled (pooled share = sum of counts / sum of trees).
+--eps-scale S (D76's reported sensitivity, not a bar): rescore a D76 run with its calibrated eps times S (no retraining), into gatepull_e{epoch}_eps{S}.json."""
 import sys, os, json, argparse, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pandas as pd, torch
@@ -34,16 +35,19 @@ def z50(m, B, dev, bs=512, K=100):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); ap.add_argument('--run', required=True); ap.add_argument('--epoch', type=int, default=36)
     ap.add_argument('--folds', default='0,1,2,3,4'); ap.add_argument('--frac', type=float, default=1.0, help='share of each fold\'s held plots (1 = all)')
-    ap.add_argument('--device', default='cpu'); ap.add_argument('--threads', type=int, default=8); a = ap.parse_args(); torch.set_num_threads(a.threads)
+    ap.add_argument('--eps-scale', type=float, default=1.0); ap.add_argument('--device', default='cpu'); ap.add_argument('--threads', type=int, default=8); a = ap.parse_args(); torch.set_num_threads(a.threads)
     k = M.K_ + ['invyr']; tr = pd.read_parquet(f'{a.data}/seq.parquet', filters=[('split', '==', 'train')]); keys = sorted(tr.plot_key.unique())
-    R = dict(run=a.run, epoch=a.epoch, frac=a.frac, bar=BAR, folds={})
+    R = dict(run=a.run, epoch=a.epoch, frac=a.frac, bar=BAR, eps_scale=a.eps_scale, eps={}, folds={})
     for f in map(int, a.folds.split(',')):
         t0 = time.time(); m, ck = S.load(f'{a.run}/f{f}_age1', f'model_e{a.epoch}.pt'); m.to(a.device)
         held_k, _, _ = C.split_plots(keys, f); hk = pd.Series(held_k)
         if a.frac < 1: hk = hk.sample(frac=a.frac, random_state=5)
         held = tr[tr.plot_key.isin(set(hk))]
         if m.height == 't': held = held.merge(pd.read_parquet(f'{a.data}/ht_refs.parquet'), on=k, how='left')   # the inputs the model trained with
-        B, _, _ = A.build(held, m.vocab); sub, mic = late_debut_masks(B); o = {}
+        B, _, _ = A.build(held, m.vocab); R['eps'][str(f)] = m.vocab.get('miss_eps')                    # build applies the run's own eps (D76 runs)
+        if a.eps_scale != 1.0:
+            assert 'miss_eps' in m.vocab, '--eps-scale needs a D76 run'; A.apply_miss(B, m.vocab['miss_eps'] * a.eps_scale)
+        sub, mic = late_debut_masks(B); o = {}
         for lab, msk in (('subplot', sub), ('microplot', mic)):
             ix = torch.nonzero(msk).flatten(); torch.manual_seed(0); z = z50(m, M.sub(B, ix), a.device)
             o[lab] = dict(n=int(len(z)), **{f'below_{c:g}': int((z < c).sum()) for c in CUTS})
@@ -51,8 +55,10 @@ def main():
         print(f'fold {f}: {json.dumps(o)}', flush=True)
     pool = {lab: {x: sum(R['folds'][f][lab][x] for f in R['folds']) for x in R['folds'][next(iter(R['folds']))][lab]} for lab in ('subplot', 'microplot')}
     for lab in pool: pool[lab].update({f'share_below_{c:g}': pool[lab][f'below_{c:g}'] / max(1, pool[lab]['n']) for c in CUTS})
-    R['pooled'] = pool; R['pass'] = bool(pool['subplot']['share_below_-2'] <= BAR)
-    json.dump(R, open(f'{a.run}/gatepull_e{a.epoch}.json', 'w'), indent=1); print(json.dumps(R['pooled'], indent=1), '\nD76 primary (subplot share below -2 <= 0.10 %):', 'PASS' if R['pass'] else 'FAIL')
+    R['pooled'] = pool; R['pass'] = bool(pool['subplot']['share_below_-2'] <= BAR) if a.eps_scale == 1.0 else None   # the bar is on the run as trained
+    out = f'{a.run}/gatepull_e{a.epoch}.json' if a.eps_scale == 1.0 else f'{a.run}/gatepull_e{a.epoch}_eps{a.eps_scale:g}.json'
+    json.dump(R, open(out, 'w'), indent=1); print(json.dumps(R['pooled'], indent=1))
+    print('D76 primary (subplot share below -2 <= 0.10 %):', 'PASS' if R['pass'] else 'FAIL') if R['pass'] is not None else print(f'sensitivity eps x{a.eps_scale:g} (reported, not a bar) -> {out}')
 
 
 if __name__ == '__main__':

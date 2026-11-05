@@ -64,6 +64,7 @@ def run(a):
         state['curve'].append(dict(epoch=ep, fit_bound=lt, monitor_bound=lm, gap=lt - lm, fit_ess=et, monitor_ess=em)); pr(json.dumps(state['curve'][-1])); json.dump(state['curve'], open(f'{d}/curve.json', 'w'), indent=0)
         if ep in ckpts:
             if 'age_coupling' in m.vocab and not os.path.exists(f'{d}/coupling.json'): json.dump(m.vocab['age_coupling'], open(f'{d}/coupling.json', 'w'), indent=1)
+            if 'miss_eps' in m.vocab and not os.path.exists(f'{d}/miss.json'): json.dump(dict(eps=m.vocab['miss_eps']), open(f'{d}/miss.json', 'w'))   # D76: eps per fold (reported)
             t0 = time.time(); o = dict(completion=S.completion(m, score_plots))
             rows = []
             if a.age: o.update(S.age_scores(m, held, site, planted, planted_frac=a.planted_frac, site_old=site_old, rows=rows)); pd.concat(rows).to_parquet(f'{d}/g1_e{ep}.parquet')
@@ -129,6 +130,45 @@ def compare(a):
     json.dump(R, open(f'{a.out}/d74_compare.json', 'w'), indent=1, default=float); print(json.dumps(R, indent=1, default=float)[:5000])
     print('G6 / G8: see the cv74 --summary (age on vs age off within cv74).')
 
+D76_BARS = dict(g1_worse=0.05, g1_bias=2.0, g5=(0.75, 0.85), brier_worse=0.002, size_ratio=1.01, resid_slope=0.5)   # pre-registered in D76 (no harm)
+
+def compare_d76(a):
+    """D76's pre-registered bars: --out (cv76flow) against --d76-base (cv74flow), same folds, epoch by epoch. Primary: gatepull_e{epoch}.json of
+    --out (nimiwae70_gatepull.py; the base's own file is the reference value). No harm, on fold means: G1 mean MAE (both link sets) not worse by more
+    than 0.05 yr, |G1 median-bias mean| <= 2, G5 coverage 0.75-0.85, age-on E1 / E2 / E3 Brier not worse by more than 0.002, age-on size MAE not worse
+    by more than 1 %, the D74 residual slope <= 0.5 |delta|. Reported: eps per fold, the same completion deltas for the age-off arm."""
+    b = a.d76_base; R = {}
+    for e in sorted({int(x) for f in glob.glob(f'{a.out}/f*_age1/scores.json') for x in json.load(open(f))}):
+        fo = {}
+        for f in range(NF):
+            for arm in (1, 0):
+                p6, p4 = f'{a.out}/f{f}_age{arm}/scores.json', f'{b}/f{f}_age{arm}/scores.json'
+                if not (os.path.exists(p6) and os.path.exists(p4)): continue
+                s6, s4 = json.load(open(p6)).get(str(e)), json.load(open(p4)).get(str(e))
+                if not (s6 and s4): continue
+                c6, c4 = s6['completion'], s4['completion']; r = dict(dE1=c6['E1'] - c4['E1'], dE2=c6['E2'] - c4['E2'], dE3=c6['E3'] - c4['E3'], size_ratio=c6['mae_lD'] / c4['mae_lD'])
+                if arm: r.update(g1_76=s6['G1']['mae_joint'], g1_74=s4['G1']['mae_joint'], g1d70_76=s6['G1_d70']['mae_joint'], g1d70_74=s4['G1_d70']['mae_joint'], bias_76=s6['G1']['bias_joint'], g5_76=s6['G5']['cover80'])
+                fo[f'f{f}_age{arm}'] = r
+        on = {k: v for k, v in fo.items() if k.endswith('age1')}; off = {k: v for k, v in fo.items() if k.endswith('age0')}
+        if not on: continue
+        mean = lambda d, x: float(np.mean([v[x] for v in d.values()])) if d else None
+        rows = pd.concat([pd.read_parquet(x) for x in glob.glob(f'{a.out}/f*_age1/g1_e{e}.parquet')]); c = rows[rows.af_shift != 0]
+        y = np.log(c.truth.to_numpy()) - np.log(c.q50.to_numpy()); X = np.column_stack([np.ones(len(c)), c.lrate.to_numpy()]); sl = float(np.linalg.lstsq(X, y, rcond=None)[0][1]) if len(c) > 50 else None
+        cps = [json.load(open(x)) for x in glob.glob(f'{a.out}/f*_age1/coupling.json')]; dl = float(np.mean([cp['delta']['3'] for cp in cps])) if cps else None
+        gp = {r_: json.load(open(f'{r_}/gatepull_e{e}.json')) if os.path.exists(f'{r_}/gatepull_e{e}.json') else None for r_ in (a.out, b)}
+        prim = {r_: (g['pooled']['subplot']['share_below_-2'] if g else None) for r_, g in gp.items()}
+        g1w = mean(on, 'g1_76') - mean(on, 'g1_74'); g1dw = mean(on, 'g1d70_76') - mean(on, 'g1d70_74')
+        bars = dict(primary=bool(gp[a.out] is not None and gp[a.out]['pass'] and gp[a.out]['frac'] == 1.0 and len(gp[a.out]['folds']) == NF),   # all held plots of all folds
+                    G1=bool(g1w <= D76_BARS['g1_worse'] and g1dw <= D76_BARS['g1_worse']), G1_bias=bool(abs(mean(on, 'bias_76')) <= D76_BARS['g1_bias']),
+                    G5=bool(D76_BARS['g5'][0] <= mean(on, 'g5_76') <= D76_BARS['g5'][1]),
+                    brier=bool(max(mean(on, 'dE1'), mean(on, 'dE2'), mean(on, 'dE3')) <= D76_BARS['brier_worse']), size=bool(mean(on, 'size_ratio') <= D76_BARS['size_ratio']),
+                    residual_slope=bool(sl is not None and dl is not None and abs(sl) <= D76_BARS['resid_slope'] * abs(dl)))
+        eps = {os.path.basename(os.path.dirname(x)): json.load(open(x))['eps'] for x in sorted(glob.glob(f'{a.out}/f*_age*/miss.json'))}
+        R[e] = dict(folds=fo, primary_share_below_m2=prim, G1_worse=g1w, G1_d70_worse=g1dw, age_on={x: mean(on, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio', 'bias_76', 'g5_76')},
+                    age_off_reported={x: mean(off, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio')}, residual_slope=sl, delta_c3=dl, eps=eps, bars=bars, adopt=bool(all(bars.values())))
+    json.dump(R, open(f'{a.out}/d76_compare.json', 'w'), indent=1, default=float); print(json.dumps(R, indent=1, default=float)[:6000])
+    if any(R[e]['bars']['primary'] is False and R[e]['primary_share_below_m2'][a.out] is None for e in R): print('primary: run nimiwae70_gatepull.py on --out (and on the base for its reference value) first')
+
 def summary(a):
     R = {}
     for f in sorted(glob.glob(f'{a.out}/f*_age*/scores.json')):
@@ -166,5 +206,5 @@ if __name__ == '__main__':
     ap.add_argument('--trees', type=int, default=400000); ap.add_argument('--ckpts', default='12,24,36'); ap.add_argument('--curve-every', type=int, default=2); ap.add_argument('--curve-plots', type=int, default=500); ap.add_argument('--score-frac', type=float, default=0.5); ap.add_argument('--planted-frac', type=float, default=0.25)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=8); ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--d74', type=int, default=0); ap.add_argument('--d76', type=int, default=0); ap.add_argument('--backend', choices=('torch', 'jax'), default='torch'); ap.add_argument('--compare', help='cv72 rescored with --rescore-g1: evaluate the D74 bars of --out against it'); ap.add_argument('--rescore-g1', help='a finished run without D74: score its age-on checkpoints on both G1 sets'); ap.add_argument('--q', choices=('gauss', 'flow'), default='gauss'); ap.add_argument('--flow-layers', type=int, default=6); ap.add_argument('--flow-hidden', type=int, default=64); ap.add_argument('--flow-bins', type=int, default=8)
-    ap.add_argument('--summary', action='store_true'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
-    selftest() if a.selftest else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)
+    ap.add_argument('--summary', action='store_true'); ap.add_argument('--d76-base', help='cv74flow: evaluate the D76 bars of --out (cv76flow) against it'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
+    selftest() if a.selftest else compare_d76(a) if a.d76_base else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)

@@ -39,9 +39,9 @@ T_NU = 4.0                               # D74: Student-t degrees of freedom for
 RATE_FLOOR = 0.02                        # D74: in / yr; an observed DIA change at or below it reads as this rate (12 % of anchor increments are <= 0)
 COUPLE_MIN_DIA = 5.0                     # D74: no coupling below 5 in at the prior's slot (no R4 sapling has an age)
 COUPLE_MIN_YEARS = 1.0                   # D74: a growth rate needs measured DIA at least this far apart
-WEST_RATIO = {4: 0.61, 5: 0.43}
+WEST_RATIO = {4: 0.61, 5: 0.43}          # D74: coupling strength of intermediate / overtopped relative to classes 1-3 (western BHAGE, 229k trees)
 MISS_DIA = (5.0, 7.0)                    # D76: G_MAX comes from the measured growth of trees this size (just above the subplot limit)
-MISS_Q = 0.99                            # D76: G_MAX = this quantile of their annual DIA growth          # D74: coupling strength of intermediate / overtopped relative to classes 1-3 (western BHAGE, 229k trees)
+MISS_Q = 0.99                            # D76: G_MAX = this quantile of their annual DIA growth
 
 def soil_vocab(seq):
     return {c: (float(seq[c].mean()), float(seq[c].std()) or 1.0) for c in SOIL_COLS}

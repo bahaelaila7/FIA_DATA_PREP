@@ -21,6 +21,9 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 #   BACKEND=jax    train with nimiwae_jax (D75), score with the same PyTorch code; output folder gets _jax (e.g. out/cv74flow_jax)
 #   G1RESCORE=DIR  no training: score DIR's saved age-on checkpoints on both G1 sets into DIR_g1 (cv72 vs cv74 on the same trees), then exit
 # Order for D74: G1RESCORE=out/cv72 bash run.sh cuda; D74=1 bash run.sh cuda; python -I nimiwae70_cv.py --out out/cv74 --compare out/cv72_g1
+# Order for D76: Q=flow D74=1 D76=1 bash run.sh cuda; then for R in out/cv76flow out/cv74flow: python -I nimiwae70_gatepull.py --data data --run $R --device cuda;
+#   python -I nimiwae70_gatepull.py --data data --run out/cv76flow --device cuda --eps-scale 0.5 (and 2: reported, not bars);
+#   python -I nimiwae70_cv.py --out out/cv76flow --d76-base out/cv74flow (every D76 bar, into out/cv76flow/d76_compare.json)
 # Runs P at a time (P=5), CPU threads shared out, runs spread over GPUs. Finished runs are skipped, so it can be restarted. Copy the out dir back.
 set -uo pipefail
 D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; D76=${D76:-0}; BK=${BACKEND:-torch}; G1R=${G1RESCORE:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
