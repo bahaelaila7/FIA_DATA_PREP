@@ -86,7 +86,7 @@ def load_state(path, fingerprint, model, optimizer, rng):
 
 
 def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='sf', on_epoch=None,
-          q='gauss', flow=None, d74=False, state_path=None):
+          q='gauss', flow=None, d74=False, state_path=None, d76=False):
     """nimiwae70.train with this step. Returns (a PyTorch NIMIWAE70 with the averaged weights, the history). `device` is where the PyTorch model the
     hook scores lives; JAX trains on its default device. state_path: after every completed epoch (and its hook) the full training state is saved
     there, and an existing file resumes training after its epoch (the setup must match the saved fingerprint)."""
@@ -102,6 +102,8 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         log(f'D74 coupling shifts {int((B["af_shift"] != 0).sum()):,} of {n:,} trees; anchors on {int((B["anc_m"].sum(1) > 0).sum()):,} trees')
     else:
         assert float(B['anc_m'].sum()) == 0, 'anchors in the fitting rows without D74 age on'
+    if d76:                                                             # both arms: the crew-miss rate (D76), as nimiwae70.train
+        vocab['miss_eps'] = A.calibrate_miss(B, log=log); A.apply_miss(B, vocab['miss_eps'])
     if max_trees and max_trees < n: B = M.sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
     # PyTorch initialisation (the same distributions and zero-initialised heads), copied into Flax
     tm = A.make_model(vocab, age=age, q=q, flow=flow, height='t' if d74 else 'gauss')
@@ -112,7 +114,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
     log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; prior on {int(B["af_has"].sum()):,} trees; K {k} (DReG); age {age}; q {q}; '
         f'backend jax {jax.__version__} on {jax.devices()[0].platform}; scoring on {device}; optimizer schedule-free adamw (optax)')
     hist, start = [], 0
-    fp = dict(backend='jax', n=n, epochs=epochs, k=k, bs=bs, seed=seed, lr=lr, age=age, q=q, cfg=tm.cfg, d74=d74, coupling=vocab.get('age_coupling'))
+    fp = dict(backend='jax', n=n, epochs=epochs, k=k, bs=bs, seed=seed, lr=lr, age=age, q=q, cfg=tm.cfg, d74=d74, coupling=vocab.get('age_coupling'), miss_eps=vocab.get('miss_eps'))
     if state_path and os.path.exists(state_path):                       # resume after the last completed epoch
         start, key, hist = load_state(state_path, fp, model, opt, rng); log(f'resumed after epoch {start} of {epochs} from {state_path}')
     for ep in range(start, epochs):

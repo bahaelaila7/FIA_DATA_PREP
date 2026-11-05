@@ -39,7 +39,9 @@ T_NU = 4.0                               # D74: Student-t degrees of freedom for
 RATE_FLOOR = 0.02                        # D74: in / yr; an observed DIA change at or below it reads as this rate (12 % of anchor increments are <= 0)
 COUPLE_MIN_DIA = 5.0                     # D74: no coupling below 5 in at the prior's slot (no R4 sapling has an age)
 COUPLE_MIN_YEARS = 1.0                   # D74: a growth rate needs measured DIA at least this far apart
-WEST_RATIO = {4: 0.61, 5: 0.43}          # D74: coupling strength of intermediate / overtopped relative to classes 1-3 (western BHAGE, 229k trees)
+WEST_RATIO = {4: 0.61, 5: 0.43}
+MISS_DIA = (5.0, 7.0)                    # D76: G_MAX comes from the measured growth of trees this size (just above the subplot limit)
+MISS_Q = 0.99                            # D76: G_MAX = this quantile of their annual DIA growth          # D74: coupling strength of intermediate / overtopped relative to classes 1-3 (western BHAGE, 229k trees)
 
 def soil_vocab(seq):
     return {c: (float(seq[c].mean()), float(seq[c].std()) or 1.0) for c in SOIL_COLS}
@@ -74,6 +76,7 @@ def build(seq, vocab=None):
     B['af_mu'], B['af_sd'], B['la'] = torch.tensor(mu), torch.tensor(sd), la
     d74_features(B, seq_cols=sq, ti=ti, po=po)
     if 'age_coupling' in vocab: apply_coupling(B, vocab['age_coupling'])
+    if 'miss_eps' in vocab: apply_miss(B, vocab['miss_eps'])
     return B, vocab, sq
 
 def d74_features(B, seq_cols, ti, po):
@@ -99,6 +102,43 @@ def d74_features(B, seq_cols, ti, po):
         vis = np.isin(h, (2.0, 3.0)); mdl = h == 4.0
         B['htcls'][ti[vis], po[vis]] = 1; B['mH'][ti[mdl], po[mdl]] = 0.0                      # modelled heights repeat the previous height: not observations
     B['af_shift'], B['af_sdf'] = torch.zeros(n), torch.ones(n)
+    B['miss_keep'] = torch.ones(n, T)                                                           # D76: 1 - eps where a not-yet-listed tree can be missed
+
+def pre_debut_subplot(B):
+    """[n, T] slots before the first visible record whose tally limit is above the existence level: where an unlisted tree on a sampled spot
+    has no label and only the "sampled, no record" term speaks (D76)"""
+    ar = torch.arange(B['v'].shape[1], device=B['v'].device)[None]
+    return (ar < B['f'][:, None]) & (B['llim'] > B['lex'] + 1e-6) & (B['v'] > 0)
+
+def apply_miss(B, eps):
+    """D76: P(no record) = 1 - p_s (1 - eps) g sigma(x) at pre-debut subplot-level slots, i.e. the term's p_s scaled by miss_keep = 1 - eps there"""
+    B['miss_keep'] = torch.where(pre_debut_subplot(B), torch.full_like(B['v'], 1.0 - eps), torch.ones_like(B['v']))
+
+def calibrate_miss(B, log=print):
+    """D76: eps, the rate at which a not-yet-listed, tally-size tree on a fully sampled spot goes unrecorded without a code, fixed from the data
+    in B (fit plots) before training. G_MAX = the MISS_Q quantile of annual DIA growth between consecutive measured visible records of trees
+    MISS_DIA in at the first of them. eps = the share of uncoded subplot-level debuts after a fully sampled earlier visit whose growth above that
+    visit's limit, per year since it, exceeds G_MAX (they could not have been below the limit then: a miss)."""
+    n, T = B['v'].shape; t = B['cov'][..., ITYR] * 20.0; D = torch.exp(B['lD']); m = B['mD'] > 0; ii = torch.arange(n)
+    rates = []                                                                                  # consecutive measured visible records
+    for j in range(T - 1):
+        nxt = torch.full((n,), -1, dtype=torch.long)
+        for jj in range(T - 1, j, -1): nxt = torch.where(m[:, jj], torch.full_like(nxt, jj), nxt)
+        ok = m[:, j] & (nxt > j) & (D[:, j] >= MISS_DIA[0]) & (D[:, j] < MISS_DIA[1]); nj = nxt.clamp(min=0)
+        dt = t[ii, nj] - t[:, j]; ok &= dt >= 1.0
+        rates.append(((D[ii, nj] - D[:, j]) / dt.clamp(min=1.0))[ok])
+    r = torch.cat(rates); assert len(r) >= 1000, f'too few growth pairs for G_MAX: {len(r)}'
+    gmax = float(torch.quantile(r.double(), MISS_Q))
+    f = B['f']; fp = (f - 1).clamp(min=0)
+    prev = (f > 0) & (B['sampled'][ii, fp] > 0) & (B['psamp'][ii, fp] >= 1) & (B['real'][ii, fp] == 0) & (B['llim'][ii, fp] > B['lex'][ii, fp] + 1e-6)
+    uncoded = prev & (B['mode'][ii, fp] == M.MODE['cutoff'])                                    # coded misses (3 / 6 / 7) carry the missed mode instead
+    lim = torch.exp(B['llim'][ii, fp]) + M.HALF_UNIT; dt = (t[ii, f] - t[ii, fp]).clamp(min=0.5)
+    implausible = uncoded & (B['mD'][ii, f] > 0) & ((D[ii, f] - lim) / dt > gmax)
+    nu = int(uncoded.sum()); assert nu >= 500, f'too few uncoded subplot-level debuts to calibrate eps: {nu}'
+    eps = float(implausible.sum()) / nu
+    log(f'D76 crew-miss rate calibrated: G_MAX {gmax:.3f} in / yr (q{MISS_Q} of {len(r):,} growth pairs of {MISS_DIA[0]}-{MISS_DIA[1]} in trees); '
+        f'{int(implausible.sum()):,} of {nu:,} uncoded subplot-level debuts need more: eps {eps:.4f}')
+    return eps
 
 def coupling_eligible(B):
     """trees the coupling applies to: a prior, an observed growth rate, DIA >= 5 in and a crown class at the prior's slot"""
@@ -351,7 +391,7 @@ def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
 def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None, d74=False,
-          state_path=None):
+          state_path=None, d76=False):
     """state_path: after every completed epoch (and its hook) the full training state is saved there; if the file exists, training resumes after its
     epoch. It holds the parameters, the optimizer (and scheduler) state, the batch-order and noise RNG states and the history, plus a fingerprint of the
     setup; a different setup refuses to resume."""
@@ -365,6 +405,8 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         log(f'D74 coupling shifts {int((B["af_shift"] != 0).sum()):,} of {n:,} trees (mean shift {float(B["af_shift"][B["af_shift"] != 0].mean()):+.3f}); anchors on {int((B["anc_m"].sum(1) > 0).sum()):,} trees')
     else:
         assert float(B['anc_m'].sum()) == 0, 'anchors in the fitting rows without D74 age on'
+    if d76:                                                                                  # both arms: the crew-miss rate, fixed from the fit plots before any subsample
+        vocab['miss_eps'] = calibrate_miss(B, log=log); apply_miss(B, vocab['miss_eps'])
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
     model = make_model(vocab, age=age, q=q, flow=flow, height='t' if d74 else 'gauss').to(device)
     phi = model.enc_params(); pid = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in pid]
@@ -376,7 +418,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * nb_ep, pct_start=0.05, anneal_strategy='cos')
     log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; prior on {int(B["af_has"].sum()):,} trees; K {k} (DReG); age {age}; q {q}{" " + json.dumps(model.cfg["flow"]) if q == "flow" else ""}; device {device}; optimizer {opt_name}')
     hist, start = [], 0
-    fp = dict(backend='torch', n=n, epochs=epochs, k=k, bs=bs, seed=seed, lr=lr, age=age, q=q, cfg=model.cfg, d74=d74, opt=opt_name, coupling=vocab.get('age_coupling'))
+    fp = dict(backend='torch', n=n, epochs=epochs, k=k, bs=bs, seed=seed, lr=lr, age=age, q=q, cfg=model.cfg, d74=d74, opt=opt_name, coupling=vocab.get('age_coupling'), miss_eps=vocab.get('miss_eps'))
     cuda = str(device).startswith('cuda')
     if state_path and os.path.exists(state_path):                                            # resume after the last completed epoch
         ck = torch.load(state_path, weights_only=False, map_location=device)

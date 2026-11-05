@@ -2,7 +2,7 @@
 # Bundle what a GPU machine needs for the D70 cross-validation; it needs no database. Usage: bash package_gpu.sh DATA_DIR OUT.tar
 set -euo pipefail
 DATA=$1; OUT=$2; W=$(mktemp -d); mkdir -p "$W/nimiwae70/data"
-cp nimiwae56.py nimiwae_flow.py nimiwae70.py nimiwae70_score.py nimiwae70_cv.py nimiwae70_verify.py nimiwae70_flowcheck.py "$W/nimiwae70/"
+cp nimiwae56.py nimiwae_flow.py nimiwae70.py nimiwae70_score.py nimiwae70_cv.py nimiwae70_verify.py nimiwae70_flowcheck.py nimiwae70_gatepull.py "$W/nimiwae70/"
 mkdir -p "$W/nimiwae70/nimiwae_jax" && cp nimiwae_jax/*.py "$W/nimiwae70/nimiwae_jax/"
 cp "$DATA/seq.parquet" "$DATA/site_refs.parquet" "$DATA/site_refs_d70.parquet" "$DATA/planted_refs.parquet" "$DATA/ht_refs.parquet" "$W/nimiwae70/data/"
 cat > "$W/nimiwae70/requirements.txt" <<R
@@ -17,14 +17,15 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 # Cross-validation on the GPU machine. Usage: [D74=1] [Q=flow] [BACKEND=jax] [G1RESCORE=out/cv72] bash run.sh [device]
 #   default        Gaussian q, no D74, into out/cv72                       (Q=flow: out/cv72flow, D73)
 #   D74=1          anchors + calibrated age-vigour coupling + HTCD heights, into out/cv74 (DECISIONS D74)
+#   D74=1 D76=1    D74 plus the crew-miss rate (DECISIONS D76), into out/cv76 (with Q=flow: out/cv76flow, compared against cv74flow)
 #   BACKEND=jax    train with nimiwae_jax (D75), score with the same PyTorch code; output folder gets _jax (e.g. out/cv74flow_jax)
 #   G1RESCORE=DIR  no training: score DIR's saved age-on checkpoints on both G1 sets into DIR_g1 (cv72 vs cv74 on the same trees), then exit
 # Order for D74: G1RESCORE=out/cv72 bash run.sh cuda; D74=1 bash run.sh cuda; python -I nimiwae70_cv.py --out out/cv74 --compare out/cv72_g1
 # Runs P at a time (P=5), CPU threads shared out, runs spread over GPUs. Finished runs are skipped, so it can be restarted. Copy the out dir back.
 set -uo pipefail
-D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; BK=${BACKEND:-torch}; G1R=${G1RESCORE:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
+D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; D76=${D76:-0}; BK=${BACKEND:-torch}; G1R=${G1RESCORE:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
 case "$Q" in gauss|flow) ;; *) echo "Q must be gauss or flow, not $Q"; exit 1;; esac
-case "$D74" in 0) O=out/cv72;; 1) O=out/cv74;; *) echo "D74 must be 0 or 1, not $D74"; exit 1;; esac
+case "$D74$D76" in 00) O=out/cv72;; 10) O=out/cv74;; 11) O=out/cv76;; *) echo "D74 / D76 must be 0 or 1, and D76 needs D74=1 (got D74=$D74 D76=$D76)"; exit 1;; esac
 [ "$Q" = flow ] && O=${O}flow
 case "$BK" in torch) ;; jax) O=${O}_jax; export XLA_PYTHON_CLIENT_PREALLOCATE=false
   python -I nimiwae_jax/equivalence.py data | tail -1 || exit 1;;   # the JAX port must match PyTorch on this machine first
@@ -37,8 +38,8 @@ if [ -n "$G1R" ]; then
   for f in $FOLDS; do echo "$f"; done | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out '"${G1R}_g1"' --fold $0 --rescore-g1 '"$G1R"' --device '"$D --threads $T"
   exit $?
 fi
-echo "q $Q, D74 $D74, backend $BK, into $O; $P at a time, $T CPU threads each, $G GPU(s)"
-{ for a in 1 0; do for f in $FOLDS; do echo "$f $a"; done; done; } | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out '"$O"' --fold $0 --age $1 --q '"$Q"' --d74 '"$D74"' --backend '"$BK"' --device '"$D --threads $T ${ARGS:-}"
+echo "q $Q, D74 $D74, D76 $D76, backend $BK, into $O; $P at a time, $T CPU threads each, $G GPU(s)"
+{ for a in 1 0; do for f in $FOLDS; do echo "$f $a"; done; done; } | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out '"$O"' --fold $0 --age $1 --q '"$Q"' --d74 '"$D74"' --d76 '"$D76"' --backend '"$BK"' --device '"$D --threads $T ${ARGS:-}"
 rc=$?
 python -I nimiwae70_cv.py --out "$O" --summary | tail -60
 [ "$rc" -eq 0 ] || echo "SOME RUNS FAILED: rerun this script, finished runs are skipped. See $O/*/run.log"

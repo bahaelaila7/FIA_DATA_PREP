@@ -268,6 +268,40 @@ check('grid impute: P(exists) never exceeds the birth step before birth', bool((
 check('product grid: same spacing as the scored grid, wider', abs(2 * A.PRODUCT_GRID['zmax'] / (A.PRODUCT_GRID['G'] - 1) - 2 * A.SCORE_GRID['zmax'] / (A.SCORE_GRID['G'] - 1)) < 1e-9 and A.PRODUCT_GRID['zmax'] > A.SCORE_GRID['zmax'])
 torch.manual_seed(24); Pd = M.impute(mg18, B18, K=8, nsamp=20); torch.manual_seed(24); Pd2 = M.impute(mg18, B18, K=8, nsamp=20, age='draws')
 check("impute: the default is the importance-draw path the CV scored", float((Pd['pE'] - Pd2['pE']).abs().max()) == 0.0)
+# 19. D76: crew misses of not-yet-listed trees: P(no record) = 1 - p_s (1 - eps) g sigma(x) at pre-debut subplot-level slots
+B19 = batch(); B19['f'][:] = 2; B19['llim'][:, :2] = math.log(4.95); B19['lex'][:] = math.log(0.95)   # slots 0, 1: before the debut, subplot level
+A.d74_features(B19, sq17, ti17, po17)
+check('D76 off: miss_keep is 1 everywhere', float((B19['miss_keep'] - 1).abs().max()) == 0.0)
+m19 = model(); B19n = {k: v for k, v in B19.items() if k != 'miss_keep'}
+with torch.no_grad():
+    torch.manual_seed(31); l_a = m19.joint(B19, 4)['lw']; torch.manual_seed(31); l_b = m19.joint(B19n, 4)['lw']
+check('D76 off: the weights are bit-identical to the term without the factor', float((l_a - l_b).abs().max()) == 0.0)
+A.apply_miss(B19, 0.02)
+want_mask = torch.zeros_like(B19['v'], dtype=torch.bool); want_mask[:, :2] = True
+check('D76: 1 - eps exactly at pre-debut subplot-level slots, 1 elsewhere', bool(((B19['miss_keep'] < 1) == want_mask).all()) and abs(float(B19['miss_keep'][0, 0]) - 0.98) < 1e-7)
+with torch.no_grad():
+    xt19 = torch.randn(2, 6, M.T_MAX) * 3; ps19 = (B19['psamp'] * B19['miss_keep'])[None].expand(2, -1, -1); zz19 = torch.randn(2, 6, M.DZ)
+    g19 = torch.sigmoid(A.KAPPA_B * (m19.ages(zz19, B19) - B19['l0'][None, :, None]))
+    want19 = torch.log(1 - B19['psamp'][None] * (1 - 0.02 * want_mask[None].float()) * g19 * torch.sigmoid(xt19))
+check('D76: the term equals log(1 - p_s (1 - eps) g sigma(x))', float((m19.cutoff_term(xt19, ps19, zz19, B19) - want19).abs().max()) < 1e-4)
+with torch.no_grad():
+    torch.manual_seed(31); l_c = m19.joint(B19, 4)['lw']
+check('D76 on: the weights move', float((l_c - l_a).abs().max()) > 0)
+# calibration recovers a planted miss rate
+g19r = torch.Generator().manual_seed(9); N = 6000; Bc = {}
+Bc['v'] = torch.zeros(N, M.T_MAX); Bc['v'][:, :3] = 1
+Bc['cov'] = torch.zeros(N, M.T_MAX, M.NCOV); Bc['cov'][..., A.ITYR] = (torch.arange(M.T_MAX) * 5.0 / 20.0)[None]
+Bc['lD'] = torch.zeros(N, M.T_MAX); Bc['mD'] = torch.zeros(N, M.T_MAX); Bc['real'] = torch.zeros(N, M.T_MAX)
+Bc['sampled'] = torch.ones(N, M.T_MAX); Bc['psamp'] = torch.ones(N, M.T_MAX); Bc['mode'] = torch.zeros(N, M.T_MAX, dtype=torch.long)
+Bc['llim'] = torch.full((N, M.T_MAX), math.log(4.95)); Bc['lex'] = torch.full((N, M.T_MAX), math.log(0.95)); Bc['f'] = torch.zeros(N, dtype=torch.long)
+half = N // 2                                                                               # growth trees: measured at slots 0 and 1, 6 in, 0.1-0.3 in / yr
+d0 = torch.full((half,), 6.0); gr = 0.1 + 0.2 * torch.rand(half, generator=g19r)
+Bc['lD'][:half, 0] = torch.log(d0); Bc['lD'][:half, 1] = torch.log(d0 + 5.0 * gr); Bc['mD'][:half, :2] = 1; Bc['real'][:half, :2] = 1
+nd = N - half; miss = torch.rand(nd, generator=g19r) < 0.03                                # debut trees: first record at slot 1 after an unrecorded sampled slot 0
+rate = torch.where(miss, torch.full((nd,), 1.5), torch.full((nd,), 0.05))
+Bc['f'][half:] = 1; Bc['lD'][half:, 1] = torch.log(5.0 + 5.0 * rate); Bc['mD'][half:, 1] = 1; Bc['real'][half:, 1] = 1
+eps19 = A.calibrate_miss(Bc, log=lambda *_: None)
+check('D76: calibration recovers a planted miss rate (3 %)', abs(eps19 - float(miss.float().mean())) < 1e-9, f'eps {eps19:.4f} vs planted {float(miss.float().mean()):.4f}')
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()

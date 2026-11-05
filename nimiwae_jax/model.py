@@ -215,7 +215,8 @@ class NIMIWAE70(nnx.Module):
         # FIA's design rule as a fixed mask model on the latent size (no learned parameter)
         xt = KAPPA * (lDp - B['llim'][None])                           # at / above the tally limit
         above_ex = ((B['llim'] > B['lex'] + 1e-6) | (ar[None] > B['l'][:, None]))[None]
-        unrec = (1 - real) * B['sampled'][None]; ps = jnp.broadcast_to(B['psamp'][None], xt.shape)
+        unrec = (1 - real) * B['sampled'][None]
+        ps = jnp.broadcast_to((B['psamp'] * B['miss_keep'])[None], xt.shape)  # D76: x (1 - eps) where a not-yet-listed tree can be missed (1 elsewhere)
         if self.age:                                                   # D72: sampled, no record: log(1 - p_s g_t sigma(x_t))
             lq_ = jnp.log(jnp.clip(ps, 1e-6, 1.0)) + jax.nn.log_sigmoid(A.KAPPA_B * bh)
             lcutoff = jnp.logaddexp(jnp.log(jnp.maximum(-jnp.expm1(lq_), 1e-12)), lq_ + jax.nn.log_sigmoid(-xt))

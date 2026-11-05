@@ -97,8 +97,8 @@ if __name__ == '__main__':
     keep = b[M.K_].drop_duplicates().sample(n=300, random_state=0); b = b.merge(keep, on=M.K_)
     B, vocab, _ = A.build(b)
     cp = dict(delta={str(c): -0.17 for c in (1, 2, 3)} | {'4': -0.10, '5': -0.07}, w={str(c): 0.9 for c in (1, 2, 3)} | {'4': 1.0, '5': 1.0}, m={str(c): -2.0 for c in range(1, 6)})
-    A.apply_coupling(B, cp)
-    print(f'batch: {B["v"].shape[0]} trees, {int(B["anc_m"].sum())} anchors, {int((B["af_shift"] != 0).sum())} coupled, {int((B["htcls"] == 1).sum())} visual heights')
+    A.apply_coupling(B, cp); A.apply_miss(B, 0.05)                         # D74 coupling and a D76 crew-miss factor, both non-trivial
+    print(f'batch: {B["v"].shape[0]} trees, {int(B["anc_m"].sum())} anchors, {int((B["af_shift"] != 0).sum())} coupled, {int((B["htcls"] == 1).sum())} visual heights, {int((B["miss_keep"] < 1).sum())} crew-miss slots')
     ok = True
     for age, q, height in ((True, 'gauss', 'gauss'), (True, 'flow', 'gauss'), (True, 'gauss', 't'), (True, 'flow', 't'), (False, 'gauss', 't'), (False, 'flow', 'gauss')):
         torch.manual_seed(0); tm = _perturb(A.make_model(vocab, age=age, q=q, height=height))

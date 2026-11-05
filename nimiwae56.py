@@ -350,7 +350,7 @@ class NIMIWAE56(nn.Module):
             post_ = (ar[None] > B['l'][:, None])                                                        # after the last visible record
             above_ex = ((B['llim'] > B['lex'] + 1e-6) | post_)[None]   # pre-debut microplot level: the soft FALSE label carries it
             unrec = (1 - real) * B['sampled'][None]
-            ps = B['psamp'][None].expand_as(xt)                                                          # am. 6: P(the tree's spot was sampled)
+            ps = (B['psamp'] * B['miss_keep'] if 'miss_keep' in B else B['psamp'])[None].expand_as(xt)   # am. 6: P(sampled); D76: x (1 - eps) where an unlisted tree can be missed
             lcut = s.cutoff_term(xt, ps, z, B)                                                         # log P(no record | sampled with p_s)
             cens = (real * F.logsigmoid(xt)                                                             # tallied: at or above the limit
                     + unrec * torch.where((mode == MODE['cutoff']) & above_ex, lcut, torch.zeros_like(xt))   # not tallied: below (if the spot was sampled)

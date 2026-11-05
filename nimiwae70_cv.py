@@ -4,6 +4,7 @@
 Folds: crc32(plot_key|ncv) % 5, the D54 rule, on TRAIN plots. VAL carried design choices and TEST stays untouched. Monitor: 10 % of the fitting plots, crc32(plot_key|ncv-in) % 10 == 0, never trained on and never scored.
 --d74 1 (D74): measured-age anchors on fit plots, the calibrated age-vigour coupling and the HTCD height model; its own --out (cv74).
 --rescore-g1 SRC: score SRC's saved age-on checkpoints on both G1 sets (am. 17 and the D70 set), so cv72 and cv74 compare on the same trees.
+--d76 1 (D76): a crew-miss rate for not-yet-listed trees at pre-debut subplot-level slots, fixed from the fit plots; its own --out (cv76flow).
 --backend jax (D75): train with nimiwae_jax (JAX / Flax NNX / optax), score with the same PyTorch code; its own --out.
 --q flow (D73): the proposal's non-age dimensions go through a conditional spline flow; give it its own --out, a run directory refuses a different q.
 Schedule-Free AdamW, so the same run can be read at any epoch with no decay schedule tied to its length: epoch 12 of a 36-epoch run is a real 12-epoch model. The curve file answers overtraining directly: bound on fitted trees against bound on monitor trees."""
@@ -31,9 +32,9 @@ def bound(m, B, k, dev, bs=512):
 
 def run(a):
     d = f'{a.out}/f{a.fold}_age{a.age}'; os.makedirs(d, exist_ok=True)
-    qc = dict(q=a.q, flow=dict(layers=a.flow_layers, hidden=a.flow_hidden, bins=a.flow_bins) if a.q == 'flow' else None, d74=bool(a.d74), backend=a.backend)
-    if os.path.exists(f'{d}/q.json'): assert {'d74': False, 'backend': 'torch', **json.load(open(f'{d}/q.json'))} == qc, f'{d} holds a run with another setup: {open(f"{d}/q.json").read()}'
-    elif os.path.exists(f'{d}/run.log'): assert a.q == 'gauss' and not a.d74 and a.backend == 'torch', f'{d} holds a run from before D73 (Gaussian q, no D74, PyTorch)'
+    qc = dict(q=a.q, flow=dict(layers=a.flow_layers, hidden=a.flow_hidden, bins=a.flow_bins) if a.q == 'flow' else None, d74=bool(a.d74), backend=a.backend, d76=bool(a.d76))
+    if os.path.exists(f'{d}/q.json'): assert {'d74': False, 'backend': 'torch', 'd76': False, **json.load(open(f'{d}/q.json'))} == qc, f'{d} holds a run with another setup: {open(f"{d}/q.json").read()}'
+    elif os.path.exists(f'{d}/run.log'): assert a.q == 'gauss' and not a.d74 and a.backend == 'torch' and not a.d76, f'{d} holds a run from before D73 (Gaussian q, no D74, PyTorch)'
     json.dump(qc, open(f'{d}/q.json', 'w'))
     if os.path.exists(f'{d}/done.json'): print('already done', d); return
     tr = pd.read_parquet(f'{a.data}/seq.parquet', filters=[('split', '==', 'train')])       # TRAIN rows only: several runs load this at once
@@ -72,7 +73,7 @@ def run(a):
     trainer = A.train
     if a.backend == 'jax':                                                                    # D75: the same training in JAX; scoring stays in PyTorch
         from nimiwae_jax import train as JT; trainer = JT.train
-    t0 = time.time(); trainer(fit, epochs=max(ckpts), k=a.k, bs=a.bs, max_trees=a.trees, seed=a.seed, threads=a.threads, log=pr, age=bool(a.age), device=a.device, opt_name='sf', on_epoch=hook, q=qc['q'], flow=qc['flow'], d74=bool(a.d74), state_path=sp)
+    t0 = time.time(); trainer(fit, epochs=max(ckpts), k=a.k, bs=a.bs, max_trees=a.trees, seed=a.seed, threads=a.threads, log=pr, age=bool(a.age), device=a.device, opt_name='sf', on_epoch=hook, q=qc['q'], flow=qc['flow'], d74=bool(a.d74), state_path=sp, d76=bool(a.d76))
     json.dump(dict(seconds=time.time() - t0), open(f'{d}/done.json', 'w')); pr(f'done {time.time() - t0:.0f} s')
 
 def rescore(a):
@@ -164,6 +165,6 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(); ap.add_argument('--data'); ap.add_argument('--out'); ap.add_argument('--fold', type=int, default=0); ap.add_argument('--age', type=int, default=1); ap.add_argument('--device', default='cpu')
     ap.add_argument('--trees', type=int, default=400000); ap.add_argument('--ckpts', default='12,24,36'); ap.add_argument('--curve-every', type=int, default=2); ap.add_argument('--curve-plots', type=int, default=500); ap.add_argument('--score-frac', type=float, default=0.5); ap.add_argument('--planted-frac', type=float, default=0.25)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=8); ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--d74', type=int, default=0); ap.add_argument('--backend', choices=('torch', 'jax'), default='torch'); ap.add_argument('--compare', help='cv72 rescored with --rescore-g1: evaluate the D74 bars of --out against it'); ap.add_argument('--rescore-g1', help='a finished run without D74: score its age-on checkpoints on both G1 sets'); ap.add_argument('--q', choices=('gauss', 'flow'), default='gauss'); ap.add_argument('--flow-layers', type=int, default=6); ap.add_argument('--flow-hidden', type=int, default=64); ap.add_argument('--flow-bins', type=int, default=8)
+    ap.add_argument('--d74', type=int, default=0); ap.add_argument('--d76', type=int, default=0); ap.add_argument('--backend', choices=('torch', 'jax'), default='torch'); ap.add_argument('--compare', help='cv72 rescored with --rescore-g1: evaluate the D74 bars of --out against it'); ap.add_argument('--rescore-g1', help='a finished run without D74: score its age-on checkpoints on both G1 sets'); ap.add_argument('--q', choices=('gauss', 'flow'), default='gauss'); ap.add_argument('--flow-layers', type=int, default=6); ap.add_argument('--flow-hidden', type=int, default=64); ap.add_argument('--flow-bins', type=int, default=8)
     ap.add_argument('--summary', action='store_true'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
     selftest() if a.selftest else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)
