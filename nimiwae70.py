@@ -217,6 +217,9 @@ class NIMIWAE70(M.NIMIWAE56):
         lq = torch.log(ps.clamp(1e-6, 1.0)) + F.logsigmoid(KAPPA_B * s.bh_age(z, B))            # log(p_s g_t)
         return torch.logaddexp(torch.log((-torch.expm1(lq)).clamp(min=1e-12)), lq + F.logsigmoid(-xt))
 
+SCORE_GRID = dict(G=61, zmax=3.6)       # age_posterior: the grid the CV scored G1 / G5 on (kept for comparability across runs)
+PRODUCT_GRID = dict(G=135, zmax=8.04)   # products: the same 0.12 spacing (16.08 / 134), wide enough that no held tree leaves mass at the edges (D70 am. 18)
+
 class AgeGrid:
     """The exact grid over the age latent z0 (D70 am. 14) for one batch, shared by age_posterior, posterior_grid and lineage_draws_grid.
 
@@ -247,14 +250,14 @@ class AgeGrid:
         return torch.stack([s.joint(gi)['lwg'] for gi in range(len(s.g))])
 
 @torch.no_grad()
-def age_posterior(model, B, K=100, G=61, zmax=3.6):
+def age_posterior(model, B, K=100, G=SCORE_GRID['G'], zmax=SCORE_GRID['zmax']):
     """Exact posterior of z0 on a grid: [n, G] probabilities. The decoder never reads z0, so the rest of the model is scored once and only the birth limits vary along the grid.
     Importance resampling is not used here: with ESS near 7 of K it moved ages by 0.24 sd where the exact answer is the prior (am. 14)."""
     with AgeGrid(model, B, K, G, zmax) as ag:
         return ag.g, torch.softmax(torch.logsumexp(ag.log_weights(), 1).T, 1)
 
 @torch.no_grad()
-def posterior_grid(model, b, K=100, G=61, zmax=3.6):
+def posterior_grid(model, b, K=100, G=PRODUCT_GRID['G'], zmax=PRODUCT_GRID['zmax']):
     """impute's posterior summaries (nimiwae56.posterior_draws) with z0 integrated on the exact grid:
     W[k, e, f] = sum_g P(g, k | x) P(e, f | g, k, x) and WaP1[k, t] = sum_g sum_e P(g, k | x) P(e | g, k, x) alive(e, t) P(exists_t | g, k).
     The sizes D, H depend on k only (the decoder never reads z0). Two passes over the grid: weights first, then the accumulation."""
@@ -268,7 +271,7 @@ def posterior_grid(model, b, K=100, G=61, zmax=3.6):
         return dict(W=W, WaP1=WaP1, D=o['D'], H=o['H'], lsdisc=o['lsdisc'])
 
 @torch.no_grad()
-def lineage_draws_grid(model, b, K=100, n_draws=10, G=61, zmax=3.6):
+def lineage_draws_grid(model, b, K=100, n_draws=10, G=PRODUCT_GRID['G'], zmax=PRODUCT_GRID['zmax']):
     """nimiwae56.lineage_draws with z0 on the exact grid: each draw picks (grid age g, draw k of the rest) from P(g, k | x), then (e, f) from
     P(e, f | g, k, x). Its existence (birth gate at g, size path of k) and its ages come from that one draw."""
     with AgeGrid(model, b, K, G, zmax) as ag:
