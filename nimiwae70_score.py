@@ -18,13 +18,16 @@ def load(d, name='model.pt'):
 
 def med(x): return float(np.median(x)) if len(x) else None
 
-def completion(m, val, seed=0):
-    """size error on the hidden visits, E1 on the same lineages under '< limit only', E2 and E3 on censored ends"""
+def completion(m, val, seed=0, age='draws'):
+    """size error on the hidden visits, E1 on the same lineages under '< limit only', E2 and E3 on censored ends.
+    age: 'draws' (every latent by importance draws, the scoring of every bar registered up to D76) or 'grid' (z0 on the exact product grid, the rest
+    by draws: what the products use, nimiwae56.impute(age='grid'); age models only)"""
     torch.manual_seed(seed); out = {}
-    h, _ = M.predictions(m, M.bench_sizes(val)); hh = h[h.hidden & h.dia.notna() & h.nim_lD.notna()]; out['mae_lD'] = float((hh.nim_lD - np.log(hh.dia)).abs().mean())
-    x1, _ = M.predictions(m, M.bench_sizes(val, interval=False)); x1 = x1[x1.truth_E.notna()]; r1 = reliability(x1.nim_pE, x1.truth_E); out['E1'] = r1['brier']; out['E1_n'] = r1['n']; out['E1_base'] = r1['base_rate']
+    P = lambda b: M.predictions(m, b, age=age)
+    h, _ = P(M.bench_sizes(val)); hh = h[h.hidden & h.dia.notna() & h.nim_lD.notna()]; out['mae_lD'] = float((hh.nim_lD - np.log(hh.dia)).abs().mean())
+    x1, _ = P(M.bench_sizes(val, interval=False)); x1 = x1[x1.truth_E.notna()]; r1 = reliability(x1.nim_pE, x1.truth_E); out['E1'] = r1['brier']; out['E1_n'] = r1['n']; out['E1_base'] = r1['base_rate']
     assert 0 < r1['base_rate'] < 1, 'E1 benchmark needs both TRUE and FALSE labels'
-    b = M.bench_end(val); e, _ = M.predictions(m, b); x = e[e.truth_E.notna()]; out['E2'] = reliability(x.nim_pE, x.truth_E)['brier']
+    b = M.bench_end(val); e, _ = P(b); x = e[e.truth_E.notna()]; out['E2'] = reliability(x.nim_pE, x.truth_E)['brier']
     g = x[x.truth_E == 0]; g = g[g.truth_cut.notna()]; out['E3'] = reliability(g.nim_pCut / (g.nim_pCut + g.nim_pDie).clip(lower=1e-9), g.truth_cut)['brier']
     return out
 
@@ -67,3 +70,28 @@ def age_scores(m, held, site, planted, seed=0, planted_frac=0.25, site_old=None,
     q = lineage_age(m, held[held.plot_key.isin(p.plot_key)], p).merge(p, on=k); q['cls'] = pd.cut(q.dia, [0, 3, 5, 7, 9, 15, 99], right=False).astype(str)
     o['planted_field'] = {c: dict(n=len(g), field=med(g.fld), bias=med(g.q50 - g.fld), cover80=float(((g.fld >= g.q10) & (g.fld <= g.q90)).mean())) for c, g in q.groupby('cls')}
     return o
+
+BASE_DIA_CLASSES = [0, 7, 9, 11, 13, 15, 18, 22, 99]           # in; site trees are >= 5 in (right-closed classes, as first computed for D74)
+
+def baselines(data, folds, nf):
+    """G1 lookup baselines every age model must beat, on the CV's own folds: each fitted on the linked site trees of the OTHER folds' TRAIN plots and
+    scored on the fold's held plots (the trees the CV's G1 scores). Lookups: training mean, training median, species median, species x DIA class median
+    (falls back to the species median, then the training median); also the direct prior (exp af_mu at the scored record) and the current curated
+    ages, as scored by age_scores. -> {set: {fold: {name: MAE, 'n': trees}}} for the am. 17 set (G1) and the D70 set (G1_d70)."""
+    import nimiwae70_cv as C
+    k = M.K_ + ['invyr']
+    fr = pd.read_parquet(f'{data}/seq.parquet', columns=k + ['plot_key', 'slot_kind', 'spcd', 'dia', 'af_mu'], filters=[('split', '==', 'train')])
+    keys = sorted(fr.plot_key.unique()); fr = fr[fr.slot_kind == 'real'].drop(columns='slot_kind')
+    out = {}
+    for nm, fn in (('G1', 'site_refs'), ('G1_d70', 'site_refs_d70')):
+        s = pd.read_parquet(f'{data}/{fn}.parquet'); s = s[s.estimated_age.notna()].merge(fr, on=k); s['dcls'] = pd.cut(s.dia, BASE_DIA_CLASSES)
+        out[nm] = {}
+        for f in folds:
+            held, _, _ = C.split_plots(keys, f); hs = set(held); h = s[s.plot_key.isin(hs)].reset_index(drop=True); o = s[~s.plot_key.isin(hs)]; t = h.truth.to_numpy()
+            sp = h.spcd.map(o.groupby('spcd').truth.median()).fillna(o.truth.median())
+            sd = o.groupby(['spcd', 'dcls'], observed=True).truth.median().to_dict()
+            spd = pd.Series([sd.get((a_, b_), np.nan) for a_, b_ in zip(h.spcd, h.dcls)]).fillna(sp)
+            mae = lambda p: float(np.abs(np.asarray(p, float) - t).mean())
+            out[nm][str(f)] = dict(n=len(h), training_mean=mae(np.full(len(t), o.truth.mean())), training_median=mae(np.full(len(t), o.truth.median())),
+                                   species_median=mae(sp), species_dia_median=mae(spd), direct_prior=mae(np.exp(h.af_mu)), current_ages=mae(h.estimated_age))
+    return out

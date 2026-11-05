@@ -66,6 +66,7 @@ def run(a):
             if 'age_coupling' in m.vocab and not os.path.exists(f'{d}/coupling.json'): json.dump(m.vocab['age_coupling'], open(f'{d}/coupling.json', 'w'), indent=1)
             if 'miss_eps' in m.vocab and not os.path.exists(f'{d}/miss.json'): json.dump(dict(eps=m.vocab['miss_eps']), open(f'{d}/miss.json', 'w'))   # D76: eps per fold (reported)
             t0 = time.time(); o = dict(completion=S.completion(m, score_plots))
+            if a.age and ep == max(ckpts): o['completion_grid'] = S.completion(m, score_plots, age='grid')   # D77: as the products integrate age (reported)
             rows = []
             if a.age: o.update(S.age_scores(m, held, site, planted, planted_frac=a.planted_frac, site_old=site_old, rows=rows)); pd.concat(rows).to_parquet(f'{d}/g1_e{ep}.parquet')
             state['ckpt'][str(ep)] = o; json.dump(state['ckpt'], open(f'{d}/scores.json', 'w'), indent=1, default=float); pr(f'scored epoch {ep} in {time.time() - t0:.0f} s: {json.dumps(o, default=float)[:300]}')
@@ -102,6 +103,28 @@ def rescore_g1(a):
         out[ep] = S.age_scores(m, held, site, planted, planted_frac=a.planted_frac, site_old=site_old, rows=rows); pd.concat(rows).to_parquet(f'{d}/g1_e{ep}.parquet')
         print(f'[f{a.fold} rescore-g1] epoch {ep}: G1 {out[ep]["G1"]["mae_joint"]:.3f} (n {out[ep]["G1"]["n"]:,}), G1_d70 {out[ep]["G1_d70"]["mae_joint"]:.3f}', flush=True)
     json.dump(out, open(f'{d}/scores_g1.json', 'w'), indent=1, default=float); json.dump(dict(rescored_from=src), open(f'{d}/done_g1.json', 'w'))
+
+def rescore_grid(a):
+    """D77: completion with age on the exact grid (S.completion(age='grid'), what the products use) for the last saved age-on checkpoint of a finished
+    run, on the same held inputs and score plots as its own scoring; written next to its scores as scores_grid.json (nothing else is touched)"""
+    d = f'{a.rescore_grid}/f{a.fold}_age1'; qc = json.load(open(f'{d}/q.json')) if os.path.exists(f'{d}/q.json') else {}
+    ep = str(max(int(x.split('_e')[-1][:-3]) for x in glob.glob(f'{d}/model_e*.pt'))); g = f'{d}/scores_grid.json'
+    old = json.load(open(g)) if os.path.exists(g) else {}
+    if ep in old: print('already scored', d, ep); return
+    tr = pd.read_parquet(f'{a.data}/seq.parquet', filters=[('split', '==', 'train')]); k = M.K_ + ['invyr']
+    if qc.get('d74'): tr = tr.merge(pd.read_parquet(f'{a.data}/ht_refs.parquet'), on=k, how='left')      # the inputs the run scored with
+    held_k, _, _ = split_plots(sorted(tr.plot_key.unique()), a.fold); held = tr[tr.plot_key.isin(set(held_k))]
+    score_plots = held[held.plot_key.isin(pd.Series(held_k).sample(frac=a.score_frac, random_state=2))]   # = run()'s score plots
+    m, _ = S.load(d, f'model_e{ep}.pt'); m.to(a.device); t0 = time.time()
+    old[ep] = S.completion(m, score_plots, age='grid'); json.dump(old, open(g, 'w'), indent=1, default=float)
+    print(f'[f{a.fold} rescore-grid] epoch {ep} in {time.time() - t0:.0f} s: {json.dumps(old[ep], default=float)}', flush=True)
+
+def grid_completion(run, f, e):
+    """the D77 grid completion of run's age-on fold f at epoch e: from its own scoring, else from rescore_grid; None if neither"""
+    s = json.load(open(f'{run}/f{f}_age1/scores.json')).get(str(e), {}) if os.path.exists(f'{run}/f{f}_age1/scores.json') else {}
+    if 'completion_grid' in s: return s['completion_grid']
+    g = f'{run}/f{f}_age1/scores_grid.json'
+    return json.load(open(g)).get(str(e)) if os.path.exists(g) else None
 
 D74_BARS = dict(g1_gain=0.2, g1_fold_worse=0.2, g1_bias=2.0, g5=(0.75, 0.85), resid_slope=0.5)
 
@@ -173,7 +196,10 @@ def compare_d76(a):
                     brier=bool(max(mean(on, 'dE1'), mean(on, 'dE2'), mean(on, 'dE3')) <= D76_BARS['brier_worse']), size=bool(mean(on, 'size_ratio') <= D76_BARS['size_ratio']),
                     residual_slope=bool(sl is not None and dl is not None and abs(sl) <= D76_BARS['resid_slope'] * abs(dl)))
         eps = {os.path.basename(os.path.dirname(x)): json.load(open(x))['eps'] for x in sorted(glob.glob(f'{a.out}/f*_age*/miss.json'))}
-        R[e] = dict(folds=fo, n_folds_age1=len(on), n_folds_age0=len(off), primary_share_below_m2={'out': prim[a.out], 'base': prim[b]}, primary_same_trees=same_trees, G1_worse=g1w, G1_d70_worse=g1dw,
+        gr = {f: (grid_completion(a.out, f, e), grid_completion(b, f, e)) for f in range(NF)}; gr = {f: v for f, v in gr.items() if None not in v}
+        grid = dict(n_folds=len(gr), **{x: (float(np.mean([v[0][x] - v[1][x] for v in gr.values()])) if gr else None) for x in ('E1', 'E2', 'E3')},
+                    size_ratio=float(np.mean([v[0]['mae_lD'] / v[1]['mae_lD'] for v in gr.values()])) if gr else None)   # D77, reported: deltas out - base
+        R[e] = dict(grid_completion_reported=grid, folds=fo, n_folds_age1=len(on), n_folds_age0=len(off), primary_share_below_m2={'out': prim[a.out], 'base': prim[b]}, primary_same_trees=same_trees, G1_worse=g1w, G1_d70_worse=g1dw,
                     age_on={x: mean(on, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio', 'bias_76', 'g5_76', 'bias_d70_76', 'g5_d70_76')},
                     age_off_reported={x: mean(off, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio')}, residual_slope=sl, n_coupled_G1=int(len(c)), delta_c3=dl, eps=eps,
                     bars=bars, adopt=bool(all(bars.values())))
@@ -183,6 +209,9 @@ def compare_d76(a):
         if not R[e]['bars']['complete']: print(f'epoch {e}: {R[e]["n_folds_age1"]} of {NF} age-on folds in both runs: no adoption')
 
 def summary(a):
+    """fold means per epoch of every score and the D70 bars; with --data also the G1 lookup baselines on the same folds and trees
+    (nimiwae70_score.baselines), and per epoch the joint model's G1 MAE next to them"""
+    BL = S.baselines(a.data, range(NF), NF) if a.data else None
     R = {}
     for f in sorted(glob.glob(f'{a.out}/f*_age*/scores.json')):
         n = os.path.basename(os.path.dirname(f)); R[n] = json.load(open(f))
@@ -198,6 +227,16 @@ def summary(a):
                  G1_d70_mae=gs('G1_d70', 'mae_joint'), G1_d70_bias=gs('G1_d70', 'bias_joint'), G5_d70=gs('G5_d70', 'cover80'))
         o['planted_bias'] = {c: ms([v['planted_field'][c]['bias'] for v in on.values() if c in v['planted_field']]) for c in sorted({c for v in on.values() for c in v['planted_field']})}
         o['planted_cover'] = {c: ms([v['planted_field'][c]['cover80'] for v in on.values() if c in v['planted_field']]) for c in o['planted_bias']}
+        gc = {f: grid_completion(a.out, int(f[1:]), e) for f in on}; gc = {f: v for f, v in gc.items() if v}
+        o['grid_completion'] = {x: ms([v[x] for v in gc.values()]) for x in ('mae_lD', 'E1', 'E2', 'E3')} if gc else None   # D77, reported
+        if BL:                                                                            # the same folds as the joint scores, and the same trees (checked)
+            o['baselines'] = {}
+            for nm in ('G1', 'G1_d70'):
+                fs = [f for f in on if nm in on[f]]
+                if not fs: continue
+                bad = [f for f in fs if BL[nm][f[1:]]['n'] != on[f][nm]['n']]
+                o['baselines'][nm] = dict(joint=ms([on[f][nm]['mae_joint'] for f in fs]), same_trees=not bad, folds_n_mismatch=bad,
+                                          **{x: ms([BL[nm][f[1:]][x] for f in fs]) for x in ('training_mean', 'training_median', 'species_median', 'species_dia_median', 'direct_prior', 'current_ages')})
         if o['G1_mae'] and pair:
             o['bars'] = dict(G1=bool(o['G1_mae']['mean'] <= BARS['G1_mae'] and abs(o['G1_bias']['mean']) <= BARS['G1_bias'] and o['G1_mae']['mean'] <= o['G1_direct']['mean']), G5=bool(BARS['G5'][0] <= o['G5']['mean'] <= BARS['G5'][1]),
                              G6=bool(o['size_ratio']['mean'] <= BARS['G6_size'] and o['dE2']['mean'] <= BARS['G6_brier'] and o['dE3']['mean'] <= BARS['G6_brier']), G8=bool(o['dE1']['mean'] <= BARS['G8']))
@@ -206,7 +245,12 @@ def summary(a):
     for f in sorted(glob.glob(f'{a.out}/f*_age*/curve.json')):
         for r in json.load(open(f)): c.setdefault((os.path.basename(os.path.dirname(f)).split('_')[1], r['epoch']), []).append(r)
     cu = {f'{k[0]} e{k[1]}': {x: float(np.mean([r[x] for r in v])) for x in ('fit_bound', 'monitor_bound', 'gap', 'monitor_ess')} for k, v in sorted(c.items())}
-    json.dump(dict(by_epoch=out, curve=cu), open(f'{a.out}/cv_summary.json', 'w'), indent=1); print(json.dumps(out, indent=0)[:6000]); [print(k, {x: round(y, 3) for x, y in v.items()}) for k, v in cu.items()]
+    json.dump(dict(by_epoch=out, curve=cu, baselines_by_fold=BL), open(f'{a.out}/cv_summary.json', 'w'), indent=1); print(json.dumps(out, indent=0)[:6000]); [print(k, {x: round(y, 3) for x, y in v.items()}) for k, v in cu.items()]
+    names = ('training_mean', 'training_median', 'species_median', 'species_dia_median', 'current_ages', 'direct_prior', 'joint')
+    for e, o in out.items():                                                              # the G1 table: lookups, today's ages, the direct prior, the joint model
+        for nm, bl in (o.get('baselines') or {}).items():
+            print(f'G1 MAE (yr), epoch {e}, {nm} ({bl["joint"]["n"]} folds{"" if bl["same_trees"] else ", TREE COUNTS DIFFER: " + str(bl["folds_n_mismatch"])}): '
+                  + ' | '.join(f'{x.replace("_", " ")} {bl[x]["mean"]:.2f}' for x in names))
 
 def selftest():
     keys = [f'1_1_{i}_{j}' for i in range(40) for j in range(40)]; seen = set()
@@ -219,5 +263,5 @@ if __name__ == '__main__':
     ap.add_argument('--trees', type=int, default=400000); ap.add_argument('--ckpts', default='12,24,36'); ap.add_argument('--curve-every', type=int, default=2); ap.add_argument('--curve-plots', type=int, default=500); ap.add_argument('--score-frac', type=float, default=0.5); ap.add_argument('--planted-frac', type=float, default=0.25)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=8); ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--d74', type=int, default=0); ap.add_argument('--d76', type=int, default=0); ap.add_argument('--backend', choices=('torch', 'jax'), default='torch'); ap.add_argument('--compare', help='cv72 rescored with --rescore-g1: evaluate the D74 bars of --out against it'); ap.add_argument('--rescore-g1', help='a finished run without D74: score its age-on checkpoints on both G1 sets'); ap.add_argument('--q', choices=('gauss', 'flow'), default='gauss'); ap.add_argument('--flow-layers', type=int, default=6); ap.add_argument('--flow-hidden', type=int, default=64); ap.add_argument('--flow-bins', type=int, default=8)
-    ap.add_argument('--summary', action='store_true'); ap.add_argument('--d76-base', help='cv74flow: evaluate the D76 bars of --out (cv76flow) against it'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
-    selftest() if a.selftest else compare_d76(a) if a.d76_base else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)
+    ap.add_argument('--summary', action='store_true'); ap.add_argument('--rescore-grid', help='a finished run: D77 grid completion of its last age-on checkpoint (scores_grid.json)'); ap.add_argument('--d76-base', help='cv74flow: evaluate the D76 bars of --out (cv76flow) against it'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
+    selftest() if a.selftest else rescore_grid(a) if a.rescore_grid else compare_d76(a) if a.d76_base else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)
