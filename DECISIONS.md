@@ -1957,6 +1957,15 @@ User: anchors as joint-likelihood observations (the D70 design, "constrain each 
 
 **Build order (each step read semantically twice before anything runs):** site_links module and G1 refs -> frame (HTCD, anchor slot columns) -> calibration routine in the CV run -> model terms (anchor, coupling, height) -> verifier checks (anchor term against its formula, coupling inert when rho is undefined and below 5 in, grid exactness with the coupling, held-plot anchors never enter training, HTCD 4 masked) -> bundle.
 
+**D74 measured: cv74flow (Q=flow, D74=1, PyTorch; FIA/nimiwae_r8/cv74flow), all 10 runs, epoch 36. Combined flow + D74; attribution open.**
+- **G1 on the old link set, the same held trees as cv72 (counts equal): 7.968 yr mean vs cv72 8.278** (f0 8.040 / 8.388, f1 8.007 / 8.458, f2 7.930 / 8.128, f3 7.935 / 8.270, f4 7.929 / 8.146): better in every fold, by 0.20-0.45. New link set: 8.298 (n 3,561-3,751 per fold), bias -0.42 to +0.01, direct prior 9.16, current ages 9.81. The pre-registered G1 bar is on the new set against cv72 rescored there (`G1RESCORE=out/cv72`), still to run.
+- **cv74flow's own bars at 36 (age on vs off): G1, G5 (0.768-0.783), G6 (size ratio 0.96-1.03; E2, E3 no worse), G8 (E1 0.054 vs 0.062, every fold) all pass.**
+- **Residual-slope guard: passes.** Held G1 trees with a shift (n 15,067): slope of log truth - log posterior median on log rate +0.013, |slope| / |delta| = 0.10 (bar 0.5).
+- **Coupling on the full fit sets:** delta -0.125 to -0.133 per log (in / yr), width factor 0.943-0.948, about 10,600 anchor rows per fold (smoke subset: -0.173).
+- **Planted field age (diagnostic):** bias +2.1 to +4.4 yr by DIA class, 80 % coverage 0.27-0.33 at 1-5 in, 0.45-0.68 above: the sapling limit stays.
+- **Trivial baselines, same held folds (old set, 20,687 trees):** training mean 18.3, median 18.1, species median 12.9, species x DIA class median 9.86, current ages 9.49, direct prior 8.77; joint cv72 8.28, cv74flow 7.97. New set: 18.1 / 13.3 / 10.3 / 9.81 / 9.16 / 8.30. The current curated ages barely beat a species x size lookup.
+- **Flow check (fold 0, epoch 36, 2,000 held trees):** far from the identity (median shift 0.63 q-sd, p90 1.6; mean log-det -3.8; 98 % inside the spline range; forward-inverse round trip 6e-6). Flow off under the trained model: bound +0.59 -> -7.89 nats / tree and ESS 7.9 -> 1.2 (K 32; K 100: ESS 22.0 -> 1.5). An upper bound on the flow's value: the encoder co-adapted (a wide Gaussian the flow contracts), so a separately trained Gaussian (cv74) is still the attribution test.
+
 ## D75 — Training in JAX (user, 2026-11-04)
 User: "could you make an implementation using JAX ecosystem instead of pytorch?", then "use idiomatic jax design", "comment the code well", "jax 0.7.2 is too old use latest".
 - **Stack:** JAX 0.12.0.1, Flax 0.12.12 (NNX), optax 0.2.8 (installed into FIA/.venv_fia; GPU: `pip install -U "jax[cuda12]" flax optax`).
