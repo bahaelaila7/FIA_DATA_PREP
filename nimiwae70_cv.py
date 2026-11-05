@@ -130,13 +130,15 @@ def compare(a):
     json.dump(R, open(f'{a.out}/d74_compare.json', 'w'), indent=1, default=float); print(json.dumps(R, indent=1, default=float)[:5000])
     print('G6 / G8: see the cv74 --summary (age on vs age off within cv74).')
 
-D76_BARS = dict(g1_worse=0.05, g1_bias=2.0, g5=(0.75, 0.85), brier_worse=0.002, size_ratio=1.01, resid_slope=0.5)   # pre-registered in D76 (no harm)
+D76_BARS = dict(primary=0.0010, g1_worse=0.05, g1_bias=2.0, g5=(0.75, 0.85), brier_worse=0.002, size_ratio=1.01, resid_slope=0.5)   # pre-registered in D76
 
 def compare_d76(a):
-    """D76's pre-registered bars: --out (cv76flow) against --d76-base (cv74flow), same folds, epoch by epoch. Primary: gatepull_e{epoch}.json of
-    --out (nimiwae70_gatepull.py; the base's own file is the reference value). No harm, on fold means: G1 mean MAE (both link sets) not worse by more
-    than 0.05 yr, |G1 median-bias mean| <= 2, G5 coverage 0.75-0.85, age-on E1 / E2 / E3 Brier not worse by more than 0.002, age-on size MAE not worse
-    by more than 1 %, the D74 residual slope <= 0.5 |delta|. Reported: eps per fold, the same completion deltas for the age-off arm."""
+    """D76's pre-registered bars: --out (cv76flow) against --d76-base (cv74flow), same folds, epoch by epoch.
+    Primary: gatepull_e{epoch}.json of --out and of the base (nimiwae70_gatepull.py; only files over all held plots of all five folds, as trained,
+    count): the pooled subplot share below -2 falls from the base's value to <= 0.10 %.
+    No harm, on means over the age-on folds present in both runs (adoption needs all five): G1 mean MAE (both link sets) not worse by more than
+    0.05 yr, |G1 median-bias mean| <= 2, G5 coverage 0.75-0.85, E1 / E2 / E3 Brier not worse by more than 0.002, size MAE not worse by more than 1 %,
+    the D74 residual slope <= 0.5 |delta|. Reported: eps per fold, the same completion deltas for the age-off arm, the D70-set bias and coverage."""
     b = a.d76_base; R = {}
     for e in sorted({int(x) for f in glob.glob(f'{a.out}/f*_age1/scores.json') for x in json.load(open(f))}):
         fo = {}
@@ -147,27 +149,38 @@ def compare_d76(a):
                 s6, s4 = json.load(open(p6)).get(str(e)), json.load(open(p4)).get(str(e))
                 if not (s6 and s4): continue
                 c6, c4 = s6['completion'], s4['completion']; r = dict(dE1=c6['E1'] - c4['E1'], dE2=c6['E2'] - c4['E2'], dE3=c6['E3'] - c4['E3'], size_ratio=c6['mae_lD'] / c4['mae_lD'])
-                if arm: r.update(g1_76=s6['G1']['mae_joint'], g1_74=s4['G1']['mae_joint'], g1d70_76=s6['G1_d70']['mae_joint'], g1d70_74=s4['G1_d70']['mae_joint'], bias_76=s6['G1']['bias_joint'], g5_76=s6['G5']['cover80'])
+                if arm: r.update(g1_76=s6['G1']['mae_joint'], g1_74=s4['G1']['mae_joint'], g1d70_76=s6['G1_d70']['mae_joint'], g1d70_74=s4['G1_d70']['mae_joint'],
+                                 bias_76=s6['G1']['bias_joint'], g5_76=s6['G5']['cover80'], bias_d70_76=s6['G1_d70']['bias_joint'], g5_d70_76=s6['G5_d70']['cover80'])
                 fo[f'f{f}_age{arm}'] = r
         on = {k: v for k, v in fo.items() if k.endswith('age1')}; off = {k: v for k, v in fo.items() if k.endswith('age0')}
         if not on: continue
         mean = lambda d, x: float(np.mean([v[x] for v in d.values()])) if d else None
-        rows = pd.concat([pd.read_parquet(x) for x in glob.glob(f'{a.out}/f*_age1/g1_e{e}.parquet')]); c = rows[rows.af_shift != 0]
-        y = np.log(c.truth.to_numpy()) - np.log(c.q50.to_numpy()); X = np.column_stack([np.ones(len(c)), c.lrate.to_numpy()]); sl = float(np.linalg.lstsq(X, y, rcond=None)[0][1]) if len(c) > 50 else None
-        cps = [json.load(open(x)) for x in glob.glob(f'{a.out}/f*_age1/coupling.json')]; dl = float(np.mean([cp['delta']['3'] for cp in cps])) if cps else None
+        gf = [f'{a.out}/{k}/g1_e{e}.parquet' for k in sorted(on)]; gf = [x for x in gf if os.path.exists(x)]   # the same folds as the other bars
+        rows = pd.concat([pd.read_parquet(x) for x in gf]) if gf else pd.DataFrame(dict(af_shift=[], truth=[], q50=[], lrate=[]))
+        c = rows[rows.af_shift != 0]; y = np.log(c.truth.to_numpy()) - np.log(c.q50.to_numpy()); X = np.column_stack([np.ones(len(c)), c.lrate.to_numpy()])
+        sl = float(np.linalg.lstsq(X, y, rcond=None)[0][1]) if len(c) > 50 else None
+        cps = [json.load(open(f'{a.out}/{k}/coupling.json')) for k in sorted(on) if os.path.exists(f'{a.out}/{k}/coupling.json')]
+        dl = float(np.mean([cp['delta']['3'] for cp in cps])) if cps else None
         gp = {r_: json.load(open(f'{r_}/gatepull_e{e}.json')) if os.path.exists(f'{r_}/gatepull_e{e}.json') else None for r_ in (a.out, b)}
-        prim = {r_: (g['pooled']['subplot']['share_below_-2'] if g else None) for r_, g in gp.items()}
+        full = lambda g: g is not None and g['frac'] == 1.0 and sorted(g['folds']) == [str(f) for f in range(NF)] and g.get('eps_scale', 1.0) == 1.0 and g['epoch'] == e
+        prim = {r_: (g['pooled']['subplot']['share_below_-2'] if full(g) else None) for r_, g in gp.items()}
+        same_trees = bool(full(gp[a.out]) and full(gp[b]) and all(gp[a.out]['folds'][f]['subplot']['n'] == gp[b]['folds'][f]['subplot']['n'] for f in gp[b]['folds']))   # data-defined population
         g1w = mean(on, 'g1_76') - mean(on, 'g1_74'); g1dw = mean(on, 'g1d70_76') - mean(on, 'g1d70_74')
-        bars = dict(primary=bool(gp[a.out] is not None and gp[a.out]['pass'] and gp[a.out]['frac'] == 1.0 and len(gp[a.out]['folds']) == NF),   # all held plots of all folds
+        bars = dict(complete=bool(len(on) == NF and len(gf) == NF and len(cps) == NF),
+                    primary=bool(same_trees and prim[a.out] < prim[b] and prim[a.out] <= D76_BARS['primary']),
                     G1=bool(g1w <= D76_BARS['g1_worse'] and g1dw <= D76_BARS['g1_worse']), G1_bias=bool(abs(mean(on, 'bias_76')) <= D76_BARS['g1_bias']),
                     G5=bool(D76_BARS['g5'][0] <= mean(on, 'g5_76') <= D76_BARS['g5'][1]),
                     brier=bool(max(mean(on, 'dE1'), mean(on, 'dE2'), mean(on, 'dE3')) <= D76_BARS['brier_worse']), size=bool(mean(on, 'size_ratio') <= D76_BARS['size_ratio']),
                     residual_slope=bool(sl is not None and dl is not None and abs(sl) <= D76_BARS['resid_slope'] * abs(dl)))
         eps = {os.path.basename(os.path.dirname(x)): json.load(open(x))['eps'] for x in sorted(glob.glob(f'{a.out}/f*_age*/miss.json'))}
-        R[e] = dict(folds=fo, primary_share_below_m2=prim, G1_worse=g1w, G1_d70_worse=g1dw, age_on={x: mean(on, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio', 'bias_76', 'g5_76')},
-                    age_off_reported={x: mean(off, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio')}, residual_slope=sl, delta_c3=dl, eps=eps, bars=bars, adopt=bool(all(bars.values())))
+        R[e] = dict(folds=fo, n_folds_age1=len(on), n_folds_age0=len(off), primary_share_below_m2={'out': prim[a.out], 'base': prim[b]}, primary_same_trees=same_trees, G1_worse=g1w, G1_d70_worse=g1dw,
+                    age_on={x: mean(on, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio', 'bias_76', 'g5_76', 'bias_d70_76', 'g5_d70_76')},
+                    age_off_reported={x: mean(off, x) for x in ('dE1', 'dE2', 'dE3', 'size_ratio')}, residual_slope=sl, n_coupled_G1=int(len(c)), delta_c3=dl, eps=eps,
+                    bars=bars, adopt=bool(all(bars.values())))
     json.dump(R, open(f'{a.out}/d76_compare.json', 'w'), indent=1, default=float); print(json.dumps(R, indent=1, default=float)[:6000])
-    if any(R[e]['bars']['primary'] is False and R[e]['primary_share_below_m2'][a.out] is None for e in R): print('primary: run nimiwae70_gatepull.py on --out (and on the base for its reference value) first')
+    for e in R:
+        if None in R[e]['primary_share_below_m2'].values(): print(f'epoch {e}: the primary needs nimiwae70_gatepull.py --epoch {e} on --out and on the base (all folds, --frac 1)')
+        if not R[e]['bars']['complete']: print(f'epoch {e}: {R[e]["n_folds_age1"]} of {NF} age-on folds in both runs: no adoption')
 
 def summary(a):
     R = {}
