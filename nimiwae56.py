@@ -406,33 +406,45 @@ def wmedian(X, w):
     Xs, ix = torch.sort(X, 0); cw = torch.cumsum(w[..., None].expand_as(X).gather(0, ix), 0)
     return Xs.gather(0, (cw < 0.5).sum(0, keepdim=True).clamp(max=X.shape[0] - 1))[0]
 
+def alive_mask(v):
+    """[1, n, E, T]: slot t lies before end e (or the tree is alive through the span) and inside the frame"""
+    nv = v.sum(1).long(); eI = torch.arange(T_MAX + 1, device=v.device)[None, None, :, None]; tI = torch.arange(T_MAX, device=v.device)[None, None, None, :]
+    return ((tI < eI) | (eI == T_MAX)).float() * (tI < nv[None, :, None, None]).float()
+
+def posterior_draws(model, b, K):
+    """The posterior summaries impute needs, from K importance draws of z: W [K, n, E, 2] (weight of draw k with end e and cause f), WaP1 [K, n, T]
+    (weight of draw k being alive and existing at slot t), the size paths D, H [K, n, T] and the measurement discrepancy."""
+    o = model.joint(b, K)
+    W = torch.softmax(o['lw'], 0)[..., None, None] * torch.exp(o['lpost'])
+    return dict(W=W, WaP1=(W.sum(-1)[..., None] * alive_mask(b['v'])).sum(2) * o['p1'], D=o['D'], H=o['H'], lsdisc=o['lsdisc'])
+
 @torch.no_grad()
-def impute(model, B, K=100, bs=512, nsamp=200, w_int=None):
+def impute(model, B, K=100, bs=512, nsamp=200, w_int=None, age='draws'):
     """Per slot: P(exists), P(gone by death / cut); unconditional latent DIA median (P1, monotone); size given existence (median log DIA /
     HT; undefined where no sample exists), 10 / 90 % of the measured log DIA (per slot-type widths), expected basal area; bounded by the
-    tree's own measurements (am. 7); in_span."""
+    tree's own measurements (am. 7); in_span.
+    age: 'draws' integrates every latent by importance draws (as the CV scored it); 'grid' (age models, D70) integrates the age latent z0 on the
+    exact grid and the rest by draws (nimiwae70.posterior_grid)."""
     w_int = w_int or {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}
     keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD_raw', 'BA_raw', 'lD', 'lH', 'q10', 'q90', 'BA', 'in_span')
     out = {k: [] for k in keys}
     ar = torch.arange(T_MAX); dev = next(model.parameters()).device
     for i in range(0, B['v'].shape[0], bs):
-        b = sub(B, slice(i, i + bs)); o = model.joint({k: v.to(dev) for k, v in b.items()}, K)        # the network may sit on a GPU; the arithmetic below stays on the CPU
+        b = sub(B, slice(i, i + bs)); bd = {k: v.to(dev) for k, v in b.items()}                        # the network may sit on a GPU; the arithmetic below stays on the CPU
+        if age == 'grid': o = model.posterior_grid(bd, K)
+        else: assert age == 'draws', age; o = posterior_draws(model, bd, K)
         o = {k: v.cpu() if torch.is_tensor(v) else v for k, v in o.items()}
-        W = torch.softmax(o['lw'], 0)[..., None, None] * torch.exp(o['lpost'])                        # [K, n, E, 2]
+        W, WaP1 = o['W'], o['WaP1']                                                                    # [K, n, E, 2], [K, n, T]
         Kk, n = W.shape[:2]
-        nv = b['v'].sum(1).long()
         eI = torch.arange(T_MAX + 1)[None, None, :, None]; tI = ar[None, None, None, :]
-        alive_w = ((tI < eI) | (eI == T_MAX)).float() * (tI < nv[None, :, None, None]).float()        # [1, n, E, T]
         We = W.sum(-1)                                                                                 # [K, n, E]
-        Walive = (We[..., None] * alive_w).sum(2)                                                      # [K, n, T] weight alive at t
-        p1 = o['p1']                                                                                   # [K, n, T]
-        pE = (Walive * p1).sum(0)
+        pE = WaP1.sum(0)
         gone = ((tI >= eI) & (eI < T_MAX)).float()
         pDie = (W[..., 0][..., None] * gone).sum((0, 2)); pCut = (W[..., 1][..., None] * gone).sum((0, 2))
         Wk = We.sum(-1)                                                                                # [K, n]
         D, H = o['D'], o['H']
         lD_u = torch.log(wmedian(D, Wk).clamp(min=1e-3))
-        Wc = Walive * p1; wsum = Wc.sum(0); Wc = Wc / wsum[None].clamp(min=1e-12); defined = wsum > 1e-9
+        Wc = WaP1; wsum = Wc.sum(0); Wc = Wc / wsum[None].clamp(min=1e-12); defined = wsum > 1e-9
         def cmed(X):
             Xs, ix = torch.sort(X, 0); cw = torch.cumsum(Wc.gather(0, ix), 0)
             return Xs.gather(0, (cw < 0.5).sum(0, keepdim=True).clamp(max=X.shape[0] - 1))[0]
@@ -477,26 +489,40 @@ def obs_bounds(X, obs, m, monotone=False, lower=True):
         out = torch.cummax(out, 1).values                            # running max stays within the (non-decreasing) upper bound
     return torch.where(m > 0, obs, out)
 
+def lineage_draws(model, b, K, n_draws):
+    """n_draws posterior draws per tree of (z, end e, cause f) from K importance draws: the draw's size paths Dp, Hp [n, d, T], e, f [n, d],
+    its birth gate born [n, d, T] and, for age models, its ages [n, d, T]"""
+    o = model.joint(b, K)
+    W = torch.softmax(o['lw'], 0)[..., None, None] * torch.exp(o['lpost'])                            # [K, n, E, 2]
+    Kk, n = W.shape[:2]
+    flat = W.permute(1, 0, 2, 3).reshape(n, -1)
+    idx = torch.multinomial(flat + 1e-30, n_draws, replacement=True)
+    k_, rem = idx // ((T_MAX + 1) * 2), idx % ((T_MAX + 1) * 2)
+    e_, f_ = rem // 2, rem % 2
+    nidx = torch.arange(n)[:, None].expand(-1, n_draws)
+    out = dict(Dp=o['D'][k_, nidx], Hp=o['H'][k_, nidx], e=e_, f=f_, born=o['born'][k_, nidx])
+    if hasattr(model, 'ages') and getattr(model, 'age', False): out['age'] = model.ages(o['z'], b)[k_, nidx]
+    return out
+
 @torch.no_grad()
-def sample_lineages(model, B, n_draws=10, K=100, bs=512):
+def sample_lineages(model, B, n_draws=10, K=100, bs=512, age=None):
     """Coherent lineage draws (the cohort product): (z_k, end e, cause f) from the posterior; existence = (latent DIA >= the smallest
-    tally level) and t < e — one appearance, at most one end; DIA / HT bounded by the tree's own measurements; NaN outside the span."""
+    tally level) and t < e — one appearance, at most one end; DIA / HT bounded by the tree's own measurements; NaN outside the span.
+    age: 'grid' (the default for age models, D70) draws the age latent from its exact grid posterior jointly with the rest, so each lineage's
+    existence and its ages (output 'age', years at every slot) come from one coherent draw; 'draws' uses importance draws for every latent."""
+    age = age or ('grid' if getattr(model, 'age', False) else 'draws')
     outs = {k: [] for k in ('exists', 'dia', 'ht', 'start', 'end', 'cause')}
     ar = torch.arange(T_MAX)
     for i in range(0, B['v'].shape[0], bs):
-        b = sub(B, slice(i, i + bs)); o = model.joint(b, K)
-        W = torch.softmax(o['lw'], 0)[..., None, None] * torch.exp(o['lpost'])                        # [K, n, E, 2]
-        Kk, n = W.shape[:2]
-        flat = W.permute(1, 0, 2, 3).reshape(n, -1)
-        idx = torch.multinomial(flat + 1e-30, n_draws, replacement=True)
-        k_, rem = idx // ((T_MAX + 1) * 2), idx % ((T_MAX + 1) * 2)
-        e_, f_ = rem // 2, rem % 2
-        nidx = torch.arange(n)[:, None].expand(-1, n_draws)
-        Dp = o['D'][k_, nidx]; Hp = o['H'][k_, nidx]                                                   # [n, d, T]
+        b = sub(B, slice(i, i + bs))
+        if age == 'grid': d = model.lineage_draws_grid(b, K, n_draws)
+        else: assert age == 'draws', age; d = lineage_draws(model, b, K, n_draws)
+        e_, f_, n = d['e'], d['f'], b['v'].shape[0]
+        Dp, Hp = d['Dp'], d['Hp']                                                                      # [n, d, T]
         nv = b['v'].sum(1).long()[:, None, None]
         thr = torch.exp(b['lex'][:, :1])[:, None]                                                      # smallest-level threshold (- 0.05)
         # one contiguous existence interval: from the first slot at the level OR with a visible record, until the end
-        cand = ((Dp >= thr) & o['born'][k_, nidx]) | ((b['real'] > 0)[:, None].expand(-1, n_draws, -1))   # D70: not before birth
+        cand = ((Dp >= thr) & d['born']) | ((b['real'] > 0)[:, None].expand(-1, n_draws, -1))          # D70: not before birth
         first = torch.where(cand.any(-1), torch.argmax(cand.float(), -1), torch.full_like(e_, T_MAX))
         ex = (ar[None, None] >= first[..., None]) & ((ar[None, None] < e_[..., None]) | (e_[..., None] == T_MAX)) & (ar[None, None] < nv)
         lDp = torch.log(Dp.clamp(min=1e-3)); lHp = torch.log(Hp.clamp(min=1.0))
@@ -512,6 +538,7 @@ def sample_lineages(model, B, n_draws=10, K=100, bs=512):
         outs['ht'].append(torch.where(span & ex, torch.exp(lHb), torch.where(span, torch.zeros_like(lHb), nan)))
         start = torch.where(ex.any(-1), torch.argmax(ex.float(), -1), torch.full_like(e_, T_MAX))
         outs['start'].append(start); outs['end'].append(e_); outs['cause'].append(torch.where(e_ < T_MAX, f_, torch.full_like(f_, -1)))
+        if 'age' in d: outs.setdefault('age', []).append(torch.where(span, d['age'], nan))              # years at every slot of the draw
     return {k: torch.cat(v).numpy() for k, v in outs.items()}
 
 def expansion(exists, tpa_tree):
@@ -610,9 +637,9 @@ def bench_end(seq: pd.DataFrame) -> pd.DataFrame:
         out.append(b.drop(columns=['_rk', '_nr', '_truth', '_i']))
     return pd.concat(out, ignore_index=True)
 
-def predictions(model, bb, K=100, w_int=None):
+def predictions(model, bb, K=100, w_int=None, age='draws'):
     B, _, sq = getattr(model, 'build', build)(bb, model.vocab)
-    R = impute(model, B, K, w_int=w_int)
+    R = impute(model, B, K, w_int=w_int, age=age)
     ti, po = sq._tid.to_numpy().copy(), sq._pos.to_numpy().copy()
     for k in ('pE', 'pDie', 'pCut', 'lD', 'lH', 'q10', 'q90', 'BA', 'lD_u'): sq[f'nim_{k}'] = R[k][ti, po].numpy()
     viol = (monotone_violations(R['lD_u'], B),)

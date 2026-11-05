@@ -238,6 +238,35 @@ mx2 = model(); mx2.eval(); Bx2 = batch(); Bx2['la'][:] = 0; Bx2['f'][:] = 0; Bx2
 Bx2['af_shift'] = torch.full((6,), 0.4); Bx2['af_sdf'] = torch.full((6,), 0.8)
 gq2, pq2 = A.age_posterior(mx2, Bx2, K=16); zq2 = A.z_quantiles(gq2, pq2, [0.1, 0.5, 0.9])
 check('D74 grid with a coupling shift: z0 posterior is still N(0, 1) without limits', float(zq2[1].abs().max()) < 0.02 and float((zq2[2] - 1.2816).abs().max()) < 0.03)
+# 18. exact-grid age in the products: impute(age='grid') and sample_lineages (grid by default for age models)
+mg18 = model(); mg18.eval(); B18 = batch(); B18['la'][:] = 4; B18['f'][:] = 4; B18['af_mu'][:] = math.log(4.0); B18['af_sd'][:] = 0.5
+B18['ev'][:, 2:4] = M.EV['true_soft']; B18['real'][:, 2:4] = 0; B18['mD'][:, 2:4] = 0; B18['real'][:, 4] = 1; B18['mD'][:, 4] = 1; B18['lD'][:, 4] = math.log(3.0); B18['ev'][:, 4] = M.EV['true_hard']
+torch.manual_seed(21); pg = A.posterior_grid(mg18, B18, K=8, G=21)
+check('grid posterior: weights over (draw, end, cause) sum to 1 per tree', float((pg['W'].sum((0, 2, 3)) - 1).abs().max()) < 1e-4)
+torch.manual_seed(21)                                                                     # brute force on the same draws: explicit loops over grid age, draw and end
+with A.AgeGrid(mg18, B18, K=8, G=21) as ag:
+    L = ag.log_weights(); P = torch.softmax(L.reshape(-1, 6), 0).reshape(L.shape); pE_bf = torch.zeros(6, M.T_MAX); nv18 = B18['v'].sum(1).long()
+    for gi in range(21):
+        o18 = ag.joint(gi); post = torch.exp(o18['lpost']).sum(-1)
+        for kk in range(8):
+            for e in range(M.T_MAX + 1):
+                for t in range(M.T_MAX):
+                    alive = ((t < e) | (e == M.T_MAX)) & (t < nv18)
+                    pE_bf[:, t] += P[gi, kk] * post[kk, :, e] * alive.float() * o18['p1'][kk, :, t]
+check('grid posterior: P(exists) equals the brute-force sum over grid age, draw and end', float((pg['WaP1'].sum(0) - pE_bf).abs().max()) < 1e-5, f"{float((pg['WaP1'].sum(0) - pE_bf).abs().max()):.1e}")
+torch.manual_seed(22); gq, pq18 = A.age_posterior(mg18, B18, K=8, G=21)
+torch.manual_seed(22); ld18 = A.lineage_draws_grid(mg18, B18, K=8, n_draws=4000, G=21)
+zq18 = A.z_quantiles(gq, pq18, [0.5]); zd = ld18['g'].median(1).values
+check('grid lineage draws: drawn age latent follows the grid posterior (median)', float((zd - zq18[0]).abs().max()) < 0.12, f'{[round(float(x), 2) for x in zd[:3]]} vs {[round(float(x), 2) for x in zq18[0, :3]]}')
+torch.manual_seed(23); L18 = M.sample_lineages(mg18, B18, n_draws=50, K=8)
+bh18 = L18['age'] - B18['l0'].numpy()[:, None, None]
+check('grid lineages: no tree exists before breast height in its own draw', int(np.nansum((L18['exists'] > 0) & (bh18 <= 0))) == 0)
+t18 = (B18['cov'][..., A.ITYR] * 20).numpy()[:, None, :5]; da = L18['age'][..., :5] - L18['age'][..., :1]
+check('grid lineages: each draw\'s age steps equal elapsed years', float(np.abs(da - (t18 - t18[..., :1])).max()) < 1e-3)
+Pg = M.impute(young, B8, K=16, nsamp=20, age='grid'); limg = torch.sigmoid(A.KAPPA_B * (aY[:4].detach() - B8['l0'][0]))
+check('grid impute: P(exists) never exceeds the birth step before birth', bool((Pg['pE'][:, :4] <= limg + 1e-5).all()))
+torch.manual_seed(24); Pd = M.impute(mg18, B18, K=8, nsamp=20); torch.manual_seed(24); Pd2 = M.impute(mg18, B18, K=8, nsamp=20, age='draws')
+check("impute: the default is the importance-draw path the CV scored", float((Pd['pE'] - Pd2['pE']).abs().max()) == 0.0)
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()

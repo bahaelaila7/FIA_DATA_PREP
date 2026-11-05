@@ -184,6 +184,10 @@ class NIMIWAE70(M.NIMIWAE56):
         return M.NIMIWAE56.log_qz(s, torch.cat([z[..., :s.f0], er], -1), mq, lq) + ld
     def q(s, B):
         return s._cache['q'] if getattr(s, '_cache', None) else super().q(B)
+    def posterior_grid(s, b, K):                                                              # impute(..., age='grid')
+        return posterior_grid(s, b, K)
+    def lineage_draws_grid(s, b, K, n_draws):                                                 # sample_lineages(..., age='grid')
+        return lineage_draws_grid(s, b, K, n_draws)
     def p_z(s, B):
         mu, lv = super().p_z(B)
         if not s.age: return mu, lv
@@ -213,23 +217,72 @@ class NIMIWAE70(M.NIMIWAE56):
         lq = torch.log(ps.clamp(1e-6, 1.0)) + F.logsigmoid(KAPPA_B * s.bh_age(z, B))            # log(p_s g_t)
         return torch.logaddexp(torch.log((-torch.expm1(lq)).clamp(min=1e-12)), lq + F.logsigmoid(-xt))
 
+class AgeGrid:
+    """The exact grid over the age latent z0 (D70 am. 14) for one batch, shared by age_posterior, posterior_grid and lineage_draws_grid.
+
+    The decoder never reads z0, so the rest of z is drawn once (K draws from q), the decoder runs once on those draws and is cached, and only the
+    cheap age terms (birth gate, gated cut-off term, anchors) are re-scored at each of the G grid values of z0. joint(gi) scores the draws with
+    z0 = g[gi]; its 'lwg' = log p(x, z0 = g, rest_k) - log q(rest_k): lw divides by q(z0 = g, rest_k), and the grid replaces the z0 draw, so
+    log q(z0 = g) goes back in. A posterior over (g, k) is then softmax(lwg) over both axes (a Riemann sum over the uniform grid).
+    Use as a context manager: the decoder cache is always cleared on exit."""
+    def __init__(s, model, B, K=100, G=61, zmax=3.6):
+        assert model.age, 'the grid is over the age latent z0'
+        s.m, s.B, s.K = model, B, K
+        s.mq, s.lq = M.NIMIWAE56.q(model, B); s.g = torch.linspace(-zmax, zmax, G, device=s.mq.device)
+        s.rest, lqs = model.sample_z(s.mq, s.lq, K)                                           # flow q: z_rest from the flow (D73)
+        s.c2 = 0.5 * math.log(2 * math.pi)
+        s.lq_rest = lqs - s._lq0(s.rest[..., 0])                                              # exact log q(z_rest) of the draws: no inverse pass (D73)
+    def _lq0(s, x):
+        return -0.5 * (x - s.mq[:, 0]) ** 2 / torch.exp(s.lq[:, 0]) - 0.5 * s.lq[:, 0] - s.c2
+    def __enter__(s):
+        zz = s.rest.clone(); zz[..., 0] = 0.0; s.m._cache = None
+        s.m._cache = dict(q=(s.mq, s.lq), dec=s.m.decode(zz, s.B)); return s
+    def __exit__(s, *exc):
+        s.m._cache = None
+    def joint(s, gi):
+        z = s.rest.clone(); z[..., 0] = s.g[gi]; lq0 = s._lq0(s.g[gi])
+        o = s.m.joint(s.B, s.K, z=z, lqz=lq0[None] + s.lq_rest); o['lwg'] = o['lw'] + lq0[None]; return o
+    def log_weights(s):
+        """[G, K, n] log weights of every (grid age, draw of the rest) pair"""
+        return torch.stack([s.joint(gi)['lwg'] for gi in range(len(s.g))])
+
 @torch.no_grad()
 def age_posterior(model, B, K=100, G=61, zmax=3.6):
     """Exact posterior of z0 on a grid: [n, G] probabilities. The decoder never reads z0, so the rest of the model is scored once and only the birth limits vary along the grid.
-    Importance resampling is not used here: with ESS near 7 of K it moved ages by 0.24 sd where the exact answer is the prior (am. 14). lw divides by q(z0 = g), which the grid replaces, so that term goes back in."""
-    assert model.age, 'the grid is over the age latent z0'
-    mq, lq = M.NIMIWAE56.q(model, B); g = torch.linspace(-zmax, zmax, G, device=mq.device); rest, lqs = model.sample_z(mq, lq, K)   # flow q: z_rest from the flow (D73)
-    zz = rest.clone(); zz[..., 0] = 0.0; model._cache = None; dec = model.decode(zz, B); model._cache = dict(q=(mq, lq), dec=dec)
-    c2 = 0.5 * math.log(2 * math.pi); out = []
-    lq_rest = lqs - (-0.5 * (rest[..., 0] - mq[:, 0]) ** 2 / torch.exp(lq[:, 0]) - 0.5 * lq[:, 0] - c2)   # exact log q(z_rest) from the draw itself: no inverse pass (D73: float32 inverse of a flat spline is off)
-    try:
-        for gi in g:
-            z = rest.clone(); z[..., 0] = gi
-            lq0 = -0.5 * (gi - mq[:, 0]) ** 2 / torch.exp(lq[:, 0]) - 0.5 * lq[:, 0] - c2
-            out.append(torch.logsumexp(model.joint(B, K, z=z, lqz=lq0[None] + lq_rest)['lw'] + lq0[None], 0))
-    finally:
-        model._cache = None
-    return g, torch.softmax(torch.stack(out, 1), 1)
+    Importance resampling is not used here: with ESS near 7 of K it moved ages by 0.24 sd where the exact answer is the prior (am. 14)."""
+    with AgeGrid(model, B, K, G, zmax) as ag:
+        return ag.g, torch.softmax(torch.logsumexp(ag.log_weights(), 1).T, 1)
+
+@torch.no_grad()
+def posterior_grid(model, b, K=100, G=61, zmax=3.6):
+    """impute's posterior summaries (nimiwae56.posterior_draws) with z0 integrated on the exact grid:
+    W[k, e, f] = sum_g P(g, k | x) P(e, f | g, k, x) and WaP1[k, t] = sum_g sum_e P(g, k | x) P(e | g, k, x) alive(e, t) P(exists_t | g, k).
+    The sizes D, H depend on k only (the decoder never reads z0). Two passes over the grid: weights first, then the accumulation."""
+    with AgeGrid(model, b, K, G, zmax) as ag:
+        L = ag.log_weights(); Gn, Kk, n = L.shape
+        P = torch.softmax(L.reshape(Gn * Kk, n), 0).reshape(Gn, Kk, n)                         # P(g, k | x) per tree
+        am = M.alive_mask(b['v']); W = WaP1 = 0.0
+        for gi in range(Gn):
+            o = ag.joint(gi); post = torch.exp(o['lpost']) * P[gi][..., None, None]              # [K, n, E, 2]
+            W = W + post; WaP1 = WaP1 + (post.sum(-1)[..., None] * am).sum(2) * o['p1']
+        return dict(W=W, WaP1=WaP1, D=o['D'], H=o['H'], lsdisc=o['lsdisc'])
+
+@torch.no_grad()
+def lineage_draws_grid(model, b, K=100, n_draws=10, G=61, zmax=3.6):
+    """nimiwae56.lineage_draws with z0 on the exact grid: each draw picks (grid age g, draw k of the rest) from P(g, k | x), then (e, f) from
+    P(e, f | g, k, x). Its existence (birth gate at g, size path of k) and its ages come from that one draw."""
+    with AgeGrid(model, b, K, G, zmax) as ag:
+        L = ag.log_weights(); Gn, Kk, n = L.shape; T = T_MAX
+        idx = torch.multinomial(torch.softmax(L.reshape(Gn * Kk, n), 0).T + 1e-30, n_draws, replacement=True)   # [n, d] over (g, k)
+        gi_d, k_d = idx // Kk, idx % Kk; nidx = torch.arange(n, device=idx.device)[:, None].expand(-1, n_draws)
+        e_ = torch.full((n, n_draws), -1, dtype=torch.long, device=idx.device); f_ = e_.clone(); born = torch.zeros(n, n_draws, T, dtype=torch.bool, device=idx.device)
+        for gi in torch.unique(gi_d).tolist():
+            o = ag.joint(gi); sel = gi_d == gi
+            post = torch.exp(o['lpost'])[k_d, nidx][sel]                                          # [m, E, 2]
+            pick = torch.multinomial(post.reshape(post.shape[0], -1) + 1e-30, 1)[:, 0]
+            e_[sel], f_[sel] = pick // 2, pick % 2; born[sel] = o['born'][k_d, nidx][sel]; D, H = o['D'], o['H']
+        z = torch.zeros(n_draws, n, DZ, device=idx.device); z[..., 0] = ag.g[gi_d].T            # only z0 enters ages()
+        return dict(Dp=D[k_d, nidx], Hp=H[k_d, nidx], e=e_, f=f_, born=born, age=model.ages(z, b).permute(1, 0, 2), g=ag.g[gi_d])
 
 def z_quantiles(g, p, q):
     """quantiles [len(q), n] of a grid posterior, each node holding its cell; piecewise linear in the cumulative probability"""
