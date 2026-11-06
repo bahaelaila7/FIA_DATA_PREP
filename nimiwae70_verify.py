@@ -321,7 +321,11 @@ if len(sys.argv) > 1:
     check('frame: no visible record falls before birth under any draw', bool((Bf['la'] == Bf['f']).all()), f'{int((Bf["la"] == Bf["f"]).sum()):,} trees')
     fz = f_.copy(); fz.loc[fz.index[::3], 'af_mu'] = np.nan; Bz, _, _ = A.build(fz, vf); nz = Bz['af_has'] == 0
     check('frame: a tree with no prior anchors at its first visible record', bool((Bz['la'][nz] == Bz['f'][nz]).all()), f'{int(nz.sum()):,} trees without a prior')
-    check('frame: l0 is 2 for softwoods and 5 for hardwoods', set(Bf['l0'].unique().tolist()) <= {2.0, 5.0} and bool((Bf['l0'] == 2.0).any()))
+    if 'l0' in f_:                                                                       # D78 frames: the per-tree column of nimiwae_l0, unchanged by build
+        want_l0 = f_.drop_duplicates(M.K_).set_index(M.K_).l0; got_l0 = pd.Series(Bf['l0'].numpy(), index=pd.MultiIndex.from_frame(sf_.drop_duplicates('_tid').sort_values('_tid')[M.K_]))
+        check('frame: l0 is the frame\'s per-tree l0 (D78)', bool(np.allclose(got_l0.to_numpy(), want_l0.loc[got_l0.index].to_numpy(), atol=1e-5)), f'values {sorted(set(np.round(Bf["l0"].numpy(), 2).tolist()))[:8]}')
+    else:
+        check('frame: l0 is 2 for softwoods and 5 for hardwoods', set(Bf['l0'].unique().tolist()) <= {2.0, 5.0} and bool((Bf['l0'] == 2.0).any()))
     zf = torch.zeros(1, Bf['v'].shape[0], M.DZ)
     mf = A.make_model(vf); af = mf.ages(zf, Bf).detach()[0].numpy(); ti, po = sf_._tid.to_numpy(), sf_._pos.to_numpy(); sa = sf_.assign(a=af[ti, po], yr=(pd.to_datetime(sf_.measdate) - pd.Timestamp('2000-01-01')) / pd.Timedelta(days=365.25))
     r_ = sa.groupby(M.K_).apply(lambda g: float(((g.a - g.a.iloc[0]) - (g.yr - g.yr.iloc[0])).abs().max()), include_groups=False).max()

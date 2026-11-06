@@ -4,7 +4,7 @@ Sizes, E1, E2, E3 use the same benchmarks and definitions as the D55 comparison 
 import sys, os, json, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pandas as pd, torch, duckdb
-import nimiwae56 as M, nimiwae70 as A
+import nimiwae56 as M, nimiwae70 as A, nimiwae_l0 as L0T
 from nimiwae70_score import load, completion, lineage_age, med
 
 def linked(c, seq_val):
@@ -17,7 +17,8 @@ def linked(c, seq_val):
               QUALIFY count(*) OVER (PARTITION BY s.statecd, s.unitcd, s.countycd, s.plot, s.invyr, s.condid, s.spcd, s.dia, s.ht) = 1)
         SELECT * FROM m""").df()
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr']
-    return seq_val[k + ['slot_kind', 'sftwd_hrdwd']].merge(st[k + ['a_obs']], on=k).query("slot_kind == 'real'")
+    cols = k + ['slot_kind', 'sftwd_hrdwd'] + [c for c in ('spcd', 'stdorgcd_own') if c in seq_val]               # D78: what the l0 lookup needs
+    return seq_val[cols].merge(st[k + ['a_obs']], on=k).query("slot_kind == 'real'")
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
@@ -28,7 +29,7 @@ if __name__ == '__main__':
     m1, ck1 = load(a.age1); m0, ck0 = load(a.age0); Rp = {}
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
     ln = linked(c, val); L = lineage_age(m1, val, ln); ln = ln.merge(L, on=M.K_ + ['invyr'])
-    ln['truth'] = ln.a_obs + np.where(ln.sftwd_hrdwd == 'S', 2.0, 5.0); ln['e'] = ln.q50 - ln.truth
+    ln['truth'] = ln.a_obs + L0T.r4_truth_l0(a.data, ln); ln['e'] = ln.q50 - ln.truth                     # D78: one l0 definition
     t = duckdb.connect(a.db, read_only=True); cur = t.execute("SELECT statecd, unitcd, countycd, plot, subp, tree, invyr, estimated_age FROM (SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees)").df()
     j = ln.merge(cur, on=M.K_ + ['invyr'], how='inner'); j = j[j.estimated_age.notna()]
     Rp['G1'] = dict(n=len(j), mae_joint=float((j.q50 - j.truth).abs().mean()), mae_current=float((j.estimated_age - j.truth).abs().mean()), bias_joint=med(j.q50 - j.truth), bias_current=med(j.estimated_age - j.truth))

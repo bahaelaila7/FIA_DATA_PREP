@@ -10,7 +10,7 @@ TRAIN plots only for the age references: VAL carried design choices and TEST sta
 import sys, os, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pandas as pd, duckdb
-import nimiwae56 as M, nimiwae70_eval as E, site_links as SL
+import nimiwae56 as M, nimiwae70_eval as E, site_links as SL, nimiwae_l0 as L0T
 
 SPLIT_BASE = 100000                      # cohorts / curation: a reused tree number becomes TREE + 100000 k
 
@@ -28,19 +28,19 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     for x in ('--data', '--fiadb', '--db'): ap.add_argument(x, required=True)
     a = ap.parse_args(); k = M.K_ + ['invyr']
-    fr = pd.read_parquet(f'{a.data}/seq.parquet', columns=k + ['slot_kind', 'sftwd_hrdwd', 'split'])
+    fr = pd.read_parquet(f'{a.data}/seq.parquet', columns=k + ['slot_kind', 'sftwd_hrdwd', 'split', 'spcd', 'stdorgcd_own'])
     tr = fr[fr.split == 'train']
     c = duckdb.connect(); c.execute("SET threads = 4"); SL.load(c, a.fiadb)                         # attaches FIADB as f (read-only)
     t = duckdb.connect(a.db, read_only=True)
     cur = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees").df()
-    sh = tr[k + ['sftwd_hrdwd']].drop_duplicates(k)
+    sh = tr[k + ['sftwd_hrdwd', 'spcd', 'stdorgcd_own']].drop_duplicates(k)
     # G1 truth and anchors: the one link rule
     an = SL.anchors(c)
     s = to_frame(an, tr, k).merge(sh, on=k).rename(columns={'agedia': 'a_obs'})
-    s['truth'] = s.a_obs + np.where(s.sftwd_hrdwd == 'S', 2.0, 5.0)
+    s['truth'] = s.a_obs + L0T.r4_truth_l0(a.data, s)                                     # D78: l0 table, or 2 / 5 without one
     s = s.merge(cur, on=k, how='left')[k + ['a_obs', 'truth', 'estimated_age', 'cc', 'ssubp_null']]
     # the earlier G1 set, unchanged, for continuity
-    ln = E.linked(c, tr); ln['truth'] = ln.a_obs + np.where(ln.sftwd_hrdwd == 'S', 2.0, 5.0)
+    ln = E.linked(c, tr); ln['truth'] = ln.a_obs + L0T.r4_truth_l0(a.data, ln)
     s0 = ln.merge(cur, on=k, how='left')[k + ['a_obs', 'truth', 'estimated_age']]
     fa = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, age_from_stdage fld FROM curated_trees WHERE age_from_stdage IS NOT NULL AND cond_stdorgcd = 1").df()
     p = fa.merge(tr[tr.slot_kind == 'real'][k].drop_duplicates(), on=k)

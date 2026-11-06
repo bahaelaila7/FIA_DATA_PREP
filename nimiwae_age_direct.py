@@ -6,15 +6,24 @@ Fits age from measurements on TRAIN age records only and scores on VAL. No linea
   CR       Chapman-Richards height-age per species group on site trees: H = A (1 - exp(-k a)) ^ p, inverted with H / A capped at 0.98.
   f        gradient boosting of log total age on DIA, height, crown, species, soil, climate, region.
   f+p      the same plus stand origin (STDORGCD 1 = planted), a field observation.
-Total age = TOTAGE, or BHAGE / AGEDIA + l0 (2 yr softwood, 5 yr hardwood, fixed here). Width: a second booster on the squared log residual, fitted out of fold.
+Total age = TOTAGE, or BHAGE / AGEDIA + l0: from DIR/l0_table.parquet when present (nimiwae_l0.py, D78), else 2 yr softwood, 5 yr hardwood.
+Width: a second booster on the squared log residual, fitted out of fold.
+D78: --fld 1 adds planted field ages as targets (TRAIN plots, planted conditions); --targets-default trains on the 2 / 5 targets while scoring on the
+table's truth (the P2 baseline); --compare BASE.json evaluates the D78 bars P1 / P2 of --out against BASE.json.
 Scored as bars G1, G2, G3, G5 of D70 am. 4, whose thresholds do not change."""
 import sys, os, json, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import zlib
 import numpy as np, pandas as pd, duckdb
+import nimiwae_l0 as L0T
 from scipy.optimize import least_squares
 from sklearn.ensemble import HistGradientBoostingRegressor as HGB
 
-L0 = dict(S=2.0, H=5.0)
+L0 = L0T.DEFAULT
+FLD_PER_VISIT = 5                        # D78: at most this many field-age targets per plot-visit (they share one stand age)
+K7 = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr']
+P1_BIAS, P1_COVER, P1_MIN_N = 1.0, (0.70, 0.90), 200
+P2_G1, P2_G3, P2_G2 = 0.10, 0.25, 0.10
 SOIL = [f'soil_{c}' for c in ('clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'cec', 'depth_restriction', 'rock_frag', 'depth_bedrock')]
 NUM = ['ldia', 'lht', 'tm_n', 'pp_n', 'vp_n'] + SOIL
 CAT = ['spcd', 'spgrpcd', 'cc', 'west']
@@ -69,18 +78,26 @@ def linked(c, val):
 
 def main(a):
     rec = pd.read_parquet(f'{a.data}/age_rec.parquet'); rec = rec[rec.ht.notna() & (rec.ht > 0) & rec.fit_ok].copy()
-    rec['west'] = rec.source != 'site'; rec['l0'] = rec.sftwd_hrdwd.map(L0).fillna(5.0)
-    rec['total'] = rec.a_obs + np.where(rec.source == 'tot', 0.0, rec.l0)
+    rec['west'] = rec.source != 'site'
+    tab = pd.read_parquet(f'{a.data}/l0_table.parquet') if os.path.exists(f'{a.data}/l0_table.parquet') else pd.DataFrame(columns=['scope', 'spcd', 'planted', 'l0'])
+    l0_of = lambda d, default=False: (np.where(d.sftwd_hrdwd == 'S', L0['S'], L0['H']) if default else
+                                      np.where(d.source == 'site', L0T.lookup(tab, 'r4', d.spcd, (d.stdorgcd == 1).astype(int), d.sftwd_hrdwd),
+                                               L0T.lookup(tab, 'west', d.spcd, (d.stdorgcd == 1).astype(int), d.sftwd_hrdwd)))
+    rec['total'] = rec.a_obs + np.where(rec.source == 'tot', 0.0, l0_of(rec))                          # the truth, always on the table's l0
+    rec['total_fit'] = rec.a_obs + np.where(rec.source == 'tot', 0.0, l0_of(rec, default=a.targets_default))   # the fitting target
     rec.loc[rec.source == 'site', 'cc'] = CC_SITE
     rec['planted'] = (rec.stdorgcd == 1).astype(int)
     rec = features(rec); tr = rec[(rec.split == 'train') & rec.first_of_tree]; va = rec[(rec.split == 'val') & rec.first_of_tree]
-    seq = pd.read_parquet(f'{a.data}/seq.parquet'); val = seq[seq.split == 'val']; del seq
+    seq = pd.read_parquet(f'{a.data}/seq.parquet'); val = seq[seq.split == 'val']
+    if a.fld: tr = pd.concat([tr, field_records(seq, pd.read_parquet(f'{a.data}/planted_refs.parquet'))], ignore_index=True)
+    del seq
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
-    ln = linked(c, val); ln['total'] = ln.a_obs + ln.sftwd_hrdwd.map(L0).fillna(5.0); ln['west'] = False; ln['cc'] = ln.cclcd
+    ln = linked(c, val); ln['west'] = False; ln['cc'] = ln.cclcd
     ln = features(ln[ln.ht.notna() & (ln.ht > 0)]); ln['planted'] = (ln[ORIGIN(ln)] == 1).astype(int)
+    ln['total'] = ln.a_obs + L0T.lookup(tab, 'r4', ln.spcd, ln.planted, ln.sftwd_hrdwd)                # the same truth as site_refs (D78)
     t = duckdb.connect(a.db, read_only=True); cur = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees").df()
     ln = ln.merge(cur, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr'], how='inner'); ln = ln[ln.estimated_age.notna()]
-    R = dict(n_train=len(tr), G1_current=score(ln.estimated_age.to_numpy(), ln.total.to_numpy()))
+    R = dict(n_train=len(tr), n_train_by_source=tr.source.value_counts().to_dict(), targets_default=bool(a.targets_default), fld=bool(a.fld), G1_current=score(ln.estimated_age.to_numpy(), ln.total.to_numpy()))
     # R4 saplings have no measured age. Planted stands' field age (STDAGE) is the only outside check there: a diagnostic, never a target or an input
     fa = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, age_from_stdage fld FROM curated_trees WHERE age_from_stdage IS NOT NULL AND cond_stdorgcd = 1").df()
     vr = features(val[(val.slot_kind == 'real') & (val.dia > 0) & (val.ht > 0)].assign(west=False, cc=lambda d: d.cclcd)).merge(fa, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr'])
@@ -96,7 +113,7 @@ def main(a):
     # boosted
     def run(cols, name):
         Xt, Xv, Xl, Xf = encode(tr, [va, ln, vr], cols); cats = [cols.index(x) for x in CAT]
-        yt = np.log(tr.total.to_numpy()); fold = (pd.util.hash_pandas_object(tr.plot_key, index=False).to_numpy() % 2).astype(int); oof = np.zeros(len(tr))
+        yt = np.log(tr.total_fit.to_numpy()); fold = (pd.util.hash_pandas_object(tr.plot_key, index=False).to_numpy() % 2).astype(int); oof = np.zeros(len(tr))
         for k_ in (0, 1): oof[fold == k_] = fit(Xt[fold != k_], yt[fold != k_], cats).predict(Xt[fold == k_])
         m = fit(Xt, yt, cats); s = fit(Xt, np.log((yt - oof) ** 2 + 1e-4), cats)
         def pr(X):
@@ -106,23 +123,48 @@ def main(a):
         transfer = {c: dict(n=len(g), field=float(g.fld.median()), bias=float((g.p - g.fld).median()), cover80=float(((g.fld >= g.lo) & (g.fld <= g.hi)).mean())) for c, g in xf.groupby('cls')}
         G2 = {s_: score(g.p.to_numpy(), g.total.to_numpy(), g.lo.to_numpy(), g.hi.to_numpy()) for s_, g in v.groupby('source')}
         w = v[v.west == 1]; crown = {int(c_): score(g.p.to_numpy(), g.total.to_numpy()) for c_, g in w.groupby('cc')}
-        sm = w[(w.dia >= 1) & (w.dia < 5)]; R[name] = dict(G1=score(pl_, ln.total.to_numpy(), ll, hl), G2=G2, G2_crown=crown, G3=score(sm.p.to_numpy(), sm.total.to_numpy()), max_pred_linked=float(pl_.max()), transfer=transfer)
+        sm = w[(w.dia >= 1) & (w.dia < 5)]; st_ = sm[sm.source == 'tot']
+        R[name] = dict(G1=score(pl_, ln.total.to_numpy(), ll, hl), G2=G2, G2_crown=crown, G3=score(sm.p.to_numpy(), sm.total.to_numpy()), G3_tot=score(st_.p.to_numpy(), st_.total.to_numpy()),
+                       max_pred_linked=float(pl_.max()), transfer=transfer)
     run(NUM + CAT, 'f'); run(NUM + ['planted'] + CAT, 'f+p')
     if a.export:                                                                     # D70 am. 12: prior on log total age at live records: f+p, read from one record, so no hidden record feeds it
         cols = NUM + ['planted'] + CAT; sq = pd.read_parquet(f'{a.data}/seq.parquet')
         keep = (sq.slot_kind == 'real') & (sq.dia > 0) & (sq.ht > 0) & ~(pd.to_datetime(sq.measdate) >= pd.to_datetime(sq.dead_md)); real = features(sq[keep].assign(west=False, cc=lambda d: d.cclcd, planted=lambda d: (d[ORIGIN(d)] == 1).astype(int)))
         maps = {c: {v: i for i, v in enumerate(sorted(tr[c].dropna().unique()))} for c in CAT}
-        enc = lambda d: d[cols].assign(**{c: d[c].map(maps[c]).astype(float) for c in CAT}); Xt = enc(tr); cats = [cols.index(x) for x in CAT]; yt = np.log(tr.total.to_numpy())
+        enc = lambda d: d[cols].assign(**{c: d[c].map(maps[c]).astype(float) for c in CAT}); Xt = enc(tr); cats = [cols.index(x) for x in CAT]; yt = np.log(tr.total_fit.to_numpy())
         hash2 = lambda d: (pd.util.hash_pandas_object(d.plot_key, index=False).to_numpy() % 2).astype(int)
         fold = hash2(tr); oof = np.zeros(len(tr)); mk = {}
         for k_ in (0, 1): mk[k_] = fit(Xt[fold != k_], yt[fold != k_], cats); oof[fold == k_] = mk[k_].predict(Xt[fold == k_])
         m = fit(Xt, yt, cats); s_ = fit(Xt, np.log((yt - oof) ** 2 + 1e-4), cats); Xr = enc(real); mu = m.predict(Xr); fr = hash2(real)
         isT = (real.split == 'train').to_numpy()                                     # train plots take the fold that left them out, so a frame tree never sees its own age record
         for k_ in (0, 1): mu[isT & (fr == k_)] = mk[k_].predict(Xr[isT & (fr == k_)])
+        tr[[c for c in K7 + ['source', 'plot_key', 'spcd', 'dia', 'a_obs', 'total_fit'] if c in tr]].assign(mu_oof=oof).to_parquet(f'{a.data}/age_oof.parquet')   # D78: the sapling test
         sq['af_mu'] = np.nan; sq['af_sd'] = np.nan; sq.loc[real.index, 'af_mu'] = mu; sq.loc[real.index, 'af_sd'] = np.sqrt(np.exp(s_.predict(Xr) + 1.2704)); sq.to_parquet(f'{a.data}/seq.parquet')
         print('exported', int(sq.af_mu.notna().sum()), 'of', int((sq.slot_kind == 'real').sum()), 'real slots; median age', round(float(np.exp(sq.af_mu.median())), 1), 'median sd', round(float(sq.af_sd.median()), 3))
     json.dump(R, open(a.out, 'w'), indent=1, default=float); print(json.dumps(R, indent=0, default=float))
 
+
+def field_records(seq, planted):
+    """D78: planted field ages as direct-prior targets. Live real records on TRAIN plots in a planted condition (the record's own STDORGCD 1) that carry the
+    curation's eligible field age (planted_refs: TRAIN plots, FLDSZCD gate), DIA > 0 and HT > 0; each tree's first such record; at most FLD_PER_VISIT
+    trees per plot-visit, the smallest crc32 of the natural id (no row order). Features as a tally tree: west 0, its crown class, planted 1."""
+    s = seq[(seq.split == 'train') & (seq.slot_kind == 'real') & (seq.dia > 0) & (seq.ht > 0)]
+    s = s[(s[ORIGIN(s)] == 1) & ~(pd.to_datetime(s.measdate) >= pd.to_datetime(s.dead_md))].merge(planted[K7 + ['fld']], on=K7)
+    s = s[s.fld > 0].sort_values(K7[:-1] + ['measdate', 'invyr']).groupby(K7[:-1], sort=False).head(1)
+    s = s.assign(_h=[zlib.crc32('_'.join(map(str, r)).encode()) for r in s[K7].itertuples(index=False)]).sort_values(['plot_key', 'invyr', '_h'])
+    s = s.groupby(['plot_key', 'invyr'], sort=False).head(FLD_PER_VISIT).drop(columns='_h')
+    s = features(s.assign(west=False, cc=lambda d: d.cclcd, planted=1, source='fld', a_obs=s.fld, total=s.fld, total_fit=s.fld, first_of_tree=True))
+    assert (s.split == 'train').all() and not s.duplicated(K7[:-1]).any()
+    return s
+
+def compare(new, base):
+    """the D78 bars on two reports of this script (the f+p fit): P1 on the new one's VAL planted transfer, P2 against the baseline on the same truth"""
+    N, B = json.load(open(new))['f+p'], json.load(open(base))['f+p']
+    p1 = {c: dict(**v, ok=bool(abs(v['bias']) <= P1_BIAS and P1_COVER[0] <= v['cover80'] <= P1_COVER[1])) for c, v in N['transfer'].items() if v['n'] >= P1_MIN_N}
+    p2 = dict(G1=(N['G1']['mae'], B['G1']['mae'], P2_G1), G3_tot=(N['G3_tot']['mae'], B['G3_tot']['mae'], P2_G3), G2_site=(N['G2']['site']['mae'], B['G2']['site']['mae'], P2_G2))
+    p2 = {k: dict(new=v[0], base=v[1], worse=v[0] - v[1], limit=v[2], ok=bool(v[0] - v[1] <= v[2])) for k, v in p2.items()}
+    R = dict(P1=p1, P1_pass=all(v['ok'] for v in p1.values()) and bool(p1), P2=p2, P2_pass=all(v['ok'] for v in p2.values()))
+    print(json.dumps(R, indent=1)); return R
 
 def selftest():
     rng = np.random.default_rng(0); a_ = rng.uniform(5, 120, 3000); h = cr_h(a_, 90.0, 0.03, 1.3) * np.exp(rng.normal(0, 0.03, 3000))
@@ -131,11 +173,19 @@ def selftest():
     assert np.abs(e[a_ < 80]).mean() < 3, np.abs(e[a_ < 80]).mean()
     assert abs(cr_inv(np.array([200.0]), 90.0, 0.03, 1.3)[0] - cr_inv(np.array([90.0 * 0.98]), 90.0, 0.03, 1.3)[0]) < 1e-9       # capped
     s = score(np.array([10., 20.]), np.array([12., 20.]), np.array([5., 25.]), np.array([15., 30.])); assert s['mae'] == 1 and s['cover80'] == 0.5
-    print('selftest: 4 checks PASS')
+    # D78 field-age targets: planted, TRAIN, live, first record per tree, at most FLD_PER_VISIT per plot-visit
+    n = 8; base = dict(statecd=1, unitcd=1, countycd=1, plot=1, subp=1, plot_key='1_1_1_1', spcd=131, spgrpcd=1, sftwd_hrdwd='S', cclcd=3.0, ht=30.0, tm_n=0.0, pp_n=0.0, vp_n=0.0,
+                             slot_kind='real', dead_md=pd.NaT, **{c: 0.0 for c in SOIL})
+    rows = [dict(base, tree=t, invyr=y, measdate=pd.Timestamp(f'{y}-06-01'), dia=4.0 + t, stdorgcd_own=1.0 if t != 7 else 2.0, split='train' if t != 6 else 'val') for t in range(n) for y in (2000, 2005)]
+    sq = pd.DataFrame(rows); pr = sq[K7].assign(fld=12.0); fr = field_records(sq, pr)
+    assert len(fr) == 5 and set(fr.invyr) == {2000} and not fr.tree.isin([6, 7]).any() and (fr.total_fit == 12.0).all() and (fr.planted == 1).all() and not fr.west.any(), fr[K7]
+    assert fr.tree.tolist() == sorted(fr.tree.tolist(), key=lambda t: zlib.crc32('_'.join(map(str, (1, 1, 1, 1, 1, t, 2000))).encode()))   # picked by the natural-id hash
+    print('selftest: 6 checks PASS')
 
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     for x in ('--data', '--fiadb', '--db', '--out'): ap.add_argument(x)
-    ap.add_argument('--selftest', action='store_true'); ap.add_argument('--export', action='store_true'); a = ap.parse_args()
-    selftest() if a.selftest else main(a)
+    ap.add_argument('--selftest', action='store_true'); ap.add_argument('--export', action='store_true'); ap.add_argument('--fld', type=int, default=0)
+    ap.add_argument('--targets-default', action='store_true'); ap.add_argument('--compare'); a = ap.parse_args()
+    selftest() if a.selftest else compare(a.out, a.compare) if a.compare else main(a)

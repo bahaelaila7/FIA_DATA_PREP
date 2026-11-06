@@ -8,7 +8,7 @@ Scored on the G1 trees of VAL, at the linked visit. Each reading gives one birth
 import sys, os, json, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pandas as pd, torch, duckdb
-import nimiwae56 as M, nimiwae70_eval as E
+import nimiwae56 as M, nimiwae70_eval as E, nimiwae_l0 as L0T
 
 def births(r):
     """r: real slots of the trees, with yr (decimal years) and af_mu -> one row per tree. Sorted on natural ids; records of one tree have distinct dates or the sort is by invyr."""
@@ -33,7 +33,7 @@ if __name__ == '__main__':
     val['yr'] = (pd.to_datetime(val.measdate) - pd.Timestamp('2000-01-01')) / pd.Timedelta(days=365.25)
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)"); ln = E.linked(c, val)
     t = duckdb.connect(a.db, read_only=True); cur = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees").df()
-    ln['truth'] = ln.a_obs + np.where(ln.sftwd_hrdwd == 'S', 2.0, 5.0)
+    ln['truth'] = ln.a_obs + L0T.r4_truth_l0(a.data, ln)                                                  # D78: one l0 definition
     j = ln.merge(cur, on=M.K_ + ['invyr']); j = j[j.estimated_age.notna()]
     real = val[(val.slot_kind == 'real') & val.af_mu.notna()]; j = j.merge(real[M.K_ + ['invyr', 'yr', 'af_mu']], on=M.K_ + ['invyr'])
     tr = real.merge(j[M.K_].drop_duplicates(), on=M.K_); b = births(tr); j = j.merge(b, on=M.K_)

@@ -32,7 +32,7 @@ SOIL_COLS = [f'soil_{c}' for c in ('clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'c
 NSOIL = len(SOIL_COLS)
 KAPPA_B = 2.0                 # per year: the birth step is about half a year wide
 AF_MU0, AF_SD0 = math.log(25.0), 0.8     # trees with no usable record: wide default, not a measurement
-L0 = dict(S=2.0, H=5.0)                  # years from germination to breast height; the age targets use the same values
+L0 = dict(S=2.0, H=5.0)                  # years from germination to breast height when the frame has no `l0` column (frames before D78); the age targets use the same values
 ITYR = COV.index('tyr')
 S_ANCHOR = 0.10                          # D74: log-scale width of a ring-count breast-height age (sensitivity 0.05 / 0.20 reported)
 T_NU = 4.0                               # D74: Student-t degrees of freedom for log HT residuals
@@ -64,7 +64,7 @@ def build(seq, vocab=None):
     B['soil'] = torch.tensor(np.stack([np.nan_to_num((st[c].to_numpy(float) - vocab['_soil'][c][0]) / vocab['_soil'][c][1], nan=0.0) for c in SOIL_COLS], 1), dtype=torch.float32)
     n = B['v'].shape[0]; ti, po = sq._tid.to_numpy(), sq._pos.to_numpy()
     mu, sd, la = np.full(n, AF_MU0, np.float32), np.full(n, AF_SD0, np.float32), B['f'].clone()      # no prior: still anchored at the first visible record
-    B['l0'] = torch.tensor(np.where(st.sftwd_hrdwd.to_numpy() == 'S', L0['S'], L0['H']), dtype=torch.float32)
+    B['l0'] = torch.tensor(st.l0.to_numpy(float) if 'l0' in st else np.where(st.sftwd_hrdwd.to_numpy() == 'S', L0['S'], L0['H']), dtype=torch.float32)   # D78: per tree (nimiwae_l0)
     if 'af_mu' in sq:                                                                          # the first visible slot with a prior; hidden records never feed it
         hid = sq.hidden.fillna(False).to_numpy(bool) if 'hidden' in sq else np.zeros(len(sq), bool)
         ok = (sq.slot_kind == 'real').to_numpy() & ~hid & sq.af_mu.notna().to_numpy()
