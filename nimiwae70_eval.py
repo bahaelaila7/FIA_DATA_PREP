@@ -17,7 +17,7 @@ def linked(c, seq_val):
               QUALIFY count(*) OVER (PARTITION BY s.statecd, s.unitcd, s.countycd, s.plot, s.invyr, s.condid, s.spcd, s.dia, s.ht) = 1)
         SELECT * FROM m""").df()
     k = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr']
-    cols = k + ['slot_kind', 'sftwd_hrdwd'] + [c for c in ('spcd', 'stdorgcd_own') if c in seq_val]               # D78: what the l0 lookup needs
+    cols = k + ['slot_kind', 'sftwd_hrdwd'] + [c for c in ('spcd', 'stdorgcd_own', 'l0') if c in seq_val]         # D78: what the l0 truth needs
     return seq_val[cols].merge(st[k + ['a_obs']], on=k).query("slot_kind == 'real'")
 
 if __name__ == '__main__':

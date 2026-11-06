@@ -329,6 +329,9 @@ if len(sys.argv) > 1:
     check('frame: no visible record falls before birth under any draw', bool((Bf['la'] == Bf['f']).all()), f'{int((Bf["la"] == Bf["f"]).sum()):,} trees')
     fz = f_.copy(); fz.loc[fz.index[::3], 'af_mu'] = np.nan; Bz, _, _ = A.build(fz, vf); nz = Bz['af_has'] == 0
     check('frame: a tree with no prior anchors at its first visible record', bool((Bz['la'][nz] == Bz['f'][nz]).all()), f'{int(nz.sum()):,} trees without a prior')
+    if 'l0' in sq0 and os.path.exists(f'{sys.argv[1]}/site_refs.parquet'):              # D78: one l0 per tree, also in the G1 truth
+        sr = pd.read_parquet(f'{sys.argv[1]}/site_refs.parquet').merge(sq0[M.K_ + ['invyr', 'l0']].drop_duplicates(M.K_ + ['invyr']), on=M.K_ + ['invyr'])
+        check('frame: G1 truth = AGEDIA + the per-tree l0 on every site ref (D78)', bool(np.allclose(sr.truth - sr.a_obs, sr.l0, atol=1e-6)), f'{len(sr):,} refs')
     if 'af_model' in f_:                                                                 # D79: the known-exception flag = planted-model prior at DIA >= 15 in at the prior's slot
         fr_ = sf_[(sf_.slot_kind == 'real') & sf_.af_mu.notna()].sort_values(['_tid', '_pos']).groupby('_tid').first()
         want_kb = ((fr_.af_model == 'P') & (fr_.dia >= A.KNOWN_BIAS_DIA)).reindex(range(Bf['v'].shape[0]), fill_value=False).to_numpy()

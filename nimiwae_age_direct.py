@@ -98,14 +98,14 @@ def main(a):
     c = duckdb.connect(); c.execute("SET threads = 4"); c.execute(f"ATTACH '{a.fiadb}' AS f (READ_ONLY)")
     ln = linked(c, val); ln['west'] = False; ln['cc'] = ln.cclcd
     ln = features(ln[ln.ht.notna() & (ln.ht > 0)]); ln['planted'] = (ln[ORIGIN(ln)] == 1).astype(int)
-    ln['total'] = ln.a_obs + L0T.lookup(tab, 'r4', ln.spcd, ln.planted, ln.sftwd_hrdwd)                # the same truth as site_refs (D78)
+    ln['total'] = ln.a_obs + (ln.l0.to_numpy(float) if 'l0' in ln else L0T.lookup(tab, 'r4', ln.spcd, ln.planted, ln.sftwd_hrdwd))   # the same truth as site_refs: the per-tree l0 (D78)
     t = duckdb.connect(a.db, read_only=True); cur = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees").df()
     ln = ln.merge(cur, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr'], how='inner'); ln = ln[ln.estimated_age.notna()]
     R = dict(n_train=len(tr), n_train_by_source=tr.source.value_counts().to_dict(), targets_default=bool(a.targets_default), fld=bool(a.fld), G1_current=score(ln.estimated_age.to_numpy(), ln.total.to_numpy()))
     # R4 saplings have no measured age. Planted stands' field age (STDAGE) is the only outside check there: a diagnostic, never a target or an input
     fa = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, age_from_stdage fld FROM curated_trees WHERE age_from_stdage IS NOT NULL AND cond_stdorgcd = 1").df()
     vr = features(val[(val.slot_kind == 'real') & (val.dia > 0) & (val.ht > 0)].assign(west=False, cc=lambda d: d.cclcd)).merge(fa, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr'])
-    vr['planted'] = 1; vr['cls'] = pd.cut(vr.dia, [0, 3, 5, 7, 9, 15, 99], right=False).astype(str)
+    vr['planted'] = (vr[ORIGIN(vr)] == 1).astype(int); vr['cls'] = pd.cut(vr.dia, [0, 3, 5, 7, 9, 15, 99], right=False).astype(str)   # as the export reads it (D79 routing)
     R['transfer_current'] = {c: float((g.merge(cur, on=['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr']).pipe(lambda d: d.estimated_age - d.fld)).median()) for c, g in vr.groupby('cls')}
     # Chapman-Richards on site trees
     st = tr[tr.source == 'site']; cr = {}

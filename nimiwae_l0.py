@@ -9,7 +9,8 @@ Total age = breast-height age + l0. Rows of the table (scope, spcd, planted, l0,
                           the field size class) is close to a measurement in plantations, and planted trees share it.
   scope 'west'            western BHAGE records (age_rec source 'bha'): FIA's own constant, the modal TOTAGE - BHAGE of the species on western
                           records carrying both (only CA, OR, WA do), if >= MIN_WEST records and the mode holds >= MIN_SHARE of them.
-Anything else: 2 yr softwood, 5 yr hardwood (DEFAULT). FVS-SN's site curves are not used: they fail the R4 check (D78)."""
+Anything else: 2 yr softwood, 5 yr hardwood (DEFAULT). FVS-SN's site curves are not used: they fail the R4 check (D78).
+A frame tree's l0 is fixed by its species and stand origin at its first real record (tree_l0); the G1 truth of every visit uses that per-tree value."""
 import sys, os, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pandas as pd
@@ -40,7 +41,9 @@ def table(data):
     return pd.read_parquet(p) if os.path.exists(p) else pd.DataFrame(columns=['scope', 'spcd', 'planted', 'l0', 'source', 'n', 'spread'])
 
 def r4_truth_l0(data, d):
-    """l0 of R4 frame records d (spcd, stdorgcd_own, sftwd_hrdwd: the frame slot's own species and condition): the G1 truth is AGEDIA + this"""
+    """l0 of R4 frame records d: the G1 truth is AGEDIA + this. The frame's per-tree l0 (column `l0`, tree_l0: one birth date per tree, the same value
+    the model's gate and coupling read) when d carries it; otherwise the lookup on the record itself (frames before D78: DEFAULT)"""
+    if 'l0' in d: return d.l0.to_numpy(float)
     return lookup(table(data), 'r4', d.spcd, (d.stdorgcd_own == 1).astype(int), d.sftwd_hrdwd)
 
 
@@ -106,7 +109,9 @@ def selftest():
     sq = pd.DataFrame(dict(statecd=1, unitcd=1, countycd=1, plot=1, subp=1, tree=[1, 1, 2], invyr=[2000, 2005, 2000], slot_kind='real',
                            measdate=pd.to_datetime(['2000-06-01', '2005-06-01', '2000-06-01']), spcd=[131, 131, 802], stdorgcd_own=[1, 0, 1], sftwd_hrdwd=['S', 'S', 'H']))
     assert tree_l0(sq, tab).l0.tolist() == [2.8, 2.8, 5.0]                 # stand origin at the first record decides, for every row of the tree
-    print('selftest: 5 checks PASS')
+    rec = sq.assign(l0=tree_l0(sq, tab).l0.to_numpy())                                # a tree that leaves the planted stratum keeps its first record's l0
+    assert r4_truth_l0('/nonexistent', rec).tolist() == [2.8, 2.8, 5.0] and r4_truth_l0('/nonexistent', rec.drop(columns='l0')).tolist() == [2.0, 2.0, 5.0]
+    print('selftest: 6 checks PASS')
 
 
 if __name__ == '__main__':

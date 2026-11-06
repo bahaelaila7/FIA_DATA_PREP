@@ -28,12 +28,14 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     for x in ('--data', '--fiadb', '--db'): ap.add_argument(x, required=True)
     a = ap.parse_args(); k = M.K_ + ['invyr']
-    fr = pd.read_parquet(f'{a.data}/seq.parquet', columns=k + ['slot_kind', 'sftwd_hrdwd', 'split', 'spcd', 'stdorgcd_own'])
+    import pyarrow.parquet as pq
+    has_l0 = 'l0' in pq.read_schema(f'{a.data}/seq.parquet').names                                   # D78 frames: the per-tree l0 is the truth's l0
+    fr = pd.read_parquet(f'{a.data}/seq.parquet', columns=k + ['slot_kind', 'sftwd_hrdwd', 'split', 'spcd', 'stdorgcd_own'] + (['l0'] if has_l0 else []))
     tr = fr[fr.split == 'train']
     c = duckdb.connect(); c.execute("SET threads = 4"); SL.load(c, a.fiadb)                         # attaches FIADB as f (read-only)
     t = duckdb.connect(a.db, read_only=True)
     cur = t.execute("SELECT STATECD statecd, UNITCD unitcd, COUNTYCD countycd, PLOT plot, SUBP subp, TREE tree, INVYR invyr, estimated_age FROM curated_trees").df()
-    sh = tr[k + ['sftwd_hrdwd', 'spcd', 'stdorgcd_own']].drop_duplicates(k)
+    sh = tr[k + ['sftwd_hrdwd', 'spcd', 'stdorgcd_own'] + (['l0'] if has_l0 else [])].drop_duplicates(k)
     # G1 truth and anchors: the one link rule
     an = SL.anchors(c)
     s = to_frame(an, tr, k).merge(sh, on=k).rename(columns={'agedia': 'a_obs'})
