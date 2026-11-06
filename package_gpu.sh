@@ -43,27 +43,31 @@ python -I nimiwae70_verify.py data | tail -1 || exit 1
 python -I nimiwae70_cv.py --selftest || exit 1
 if [ -n "$POST" ]; then
   [ "$POST" = d76 ] || { echo "POST must be d76, not $POST"; exit 1; }
-  N76=out/cv76flow; B74=out/cv74flow
-  for r in $N76 $B74; do for f in $FOLDS; do for a in 1 0; do
+  N76=out/cv76flow; B74=out/cv74flow; ALL="0 1 2 3 4"                       # the D76 bars need every fold: FOLDS is ignored here
+  for r in $N76 $B74; do for f in $ALL; do for a in 1 0; do
     [ -f "$r/f${f}_age$a/done.json" ] || { echo "missing $r/f${f}_age$a/done.json: that run has not finished (copy cv74flow here; train cv76flow first)"; exit 1; }
+    [ -f "$r/f${f}_age1/model_e36.pt" ] || { echo "missing $r/f${f}_age1/model_e36.pt"; exit 1; }
   done; done; done
+  complete () {   # complete FILE SCALE: a gatepull of all held plots of all five folds at epoch 36 and this eps scale (anything else is redone)
+    [ -f "$1" ] && python -I -c "import json, sys; g = json.load(open(sys.argv[1])); sys.exit(0 if g.get('frac') == 1.0 and sorted(g.get('folds', {})) == list('01234') and g.get('epoch') == 36 and float(g.get('eps_scale', 1.0)) == float(sys.argv[2]) else 1)" "$1" "$2"
+  }
   pids=(); i=0
-  gp () {   # gp OUTPUT_JSON ARGS...: one gatepull on GPU i % G, skipped if its output exists
-    local out=$1; shift
-    if [ -f "$out" ]; then echo "have $out"; return; fi
-    echo "gatepull -> $out"; CUDA_VISIBLE_DEVICES=$(( i % G )) python -I nimiwae70_gatepull.py --data data --device "$D" --threads "$T" "$@" > "${out%.json}.log" 2>&1 &
+  gp () {   # gp OUTPUT_JSON SCALE RUN: one gatepull on GPU i % G, skipped if a complete one exists
+    local out=$1 sc=$2 run=$3
+    if complete "$out" "$sc"; then echo "have $out"; return; fi
+    echo "gatepull -> $out"; CUDA_VISIBLE_DEVICES=$(( i % G )) python -I nimiwae70_gatepull.py --data data --run "$run" --epoch 36 --eps-scale "$sc" --device "$D" --threads "$T" > "${out%.json}.log" 2>&1 &
     pids+=($!); i=$(( i + 1 ))
   }
-  gp $N76/gatepull_e36.json --run $N76; gp $B74/gatepull_e36.json --run $B74
-  gp $N76/gatepull_e36_eps0.5.json --run $N76 --eps-scale 0.5; gp $N76/gatepull_e36_eps2.json --run $N76 --eps-scale 2
+  rc=0
+  gp $N76/gatepull_e36.json 1 $N76; gp $B74/gatepull_e36.json 1 $B74; gp $N76/gatepull_e36_eps0.5.json 0.5 $N76; gp $N76/gatepull_e36_eps2.json 2 $N76
+  for p in ${pids[@]+"${pids[@]}"}; do wait "$p" || rc=1; done              # phase 1 ends before phase 2: at most max(4, P) processes on the GPUs
+  [ "$rc" -eq 0 ] || { echo "a gatepull FAILED: see $N76/gatepull_*.log and $B74/gatepull_*.log; rerun POST=d76 (complete pieces are skipped)"; exit 1; }
   echo "grid completion of $B74 (skipped where done)"
-  for f in $FOLDS; do echo "$f"; done | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --fold $0 --rescore-grid '"$B74"' --device '"$D --threads $T"
-  rc=$?
-  for p in "${pids[@]}"; do wait "$p" || rc=1; done
-  [ "$rc" -eq 0 ] || { echo "a gatepull or grid rescore FAILED: see $N76/gatepull_*.log, $B74/gatepull_*.log; rerun POST=d76 (finished pieces are skipped)"; exit 1; }
-  python -I nimiwae70_cv.py --out $N76 --d76-base $B74 | tail -60
-  python -I nimiwae70_cv.py --out $N76 --summary --data data | tail -40
-  echo "done: copy $N76 and $B74 back"
+  for f in $ALL; do echo "$f"; done | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c 'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --fold $0 --rescore-grid '"$B74"' --device '"$D --threads $T" \
+    || { echo "a grid rescore FAILED; rerun POST=d76"; exit 1; }
+  python -I nimiwae70_cv.py --out $N76 --d76-base $B74 | tail -60 || { echo "the D76 comparison FAILED"; exit 1; }
+  python -I nimiwae70_cv.py --out $N76 --summary --data data | tail -40 || { echo "the summary FAILED"; exit 1; }
+  echo "done: the D76 verdict is in $N76/d76_compare.json (adopt at epoch 36); copy $N76 and $B74 back"
   exit 0
 fi
 if [ -n "$GRR" ]; then
