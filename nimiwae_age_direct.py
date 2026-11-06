@@ -24,6 +24,10 @@ FLD_PER_VISIT = 5                        # D78: at most this many field-age targ
 K7 = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree', 'invyr']
 P1_BIAS, P1_COVER, P1_MIN_N = 1.0, (0.70, 0.90), 200
 P2_G1, P2_G3, P2_G2 = 0.10, 0.25, 0.10
+# D79 (user, 2026-11-06): the planted 15+ in class is accepted as a known exception at its measured values; a refit FAILS if it drifts past them by more
+# than KNOWN_DRIFT (bias, yr) / KNOWN_DRIFT_COVER (coverage above the 0.90 cap), and gets an INFO line if it starts passing
+KNOWN_P1 = {'[15, 99)': dict(bias=-1.0293, cover80=0.9075, flag='nimiwae70.KNOWN_BIAS_DIA: B[age_known_bias]')}
+KNOWN_DRIFT, KNOWN_DRIFT_COVER = 0.25, 0.02
 SOIL = [f'soil_{c}' for c in ('clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'cec', 'depth_restriction', 'rock_frag', 'depth_bedrock')]
 NUM = ['ldia', 'lht', 'tm_n', 'pp_n', 'vp_n'] + SOIL
 CAT = ['spcd', 'spgrpcd', 'cc', 'west']
@@ -194,6 +198,11 @@ def compare(new, base):
     """the D78 bars on two reports of this script (the f+p fit): P1 on the new one's VAL planted transfer, P2 against the baseline on the same truth"""
     N, B = json.load(open(new))['f+p'], json.load(open(base))['f+p']
     p1 = {c: dict(**v, ok=bool(abs(v['bias']) <= P1_BIAS and P1_COVER[0] <= v['cover80'] <= P1_COVER[1])) for c, v in N['transfer'].items() if v['n'] >= P1_MIN_N}
+    for c, kn in KNOWN_P1.items():                                                   # D79 known exception, guarded against drift
+        if c not in p1: continue
+        if p1[c]['ok']: p1[c]['info'] = 'known exception passes now: consider retiring it'; continue
+        within = abs(p1[c]['bias']) <= abs(kn['bias']) + KNOWN_DRIFT and P1_COVER[0] <= p1[c]['cover80'] <= max(P1_COVER[1], kn['cover80']) + KNOWN_DRIFT_COVER
+        p1[c].update(known=kn, ok=bool(within), status='KNOWN' if within else 'known exception DRIFTED')
     p2 = dict(G1=(N['G1']['mae'], B['G1']['mae'], P2_G1), G3_tot=(N['G3_tot']['mae'], B['G3_tot']['mae'], P2_G3), G2_site=(N['G2']['site']['mae'], B['G2']['site']['mae'], P2_G2))
     p2 = {k: dict(new=v[0], base=v[1], worse=v[0] - v[1], limit=v[2], ok=bool(v[0] - v[1] <= v[2])) for k, v in p2.items()}
     R = dict(P1=p1, P1_pass=all(v['ok'] for v in p1.values()) and bool(p1), P2=p2, P2_pass=all(v['ok'] for v in p2.values()))

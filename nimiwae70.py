@@ -37,6 +37,7 @@ ITYR = COV.index('tyr')
 S_ANCHOR = 0.10                          # D74: log-scale width of a ring-count breast-height age (sensitivity 0.05 / 0.20 reported)
 T_NU = 4.0                               # D74: Student-t degrees of freedom for log HT residuals
 RATE_FLOOR = 0.02                        # D74: in / yr; an observed DIA change at or below it reads as this rate (12 % of anchor increments are <= 0)
+KNOWN_BIAS_DIA = 15.0                    # D79 (user): planted-model priors at DIA >= this are a known exception (VAL bias -1.03 yr, coverage 0.908)
 COUPLE_MIN_DIA = 5.0                     # D74: no coupling below 5 in at the prior's slot (no R4 sapling has an age)
 COUPLE_MIN_YEARS = 1.0                   # D74: a growth rate needs measured DIA at least this far apart
 WEST_RATIO = {4: 0.61, 5: 0.43}          # D74: coupling strength of intermediate / overtopped relative to classes 1-3 (western BHAGE, 229k trees)
@@ -70,11 +71,14 @@ def build(seq, vocab=None):
     if 'af_mu' in sq:                                                                          # the first visible slot with a prior; hidden records never feed it
         hid = sq.hidden.fillna(False).to_numpy(bool) if 'hidden' in sq else np.zeros(len(sq), bool)
         ok = (sq.slot_kind == 'real').to_numpy() & ~hid & sq.af_mu.notna().to_numpy()
-        o = pd.DataFrame(dict(t=ti[ok], p=po[ok], m=sq.af_mu.to_numpy(float)[ok], s=sq.af_sd.to_numpy(float)[ok])).sort_values(['t', 'p']).groupby('t').first()
+        pm = (sq.af_model.to_numpy(object) == 'P') if 'af_model' in sq else np.zeros(len(sq), bool)                     # D79: which direct model gave the prior
+        o = pd.DataFrame(dict(t=ti[ok], p=po[ok], m=sq.af_mu.to_numpy(float)[ok], s=sq.af_sd.to_numpy(float)[ok], pm=pm[ok], d=sq.dia.to_numpy(float)[ok])).sort_values(['t', 'p']).groupby('t').first()
         mu[o.index.to_numpy()] = o.m.to_numpy(); sd[o.index.to_numpy()] = o.s.to_numpy(); la[torch.tensor(o.index.to_numpy())] = torch.tensor(o.p.to_numpy(), dtype=la.dtype)
         B['af_has'] = torch.zeros(n); B['af_has'][torch.tensor(o.index.to_numpy())] = 1.0
+        B['age_known_bias'] = torch.zeros(n); B['age_known_bias'][torch.tensor(o.index.to_numpy())] = torch.tensor((o.pm.astype(bool) & (o.d >= KNOWN_BIAS_DIA)).to_numpy(), dtype=torch.float32)   # D79 flag
     else:
         B['af_has'] = torch.zeros(n)
+        B['age_known_bias'] = torch.zeros(n)
     B['af_mu'], B['af_sd'], B['la'] = torch.tensor(mu), torch.tensor(sd), la
     d74_features(B, seq_cols=sq, ti=ti, po=po)
     if 'age_coupling' in vocab: apply_coupling(B, vocab['age_coupling'])

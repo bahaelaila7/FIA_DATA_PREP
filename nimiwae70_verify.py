@@ -329,6 +329,10 @@ if len(sys.argv) > 1:
     check('frame: no visible record falls before birth under any draw', bool((Bf['la'] == Bf['f']).all()), f'{int((Bf["la"] == Bf["f"]).sum()):,} trees')
     fz = f_.copy(); fz.loc[fz.index[::3], 'af_mu'] = np.nan; Bz, _, _ = A.build(fz, vf); nz = Bz['af_has'] == 0
     check('frame: a tree with no prior anchors at its first visible record', bool((Bz['la'][nz] == Bz['f'][nz]).all()), f'{int(nz.sum()):,} trees without a prior')
+    if 'af_model' in f_:                                                                 # D79: the known-exception flag = planted-model prior at DIA >= 15 in at the prior's slot
+        fr_ = sf_[(sf_.slot_kind == 'real') & sf_.af_mu.notna()].sort_values(['_tid', '_pos']).groupby('_tid').first()
+        want_kb = ((fr_.af_model == 'P') & (fr_.dia >= A.KNOWN_BIAS_DIA)).reindex(range(Bf['v'].shape[0]), fill_value=False).to_numpy()
+        check('frame: age_known_bias is the planted-model prior at DIA >= 15 in (D79)', (Bf['age_known_bias'].numpy() > 0).tolist() == want_kb.tolist(), f'{int(want_kb.sum())} flagged')
     if 'l0' in f_:                                                                       # D78 frames: the per-tree column of nimiwae_l0, unchanged by build
         want_l0 = f_.drop_duplicates(M.K_).set_index(M.K_).l0; got_l0 = pd.Series(Bf['l0'].numpy(), index=pd.MultiIndex.from_frame(sf_.drop_duplicates('_tid').sort_values('_tid')[M.K_]))
         check('frame: l0 is the frame\'s per-tree l0 (D78)', bool(np.allclose(got_l0.to_numpy(), want_l0.loc[got_l0.index].to_numpy(), atol=1e-5)), f'values {sorted(set(np.round(Bf["l0"].numpy(), 2).tolist()))[:8]}')

@@ -539,6 +539,7 @@ def sample_lineages(model, B, n_draws=10, K=100, bs=512, age=None):
         start = torch.where(ex.any(-1), torch.argmax(ex.float(), -1), torch.full_like(e_, T_MAX))
         outs['start'].append(start); outs['end'].append(e_); outs['cause'].append(torch.where(e_ < T_MAX, f_, torch.full_like(f_, -1)))
         if 'age' in d: outs.setdefault('age', []).append(torch.where(span, d['age'], nan))              # years at every slot of the draw
+        if 'age_known_bias' in b: outs.setdefault('age_known_bias', []).append(b['age_known_bias'] > 0)   # D79: per tree, the age prior is a known exception
     return {k: torch.cat(v).numpy() for k, v in outs.items()}
 
 def expansion(exists, tpa_tree):
