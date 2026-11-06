@@ -424,7 +424,9 @@ def impute(model, B, K=100, bs=512, nsamp=200, w_int=None, age='draws'):
     HT; undefined where no sample exists), 10 / 90 % of the measured log DIA (per slot-type widths), expected basal area; bounded by the
     tree's own measurements (am. 7); in_span.
     age: 'draws' integrates every latent by importance draws (as the CV scored it); 'grid' (age models, D70) integrates the age latent z0 on the
-    exact grid and the rest by draws (nimiwae70.posterior_grid)."""
+    exact grid and the rest by draws (nimiwae70.posterior_grid).
+    D81: per-tree point summaries shrink old trees toward the middle (80+ yr: median bias about -18 yr); never build age distributions or cohort
+    birth dates from them, use sample_lineages (docs/NIMIWAE_AGE_LIMITS.md)."""
     w_int = w_int or {'pre': (1.0, 1.0), 'post': (1.0, 1.0)}
     keys = ('pE', 'pDie', 'pCut', 'lD_u', 'lD_raw', 'BA_raw', 'lD', 'lH', 'q10', 'q90', 'BA', 'in_span')
     out = {k: [] for k in keys}
@@ -509,7 +511,9 @@ def sample_lineages(model, B, n_draws=10, K=100, bs=512, age=None):
     """Coherent lineage draws (the cohort product): (z_k, end e, cause f) from the posterior; existence = (latent DIA >= the smallest
     tally level) and t < e — one appearance, at most one end; DIA / HT bounded by the tree's own measurements; NaN outside the span.
     age: 'grid' (the default for age models, D70) draws the age latent from its exact grid posterior jointly with the rest, so each lineage's
-    existence and its ages (output 'age', years at every slot) come from one coherent draw; 'draws' uses importance draws for every latent."""
+    existence and its ages (output 'age', years at every slot) come from one coherent draw; 'draws' uses importance draws for every latent.
+    D81: these draws are what age products must use: they reproduce the old tail (trees > 80 yr observed 1,482 vs 1,496 expected), where per-tree
+    medians keep half; age_known_bias (D79) marks trees whose prior is a known exception (docs/NIMIWAE_AGE_LIMITS.md)."""
     age = age or ('grid' if getattr(model, 'age', False) else 'draws')
     outs = {k: [] for k in ('exists', 'dia', 'ht', 'start', 'end', 'cause')}
     ar = torch.arange(T_MAX)

@@ -229,6 +229,9 @@ def summary(a):
         o['planted_cover'] = {c: ms([v['planted_field'][c]['cover80'] for v in on.values() if c in v['planted_field']]) for c in o['planted_bias']}
         gc = {f: grid_completion(a.out, int(f[1:]), e) for f in on}; gc = {f: v for f, v in gc.items() if v}
         o['grid_completion'] = {x: ms([v[x] for v in gc.values()]) for x in ('mae_lD', 'E1', 'E2', 'E3')} if gc else None   # D77, reported
+        if a.data:                                                                        # D81: the documented old-tree limitation, re-measured every run
+            gf = [f'{a.out}/{f}_age1/g1_e{e}.parquet' for f in sorted(on)]; gf = [x for x in gf if os.path.exists(x)]
+            if gf: o['age_limits'] = S.age_limits(pd.concat([pd.read_parquet(x) for x in gf]), a.data)
         if BL:                                                                            # the same folds as the joint scores, and the same trees (checked)
             o['baselines'] = {}
             for nm in ('G1', 'G1_d70'):

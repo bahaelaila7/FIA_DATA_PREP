@@ -95,3 +95,31 @@ def baselines(data, folds, nf):
             out[nm][str(f)] = dict(n=len(h), training_mean=mae(np.full(len(t), o.truth.mean())), training_median=mae(np.full(len(t), o.truth.median())),
                                    species_median=mae(sp), species_dia_median=mae(spd), direct_prior=mae(np.exp(h.af_mu)), current_ages=mae(h.estimated_age))
     return out
+
+AGE_CLASSES = [0, 20, 40, 60, 80, 1000]                         # true age (yr), for the old-tree limitation (D81)
+SP_GROUPS = {'loblolly': (131,), 'slash': (111,), 'shortleaf + Virginia pine': (110, 132), 'longleaf': (121,), 'yellow-poplar': (621,), 'sweetgum': (611,),
+             'white oak': (802,), 'other oaks': tuple(c for c in range(800, 900) if c != 802)}
+OLD = 60.0
+
+def _p_above(a, q10, q50, q90):
+    """P(age > a) under a two-piece lognormal through the posterior's 10 / 50 / 90 % points"""
+    from scipy.stats import norm
+    mu, x = np.log(q50), np.log(a); sl = (mu - np.log(np.clip(q10, 0.5, None))) / 1.2816; su = (np.log(q90) - mu) / 1.2816
+    return np.where(x >= mu, 1 - norm.cdf((x - mu) / su), 1 - norm.cdf((x - mu) / sl))
+
+def age_limits(rows, data):
+    """D81: the documented old-tree limitation, re-measured on a run's scored G1 rows (truth, q10 / q50 / q90; the frame gives the species).
+    -> by true-age class (MAE, median bias, share above the 90 % limit), old trees (>= OLD) by species group, and the population tail: trees older
+    than A observed vs expected from the posteriors vs counted from the medians"""
+    k = M.K_ + ['invyr']
+    sp = pd.read_parquet(f'{data}/seq.parquet', columns=k + ['spcd', 'slot_kind'], filters=[('split', '==', 'train')])
+    g = rows.merge(sp[sp.slot_kind == 'real'][k + ['spcd']].drop_duplicates(k), on=k, how='left'); e = g.q50 - g.truth
+    cls = pd.cut(g.truth, AGE_CLASSES, right=False)
+    by_age = {str(c): dict(n=int(len(x)), mae=float(e[x.index].abs().mean()), bias=med(e[x.index]), above_q90=float((x.truth > x.q90).mean()), below_q10=float((x.truth < x.q10).mean()))
+              for c, x in g.groupby(cls, observed=True)}
+    o = g.truth >= OLD
+    by_sp = {nm: dict(n=int((o & g.spcd.isin(s)).sum()), mae=float(e[o & g.spcd.isin(s)].abs().mean()) if (o & g.spcd.isin(s)).any() else None,
+                      bias=med(e[o & g.spcd.isin(s)]), median_truth=med(g.truth[o & g.spcd.isin(s)])) for nm, s in SP_GROUPS.items()}
+    tail = {str(A): dict(observed=int((g.truth > A).sum()), expected_from_posteriors=float(_p_above(A, g.q10, g.q50, g.q90).sum()), from_medians=int((g.q50 > A).sum()))
+            for A in (40, 60, 80, 100)}
+    return dict(n=int(len(g)), by_true_age=by_age, old_by_species=by_sp, tail=tail, calibration_by_prediction_decile=[med((x.truth - x.q50)) for _, x in g.groupby(pd.qcut(g.q50, 10, labels=False))])
