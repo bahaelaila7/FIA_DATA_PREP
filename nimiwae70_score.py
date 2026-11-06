@@ -102,10 +102,10 @@ SP_GROUPS = {'loblolly': (131,), 'slash': (111,), 'shortleaf + Virginia pine': (
 OLD = 60.0
 
 def _p_above(a, q10, q50, q90):
-    """P(age > a) under a two-piece lognormal through the posterior's 10 / 50 / 90 % points"""
-    from scipy.stats import norm
-    mu, x = np.log(q50), np.log(a); sl = (mu - np.log(np.clip(q10, 0.5, None))) / 1.2816; su = (np.log(q90) - mu) / 1.2816
-    return np.where(x >= mu, 1 - norm.cdf((x - mu) / su), 1 - norm.cdf((x - mu) / sl))
+    """P(age > a) under a two-piece lognormal through the posterior's 10 / 50 / 90 % points (torch's normal CDF: the bundle has no scipy)"""
+    cdf = lambda v: torch.special.ndtr(torch.as_tensor(np.asarray(v, np.float64))).numpy()
+    mu, x = np.log(np.asarray(q50, float)), np.log(a); sl = (mu - np.log(np.clip(np.asarray(q10, float), 0.5, None))) / 1.2816; su = (np.log(np.asarray(q90, float)) - mu) / 1.2816
+    return np.where(x >= mu, 1 - cdf((x - mu) / su), 1 - cdf((x - mu) / sl))
 
 def age_limits(rows, data):
     """D81: the documented old-tree limitation, re-measured on a run's scored G1 rows (truth, q10 / q50 / q90; the frame gives the species).
