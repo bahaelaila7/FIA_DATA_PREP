@@ -110,39 +110,72 @@ def main(a):
     allp = fit_cr(st.total.to_numpy(), st.ht.to_numpy())
     crp = lambda d: np.array([cr_inv(h, *cr.get(g, allp)) for h, g in zip(d.ht, d.spgrpcd)])
     R['CR'] = dict(groups=len(cr), site_val=score(crp(va[va.source == 'site']), va[va.source == 'site'].total.to_numpy()), G1=score(crp(ln), ln.total.to_numpy()))
-    # boosted
+    # boosted. D79: with --planted-model 1, model P (R4 records in a planted condition: planted site records + field ages) serves those records and
+    # model N (every record but the field ages: the D78 baseline fit) everything else
+    split_p = bool(a.planted_model)
+    def models(cols):
+        return {'N': Fitted(tr[tr.source != 'fld'] if split_p else tr, cols)} | ({'P': Fitted(tr[is_planted_r4(tr)], cols)} if split_p else {})
+    def routed(mods, d, crossfit=False):
+        """(mu, sd) on log age for the rows of d, each from its model"""
+        mu, sd = np.zeros(len(d)), np.zeros(len(d)); usep = is_planted_r4(d) if 'P' in mods else np.zeros(len(d), bool)
+        for nm, ix in (('N', ~usep), ('P', usep)):
+            if ix.any(): mu[ix], sd[ix] = mods[nm].pred(d[ix], crossfit)
+        return mu, sd
     def run(cols, name):
-        Xt, Xv, Xl, Xf = encode(tr, [va, ln, vr], cols); cats = [cols.index(x) for x in CAT]
-        yt = np.log(tr.total_fit.to_numpy()); fold = (pd.util.hash_pandas_object(tr.plot_key, index=False).to_numpy() % 2).astype(int); oof = np.zeros(len(tr))
-        for k_ in (0, 1): oof[fold == k_] = fit(Xt[fold != k_], yt[fold != k_], cats).predict(Xt[fold == k_])
-        m = fit(Xt, yt, cats); s = fit(Xt, np.log((yt - oof) ** 2 + 1e-4), cats)
-        def pr(X):
-            # a booster on log r^2 estimates E log r^2 = log var - 1.27 for a normal residual, so var = exp(pred + 1.27)
-            mu = m.predict(X); sd = np.sqrt(np.exp(s.predict(X) + 1.2704)); return np.exp(mu), np.exp(mu - 1.2816 * sd), np.exp(mu + 1.2816 * sd)
-        pv, lv, hv = pr(Xv); pl_, ll, hl = pr(Xl); v = va.assign(p=pv, lo=lv, hi=hv); pf, lf, hf = pr(Xf); xf = vr.assign(p=pf, lo=lf, hi=hf)
+        mods = models(cols)
+        def pr(d):
+            mu, sd = routed(mods, d); return np.exp(mu), np.exp(mu - 1.2816 * sd), np.exp(mu + 1.2816 * sd)
+        pv, lv, hv = pr(va); pl_, ll, hl = pr(ln); v = va.assign(p=pv, lo=lv, hi=hv); pf, lf, hf = pr(vr); xf = vr.assign(p=pf, lo=lf, hi=hf)
         transfer = {c: dict(n=len(g), field=float(g.fld.median()), bias=float((g.p - g.fld).median()), cover80=float(((g.fld >= g.lo) & (g.fld <= g.hi)).mean())) for c, g in xf.groupby('cls')}
         G2 = {s_: score(g.p.to_numpy(), g.total.to_numpy(), g.lo.to_numpy(), g.hi.to_numpy()) for s_, g in v.groupby('source')}
         w = v[v.west == 1]; crown = {int(c_): score(g.p.to_numpy(), g.total.to_numpy()) for c_, g in w.groupby('cc')}
-        sm = w[(w.dia >= 1) & (w.dia < 5)]; st_ = sm[sm.source == 'tot']
-        R[name] = dict(G1=score(pl_, ln.total.to_numpy(), ll, hl), G2=G2, G2_crown=crown, G3=score(sm.p.to_numpy(), sm.total.to_numpy()), G3_tot=score(st_.p.to_numpy(), st_.total.to_numpy()),
-                       max_pred_linked=float(pl_.max()), transfer=transfer)
-    run(NUM + CAT, 'f'); run(NUM + ['planted'] + CAT, 'f+p')
+        sm = w[(w.dia >= 1) & (w.dia < 5)]; st_ = sm[sm.source == 'tot']; lp = is_planted_r4(ln)
+        R[name] = dict(G1=score(pl_, ln.total.to_numpy(), ll, hl), G1_planted=score(pl_[lp], ln.total.to_numpy()[lp]), G1_natural=score(pl_[~lp], ln.total.to_numpy()[~lp]),
+                       G2=G2, G2_crown=crown, G3=score(sm.p.to_numpy(), sm.total.to_numpy()), G3_tot=score(st_.p.to_numpy(), st_.total.to_numpy()),
+                       max_pred_linked=float(pl_.max()), transfer=transfer, models={k: int(len(m.oof)) for k, m in mods.items()})
+        return mods
+    run(NUM + CAT, 'f'); mods = run(NUM + ['planted'] + CAT, 'f+p')
     if a.export:                                                                     # D70 am. 12: prior on log total age at live records: f+p, read from one record, so no hidden record feeds it
-        cols = NUM + ['planted'] + CAT; sq = pd.read_parquet(f'{a.data}/seq.parquet')
+        sq = pd.read_parquet(f'{a.data}/seq.parquet')
         keep = (sq.slot_kind == 'real') & (sq.dia > 0) & (sq.ht > 0) & ~(pd.to_datetime(sq.measdate) >= pd.to_datetime(sq.dead_md)); real = features(sq[keep].assign(west=False, cc=lambda d: d.cclcd, planted=lambda d: (d[ORIGIN(d)] == 1).astype(int)))
-        maps = {c: {v: i for i, v in enumerate(sorted(tr[c].dropna().unique()))} for c in CAT}
-        enc = lambda d: d[cols].assign(**{c: d[c].map(maps[c]).astype(float) for c in CAT}); Xt = enc(tr); cats = [cols.index(x) for x in CAT]; yt = np.log(tr.total_fit.to_numpy())
-        hash2 = lambda d: (pd.util.hash_pandas_object(d.plot_key, index=False).to_numpy() % 2).astype(int)
-        fold = hash2(tr); oof = np.zeros(len(tr)); mk = {}
-        for k_ in (0, 1): mk[k_] = fit(Xt[fold != k_], yt[fold != k_], cats); oof[fold == k_] = mk[k_].predict(Xt[fold == k_])
-        m = fit(Xt, yt, cats); s_ = fit(Xt, np.log((yt - oof) ** 2 + 1e-4), cats); Xr = enc(real); mu = m.predict(Xr); fr = hash2(real)
-        isT = (real.split == 'train').to_numpy()                                     # train plots take the fold that left them out, so a frame tree never sees its own age record
-        for k_ in (0, 1): mu[isT & (fr == k_)] = mk[k_].predict(Xr[isT & (fr == k_)])
-        tr[[c for c in K7 + ['source', 'plot_key', 'spcd', 'dia', 'a_obs', 'total_fit'] if c in tr]].assign(mu_oof=oof).to_parquet(f'{a.data}/age_oof.parquet')   # D78: the sapling test
-        sq['af_mu'] = np.nan; sq['af_sd'] = np.nan; sq.loc[real.index, 'af_mu'] = mu; sq.loc[real.index, 'af_sd'] = np.sqrt(np.exp(s_.predict(Xr) + 1.2704)); sq.to_parquet(f'{a.data}/seq.parquet')
-        print('exported', int(sq.af_mu.notna().sum()), 'of', int((sq.slot_kind == 'real').sum()), 'real slots; median age', round(float(np.exp(sq.af_mu.median())), 1), 'median sd', round(float(sq.af_sd.median()), 3))
+        mu, sd = routed(mods, real, crossfit=True)                                   # train plots take the fold that left them out, so a frame tree never sees its own age record
+        pd.concat([m.trs[[c for c in K7 + ['source', 'plot_key', 'spcd', 'dia', 'a_obs', 'total_fit'] if c in m.trs]].assign(mu_oof=m.oof, model=k) for k, m in mods.items()],
+                  ignore_index=True).to_parquet(f'{a.data}/age_oof.parquet')     # D78: the sapling test (out-of-fold log age of every training record, by model)
+        sq['af_mu'] = np.nan; sq['af_sd'] = np.nan; sq.loc[real.index, 'af_mu'] = mu; sq.loc[real.index, 'af_sd'] = sd
+        if split_p: sq['af_model'] = None; sq.loc[real.index, 'af_model'] = np.where(is_planted_r4(real), 'P', 'N')   # D79: which direct model gave the prior
+        sq.to_parquet(f'{a.data}/seq.parquet')
+        print('exported', int(sq.af_mu.notna().sum()), 'of', int((sq.slot_kind == 'real').sum()), 'real slots; median age', round(float(np.exp(sq.af_mu.median())), 1), 'median sd', round(float(sq.af_sd.median()), 3),
+              ('; by model ' + str(sq.af_model.value_counts().to_dict())) if split_p else '')
     json.dump(R, open(a.out, 'w'), indent=1, default=float); print(json.dumps(R, indent=0, default=float))
 
+
+def hash2(d):
+    return (pd.util.hash_pandas_object(d.plot_key, index=False).to_numpy() % 2).astype(int)
+
+def is_planted_r4(d):
+    """D79: R4 records in a planted condition (west 0: R4 site, field-age and frame records; planted from the record's own condition)"""
+    return ((d.planted == 1) & (d.west.astype(int) == 0)).to_numpy()
+
+class Fitted:
+    """one direct model on the training records trs: the booster on log total age (fit_total), its 2-fold cross-fit by plot (oof, and the fold models
+    that serve TRAIN-plot frame records), and the width booster on the out-of-fold squared log residual"""
+    def __init__(s, trs, cols):
+        s.trs, s.cols = trs, cols; s.maps = {c: {v: i for i, v in enumerate(sorted(trs[c].dropna().unique()))} for c in CAT}; s.cats = [cols.index(x) for x in CAT]
+        X = s.enc(trs); y = np.log(trs.total_fit.to_numpy()); f = hash2(trs); s.oof = np.zeros(len(trs)); s.mk = {}
+        for k in (0, 1): s.mk[k] = fit(X[f != k], y[f != k], s.cats); s.oof[f == k] = s.mk[k].predict(X[f == k])
+        s.m = fit(X, y, s.cats); s.s = fit(X, np.log((y - s.oof) ** 2 + 1e-4), s.cats)
+    def enc(s, d):
+        return d[s.cols].assign(**{c: d[c].map(s.maps[c]).astype(float) for c in CAT})
+    def pred(s, d, crossfit=False):
+        """(mu, sd) of log age; crossfit: rows on TRAIN plots take the fold model that left their plot out. A booster on log r^2 estimates
+        E log r^2 = log var - 1.27 for a normal residual, so var = exp(pred + 1.27)."""
+        X = s.enc(d); mu = s.m.predict(X)
+        if crossfit:
+            f = hash2(d); t = (d.split == 'train').to_numpy()
+            for k in (0, 1):
+                ix = t & (f == k)
+                if ix.any(): mu[ix] = s.mk[k].predict(X[ix])
+        return mu, np.sqrt(np.exp(s.s.predict(X) + 1.2704))
 
 def field_records(seq, planted):
     """D78: planted field ages as direct-prior targets. Live real records on TRAIN plots in a planted condition (the record's own STDORGCD 1) that carry the
@@ -187,5 +220,6 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     for x in ('--data', '--fiadb', '--db', '--out'): ap.add_argument(x)
     ap.add_argument('--selftest', action='store_true'); ap.add_argument('--export', action='store_true'); ap.add_argument('--fld', type=int, default=0)
-    ap.add_argument('--targets-default', action='store_true'); ap.add_argument('--compare'); a = ap.parse_args()
+    ap.add_argument('--targets-default', action='store_true'); ap.add_argument('--compare'); ap.add_argument('--planted-model', type=int, default=0); a = ap.parse_args()
+    assert not (a.planted_model and not a.fld), 'D79: the planted model needs the field-age records (--fld 1)'
     selftest() if a.selftest else compare(a.out, a.compare) if a.compare else main(a)

@@ -40,6 +40,8 @@ RATE_FLOOR = 0.02                        # D74: in / yr; an observed DIA change 
 COUPLE_MIN_DIA = 5.0                     # D74: no coupling below 5 in at the prior's slot (no R4 sapling has an age)
 COUPLE_MIN_YEARS = 1.0                   # D74: a growth rate needs measured DIA at least this far apart
 WEST_RATIO = {4: 0.61, 5: 0.43}          # D74: coupling strength of intermediate / overtopped relative to classes 1-3 (western BHAGE, 229k trees)
+SAP_DELTA = -0.1689                      # D78: sapling coupling per log (in / yr), western whorl saplings (nimiwae_sapling_coupling.py; CI -0.204 to -0.135)
+SAP_RATE = (0.02, 0.1518)                # D78: its calibration's 1-99 % rate range (in / yr): sapling rates are clamped to it, no extrapolation
 MISS_DIA = (5.0, 7.0)                    # D76: G_MAX comes from the measured growth of trees this size (just above the subplot limit)
 MISS_Q = 0.99                            # D76: G_MAX = this quantile of their annual DIA growth
 
@@ -144,14 +146,26 @@ def coupling_eligible(B):
     """trees the coupling applies to: a prior, an observed growth rate, DIA >= 5 in and a crown class at the prior's slot"""
     return (B['af_has'] > 0) & (B['has_rate'] > 0) & (B['dia_la'] >= COUPLE_MIN_DIA) & (B['cc_la'] >= 1) & (B['cc_la'] <= 5)
 
+def sapling_eligible(B):
+    """D78: saplings the sapling coupling applies to: a prior, an observed growth rate, 0 < DIA < 5 in at the prior's slot"""
+    return (B['af_has'] > 0) & (B['has_rate'] > 0) & (B['dia_la'] > 0) & (B['dia_la'] < COUPLE_MIN_DIA)
+
+def sapling_x(B, cp):
+    """the clamped log rate the sapling coupling reads"""
+    return B['lrate'].clamp(cp['sapling']['lo'], cp['sapling']['hi'])
+
 def apply_coupling(B, cp):
-    """log a_l = af_mu + delta_c (lrate - m_c) + af_sd w_c z0 on eligible trees; others unchanged"""
+    """log a_l = af_mu + delta_c (lrate - m_c) + af_sd w_c z0 on eligible trees; others unchanged. D78: with cp['sapling'], saplings get
+    delta_s (clamp(lrate) - m_s) and no width change"""
     el = coupling_eligible(B); c = B['cc_la'].clamp(0, 5)
     dl = torch.tensor([0.0] + [cp['delta'][str(k)] for k in range(1, 6)]); mm = torch.tensor([0.0] + [cp['m'][str(k)] for k in range(1, 6)]); ww = torch.tensor([1.0] + [cp['w'][str(k)] for k in range(1, 6)])
     B['af_shift'] = torch.where(el, dl[c] * (B['lrate'] - mm[c]), torch.zeros_like(B['af_mu']))
     B['af_sdf'] = torch.where(el, ww[c], torch.ones_like(B['af_sd']))
+    if 'sapling' in cp:
+        es = sapling_eligible(B); sp = cp['sapling']
+        B['af_shift'] = torch.where(es, sp['delta'] * (sapling_x(B, cp) - sp['m']), B['af_shift'])
 
-def calibrate_coupling(B, log=print):
+def calibrate_coupling(B, log=print, sapling=False):
     """D74: fixed coupling from the anchors in B (fit plots), before training; nothing here is learned in the joint.
     Total age at la from each anchor: AGEDIA + l0 - (t_anchor - t_la). Regress log total age - af_mu on the log rate (classes 1-3 pooled): delta, and the
     width factor w = residual sd with the rate / without. Classes 4, 5: delta x WEST_RATIO, w = 1. m_c = mean log rate of every eligible tree of class c,
@@ -168,6 +182,11 @@ def calibrate_coupling(B, log=print):
     cp = dict(delta={str(k): d for k in (1, 2, 3)} | {str(k): d * WEST_RATIO[k] for k in (4, 5)}, w={str(k): w for k in (1, 2, 3)} | {'4': 1.0, '5': 1.0},
               m={str(k): float(B['lrate'][el & (B['cc_la'] == k)].double().mean()) if bool((el & (B['cc_la'] == k)).any()) else 0.0 for k in range(1, 6)},
               n_anchor_rows=int(len(y)), n_anchor_trees=int(len(torch.unique(ti))), intercept=float(b[0]), rate_floor=RATE_FLOOR)
+    if sapling:                                                                         # D78: fixed delta from the western test; m_s from these fit trees
+        cs = dict(sapling=dict(delta=SAP_DELTA, lo=math.log(SAP_RATE[0]), hi=math.log(SAP_RATE[1]), m=0.0)); es = sapling_eligible(B)
+        assert int(es.sum()) >= 200, f'too few saplings with a rate: {int(es.sum())}'
+        cs['sapling']['m'] = float(sapling_x(B, cs)[es].double().mean()); cs['sapling']['n'] = int(es.sum()); cp |= cs
+        log(f'D78 sapling coupling: delta {SAP_DELTA:+.4f}, rate clamped to {SAP_RATE}, m_s {cs["sapling"]["m"]:.3f} over {cs["sapling"]["n"]:,} saplings')
     log(f'D74 coupling calibrated on {cp["n_anchor_rows"]:,} anchor rows ({cp["n_anchor_trees"]:,} trees): delta {d:+.3f} per log (in / yr), width factor {w:.3f}, '
         f'intercept {b[0]:+.3f}; m by class {", ".join(f"{k}: {v:.2f}" for k, v in cp["m"].items())}')
     return cp
@@ -391,7 +410,7 @@ def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
 def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None, d74=False,
-          state_path=None, d76=False):
+          state_path=None, d76=False, sapling=False):
     """state_path: after every completed epoch (and its hook) the full training state is saved there; if the file exists, training resumes after its
     epoch. It holds the parameters, the optimizer (and scheduler) state, the batch-order and noise RNG states and the history, plus a fingerprint of the
     setup; a different setup refuses to resume."""
@@ -401,7 +420,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
     if d74: assert 'htcd' in tr, 'D74 needs HTCD in the fitting rows'                         # both arms: the height model (G6, G8 compare like with like)
     if d74 and age:                                                                          # age on: anchors and the coupling, calibrated once on every fit tree, before any subsample
         assert 'anc_agedia' in tr, 'D74 age on needs anchors in the fitting rows'
-        vocab['age_coupling'] = calibrate_coupling(B, log=log); apply_coupling(B, vocab['age_coupling'])
+        vocab['age_coupling'] = calibrate_coupling(B, log=log, sapling=sapling); apply_coupling(B, vocab['age_coupling'])
         log(f'D74 coupling shifts {int((B["af_shift"] != 0).sum()):,} of {n:,} trees (mean shift {float(B["af_shift"][B["af_shift"] != 0].mean()):+.3f}); anchors on {int((B["anc_m"].sum(1) > 0).sum()):,} trees')
     else:
         assert float(B['anc_m'].sum()) == 0, 'anchors in the fitting rows without D74 age on'

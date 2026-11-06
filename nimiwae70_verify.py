@@ -310,6 +310,14 @@ Bx['real'][x0 + 300:, 0] = 1
 check('D76: calibration ignores coded, partly sampled, microplot-level and previously recorded debuts', abs(A.calibrate_miss(Bx, log=lambda *_: None) - eps19) < 1e-12)
 B19m = {k: v.clone() for k, v in B19.items()}; B19m['llim'][0, 0] = B19m['lex'][0, 0]; A.apply_miss(B19m, 0.02)
 check('D76: no factor at a pre-debut microplot-level slot', float(B19m['miss_keep'][0, 0]) == 1.0 and float(B19m['miss_keep'][0, 1]) < 1.0)
+# 20. D78 sapling coupling (off by default): delta_s (clamp(lrate) - m_s) on saplings with a prior and a rate, nothing elsewhere
+B20 = dict(af_has=torch.ones(4), has_rate=torch.tensor([1.0, 1.0, 0.0, 1.0]), dia_la=torch.tensor([2.0, 4.9, 3.0, 6.0]), cc_la=torch.tensor([3, 3, 3, 3]),
+           lrate=torch.log(torch.tensor([0.01, 0.5, 0.05, 0.05])) * torch.tensor([1.0, 1.0, 0.0, 1.0]), af_mu=torch.zeros(4), af_sd=torch.ones(4))
+z20 = dict(delta={str(c): 0.0 for c in range(1, 6)}, w={str(c): 1.0 for c in range(1, 6)}, m={str(c): 0.0 for c in range(1, 6)})
+A.apply_coupling(B20, z20); off20 = B20['af_shift'].clone()
+A.apply_coupling(B20, z20 | dict(sapling=dict(delta=-0.2, lo=math.log(0.02), hi=math.log(0.15), m=-3.0)))
+want20 = torch.tensor([-0.2 * (math.log(0.02) + 3.0), -0.2 * (math.log(0.15) + 3.0), 0.0, 0.0])
+check('D78 sapling coupling: off by default, clamped formula on eligible saplings only', float(off20.abs().max()) == 0.0 and float((B20['af_shift'] - want20).abs().max()) < 1e-6)
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()

@@ -86,7 +86,7 @@ def load_state(path, fingerprint, model, optimizer, rng):
 
 
 def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='sf', on_epoch=None,
-          q='gauss', flow=None, d74=False, state_path=None, d76=False):
+          q='gauss', flow=None, d74=False, state_path=None, d76=False, sapling=False):
     """nimiwae70.train with this step. Returns (a PyTorch NIMIWAE70 with the averaged weights, the history). `device` is where the PyTorch model the
     hook scores lives; JAX trains on its default device. state_path: after every completed epoch (and its hook) the full training state is saved
     there, and an existing file resumes training after its epoch (the setup must match the saved fingerprint)."""
@@ -98,7 +98,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
     if d74: assert 'htcd' in tr, 'D74 needs HTCD in the fitting rows'
     if d74 and age:
         assert 'anc_agedia' in tr, 'D74 age on needs anchors in the fitting rows'
-        vocab['age_coupling'] = A.calibrate_coupling(B, log=log); A.apply_coupling(B, vocab['age_coupling'])
+        vocab['age_coupling'] = A.calibrate_coupling(B, log=log, sapling=sapling); A.apply_coupling(B, vocab['age_coupling'])
         log(f'D74 coupling shifts {int((B["af_shift"] != 0).sum()):,} of {n:,} trees; anchors on {int((B["anc_m"].sum(1) > 0).sum()):,} trees')
     else:
         assert float(B['anc_m'].sum()) == 0, 'anchors in the fitting rows without D74 age on'

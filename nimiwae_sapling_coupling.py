@@ -8,13 +8,19 @@ written by nimiwae_age_direct.py --export). The growth rate comes from consecuti
 annual visit of its plot where it is live with DIA at breast height), never from PREVDIA (often equal to DIA at a first annual visit). Rate per year,
 at least COUPLE_MIN_YEARS apart, floored at RATE_FLOOR (D74). y = log TOTAGE - prior log age, x = log rate.
 The mechanism holds (pre-registered, D78) if delta < 0 with a 95 % plot-bootstrap interval excluding 0, AND out of fold (5 folds by plot) the shift
-delta (x - m) lowers the MAE in years in >= 4 of 5 folds, AND the pooled improvement is >= 2 %."""
+delta (x - m) lowers the MAE in years in >= 4 of 5 folds, AND the pooled improvement is >= 2 %.
+
+  python -I nimiwae_sapling_coupling.py --judge --data FRAME --out judge.json
+The D78 judge of the extension (nimiwae70.SAP_DELTA / SAP_RATE) on R4: TRAIN planted saplings (field age, DIA < 5 in at the record), the prior read alone
+(the posterior equals it there, D77) with and without the sapling shift; m_s over a fixed 20 % of TRAIN plots, both origins, as training computes it.
+Per DIA class 1-3 / 3-5 in: |bias| may grow by at most JUDGE_BIAS yr and 80 % coverage fall by at most JUDGE_COVER."""
 import sys, os, json, argparse, zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pandas as pd
 
 RATE_FLOOR, COUPLE_MIN_YEARS = 0.02, 1.0           # as nimiwae70 (D74)
 NF, NBOOT, MIN_FOLDS, MIN_GAIN = 5, 1000, 4, 0.02
+JUDGE_BIAS, JUDGE_COVER, M_FRAC = 0.25, 0.02, 0.20
 K6 = ['statecd', 'unitcd', 'countycd', 'plot', 'subp', 'tree']; K7 = K6 + ['invyr']
 MD = "MAKE_DATE(P.MEASYEAR::INT, COALESCE(NULLIF(P.MEASMON::INT, 0), 6), COALESCE(NULLIF(P.MEASDAY::INT, 0), 15))"
 
@@ -73,6 +79,29 @@ def main(a):
     print('mechanism holds (D78 rule):', R['holds'])
 
 
+def judge(a):
+    import torch, nimiwae56 as M, nimiwae70 as A
+    seq = pd.read_parquet(f'{a.data}/seq.parquet', filters=[('split', '==', 'train')]); pl = pd.read_parquet(f'{a.data}/planted_refs.parquet')
+    keys = pd.Series(sorted(seq.plot_key.unique()))
+    Bm, _, _ = A.build(seq[seq.plot_key.isin(set(keys.sample(frac=M_FRAC, random_state=0)))])
+    cs = dict(sapling=dict(delta=A.SAP_DELTA, lo=float(np.log(A.SAP_RATE[0])), hi=float(np.log(A.SAP_RATE[1])), m=0.0)); es = A.sapling_eligible(Bm)
+    cs['sapling']['m'] = float(A.sapling_x(Bm, cs)[es].double().mean())
+    zero = dict(delta={str(c): 0.0 for c in range(1, 6)}, w={str(c): 1.0 for c in range(1, 6)}, m={str(c): 0.0 for c in range(1, 6)})
+    p = pl.merge(seq[seq.slot_kind == 'real'][K7 + ['dia', 'plot_key']], on=K7); p = p[(p.dia > 0) & (p.dia < 5)]
+    B, vocab, sq = A.build(seq[seq.plot_key.isin(set(p.plot_key))]); m = A.make_model(vocab, age=True)
+    pos = sq[K7 + ['_tid', '_pos']].drop_duplicates(K7); p = p.merge(pos, on=K7); ti, po = p._tid.to_numpy(), p._pos.to_numpy()
+    out = {}
+    for nm, cp in (('without', zero), ('with', zero | cs)):
+        A.apply_coupling(B, cp); z = torch.zeros(3, B['v'].shape[0], M.DZ); z[0, :, 0], z[2, :, 0] = -1.2816, 1.2816
+        with torch.no_grad(): q = m.ages(z, B).numpy()[:, ti, po]
+        d = p.assign(q10=q[0], q50=q[1], q90=q[2], shifted=(A.sapling_eligible(B).numpy()[ti]), cls=pd.cut(p.dia, [0, 3, 5], right=False).astype(str))
+        out[nm] = {c: dict(n=int(len(g)), shifted=float(g.shifted.mean()), bias=float((g.q50 - g.fld).median()), cover80=float(((g.fld >= g.q10) & (g.fld <= g.q90)).mean()))
+                   for c, g in d.groupby('cls')}
+    ok = {c: bool(abs(out['with'][c]['bias']) - abs(out['without'][c]['bias']) <= JUDGE_BIAS and out['with'][c]['cover80'] >= out['without'][c]['cover80'] - JUDGE_COVER) for c in out['with']}
+    R = dict(m_s=cs['sapling']['m'], m_s_saplings=int(es.sum()), classes=out, ok=ok, passes=bool(all(ok.values())))
+    json.dump(R, open(a.out, 'w'), indent=1); print(json.dumps(R, indent=1)); print('D78 sapling extension judge:', 'PASS' if R['passes'] else 'FAIL')
+
+
 def selftest():
     g = np.random.default_rng(1); n = 4000
     d = pd.DataFrame(dict(plot_key=[f'p{i // 4}' for i in range(n)], x=g.normal(-3.4, 0.6, n), mu=np.log(30) + g.normal(0, 0.1, n)))
@@ -85,5 +114,5 @@ def selftest():
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(); ap.add_argument('--data'); ap.add_argument('--fiadb'); ap.add_argument('--out'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
-    selftest() if a.selftest else main(a)
+    ap = argparse.ArgumentParser(); ap.add_argument('--data'); ap.add_argument('--fiadb'); ap.add_argument('--out'); ap.add_argument('--selftest', action='store_true'); ap.add_argument('--judge', action='store_true'); a = ap.parse_args()
+    selftest() if a.selftest else judge(a) if a.judge else main(a)
