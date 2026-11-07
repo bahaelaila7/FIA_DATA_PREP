@@ -178,12 +178,12 @@ def sub(B, ix): return {k: v[ix] for k, v in B.items()}
 class Static(nn.Module):
     """Per-tree statics -> 64-d token. use_summ: the per-tree record summaries (species revised, damage / broken / cull ever recorded) are
     functions of the tree's OWN record sequence (they leak its survival: D55 am. 4) -> encoder only, never the prior / decoder."""
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, use_summ=True):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, use_summ=True, d=D_MODEL):
         super().__init__()
         s.use_summ = use_summ
         s.e = nn.ModuleList([nn.Embedding(nsp + 1, 8), nn.Embedding(nl3 + 1, 4), nn.Embedding(nmaj + 1, 2), nn.Embedding(nfty + 1, 4),
                              nn.Embedding(8, 3), nn.Embedding(50, 3), nn.Embedding(nspc + 1, 8)])   # + species (resolved SPCD); unseen -> 0
-        s.out = nn.Linear(8 + 4 + 2 + 4 + 3 + 3 + 8 + 9 + (NSUMM if use_summ else 0), D_MODEL)
+        s.out = nn.Linear(8 + 4 + 2 + 4 + 3 + 3 + 8 + 9 + (NSUMM if use_summ else 0), d)
     def forward(s, B):
         x = [s.e[0](B['sp']), s.e[1](B['l3']), s.e[2](B['maj']), s.e[3](B['fty']), s.e[4](B['scl']), s.e[5](B['phy']), s.e[6](B['spc']), B['snum']]
         return s.out(torch.cat(x + ([B['summ']] if s.use_summ else []), -1))
@@ -197,18 +197,18 @@ NQ = 15 + len(EV) + len(MODE)
 class NIMIWAE56(nn.Module):
     """censor: 'known' (FIA design rule as an observed inequality, no learned missingness) | 'mar' (existence labels only).
     growth: 'flex' (per-slot increments from the decoder on z + context) | 'struct' (Δt · exp(vigour(z) + g(size, species) + c(context)))."""
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=True, prior_ctx=False):
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=True, prior_ctx=False, d_model=D_MODEL, layers=2):
         super().__init__()
         assert censor in ('known', 'mar') and growth in ('flex', 'struct')
         s.censor, s.growth, s.noise, s.prior_ctx = censor, growth, noise, prior_ctx
-        d = D_MODEL
-        s.st_q = Static(nsp, nl3, nmaj, nfty, nspc); s.ercd = nn.Embedding(10, 4); s.ecc = nn.Embedding(6, 3)
-        s.qin = nn.Linear(NCOV + NQ + 4 + 3 + NDQ, d); s.qtr = tenc(d); s.qout = nn.Linear(d, 2 * DZ)
-        s.st_p = Static(nsp, nl3, nmaj, nfty, nspc, use_summ=False)                             # am. 4: no tree-own summaries
+        d = s.d_model = d_model; s.n_layers = layers                                                  # D82: width and depth (defaults: the D55-D80 network)
+        s.st_q = Static(nsp, nl3, nmaj, nfty, nspc, d=d); s.ercd = nn.Embedding(10, 4); s.ecc = nn.Embedding(6, 3)
+        s.qin = nn.Linear(NCOV + NQ + 4 + 3 + NDQ, d); s.qtr = tenc(d, layers); s.qout = nn.Linear(d, 2 * DZ)
+        s.st_p = Static(nsp, nl3, nmaj, nfty, nspc, use_summ=False, d=d)                         # am. 4: no tree-own summaries
         s.prior = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2 * DZ))
         if prior_ctx:                                                                                 # D57: prior over the known context sequence
-            s.pin = nn.Linear(NCOV, d); s.ptr = tenc(d)
-        s.din = nn.Linear(NCOV, d); s.dz = nn.Linear(DZ, d); s.dtr = tenc(d)
+            s.pin = nn.Linear(NCOV, d); s.ptr = tenc(d, layers)
+        s.din = nn.Linear(NCOV, d); s.dz = nn.Linear(DZ, d); s.dtr = tenc(d, layers)
         s.dout = nn.Linear(d, 2 + 3 + 1 + 5 + len(DMG_GROUPS) + 1 + 3)            # dD, dH (flex) | (survive, die, cut) | cr | cclcd | damage | broken | cull
         with torch.no_grad():
             s.dout.bias.zero_(); s.dout.bias[0] = -0.5; s.dout.bias[1] = 1.5; s.dout.bias[2] = 3.0
@@ -287,7 +287,7 @@ class NIMIWAE56(nn.Module):
         tok = s.st_p(B)
         h = s.din(B['cov'])[None] + s.dz(z)[:, :, None] + tok[None, :, None]
         pad = (1 - B['v']).bool()[None].expand(K, -1, -1).reshape(K * n, T_MAX)
-        o = s.dout(s.dtr(h.reshape(K * n, T_MAX, D_MODEL), src_key_padding_mask=pad)).reshape(K, n, T_MAX, -1)
+        o = s.dout(s.dtr(h.reshape(K * n, T_MAX, s.d_model), src_key_padding_mask=pad)).reshape(K, n, T_MAX, -1)
         nd = len(DMG_GROUPS)
         if s.growth == 'flex':
             dD, dH = F.softplus(o[..., 0]), F.softplus(o[..., 1])

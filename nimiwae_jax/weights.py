@@ -64,6 +64,7 @@ def pairs(m: NIMIWAE70):
 def from_torch(tm, rngs=None) -> NIMIWAE70:
     """a Flax NIMIWAE70 holding the weights of the PyTorch nimiwae70.NIMIWAE70 `tm` (same architecture, built from its attributes)"""
     assert tm.censor == 'known' and tm.growth == 'flex' and not tm.noise and not tm.prior_ctx, 'the JAX port covers the D70 configuration only'
+    assert getattr(tm, 'd_model', 64) == 64 and getattr(tm, 'n_layers', 2) == 2, 'the JAX port covers the default network only (D82)'
     sizes = (tm.st_q.e[0].num_embeddings - 1, tm.st_q.e[1].num_embeddings - 1, tm.st_q.e[2].num_embeddings - 1, tm.st_q.e[3].num_embeddings - 1, tm.st_q.e[6].num_embeddings - 1)
     flow_cfg = None
     if tm.qfam == 'flow':

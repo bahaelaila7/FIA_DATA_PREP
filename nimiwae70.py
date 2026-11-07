@@ -26,6 +26,7 @@ import nimiwae56 as M
 from nimiwae56 import T_MAX, DZ, D_MODEL, COV, sub
 from torch.func import functional_call
 import nimiwae_flow as NF
+ARCH_DEFAULT = dict(layers=2, d=64)        # D82: transformer depth (encoder and decoder) and width; feed-forward = 2 d, 4 heads
 FLOW_DEFAULT = dict(layers=6, hidden=64, bins=8, bound=5.0)
 
 SOIL_COLS = [f'soil_{c}' for c in ('clay', 'sand', 'silt', 'soc', 'bd', 'ph', 'cec', 'depth_restriction', 'rock_frag', 'depth_bedrock')]
@@ -197,9 +198,9 @@ def calibrate_coupling(B, log=print, sapling=False):
 
 class Static70(M.Static):
     """Soil joins the statics of the prior and the decoder. The encoder also reads the age prior, so it knows how close a tree sits to its birth limits."""
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, use_summ=True, use_af=False):
-        super().__init__(nsp, nl3, nmaj, nfty, nspc, use_summ); s.use_af = use_af
-        s.out = nn.Linear(s.out.in_features + NSOIL + (2 if use_af else 0), D_MODEL)
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, use_summ=True, use_af=False, d=D_MODEL):
+        super().__init__(nsp, nl3, nmaj, nfty, nspc, use_summ, d=d); s.use_af = use_af
+        s.out = nn.Linear(s.out.in_features + NSOIL + (2 if use_af else 0), d)
     def forward(s, B):
         x = [s.e[0](B['sp']), s.e[1](B['l3']), s.e[2](B['maj']), s.e[3](B['fty']), s.e[4](B['scl']), s.e[5](B['phy']), s.e[6](B['spc']), B['snum'], B['soil']]
         if s.use_af: x.append(torch.stack([B['af_mu'] + B.get('af_shift', 0.0) - AF_MU0, B['af_sd'] * B.get('af_sdf', 1.0)], -1))   # D74: the prior the model uses
@@ -207,15 +208,16 @@ class Static70(M.Static):
 
 class NIMIWAE70(M.NIMIWAE56):
     build = staticmethod(lambda seq, vocab: build(seq, vocab))                             # predictions and stand totals use the joint build
-    def __init__(s, nsp, nl3, nmaj, nfty, nspc, age=True, q='gauss', flow=None, height='gauss'):
-        super().__init__(nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=False, prior_ctx=False)
+    def __init__(s, nsp, nl3, nmaj, nfty, nspc, age=True, q='gauss', flow=None, height='gauss', arch=None):
+        ar = {**ARCH_DEFAULT, **(arch or {})}                                                  # D82: width d and transformer depth
+        super().__init__(nsp, nl3, nmaj, nfty, nspc, censor='known', growth='flex', noise=False, prior_ctx=False, d_model=ar['d'], layers=ar['layers'])
         assert q in ('gauss', 'flow') and height in ('gauss', 't')
         s.age, s.qfam, s.height = age, q, height
         if height == 't': s.lsHc = nn.Parameter(torch.full((2,), -2.0))                       # D74: log scale per height method (1 / null, 2-3)
-        s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc, use_af=age); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False)
+        s.st_q = Static70(nsp, nl3, nmaj, nfty, nspc, use_af=age, d=ar['d']); s.st_p = Static70(nsp, nl3, nmaj, nfty, nspc, use_summ=False, d=ar['d'])
         if q == 'flow':                                                                       # D73: z0 (age) stays Gaussian and separate; age off, every dimension flows
             fc = {**FLOW_DEFAULT, **(flow or {})}; s.f0 = 1 if age else 0
-            s.flow = NF.CondFlow(DZ - s.f0, D_MODEL, layers=fc['layers'], hidden=fc['hidden'], bins=fc['bins'], B=fc['bound'])
+            s.flow = NF.CondFlow(DZ - s.f0, ar['d'], layers=fc['layers'], hidden=fc['hidden'], bins=fc['bins'], B=fc['bound'])   # context = the encoder token
     def height_ll(s, lHp, B):
         """D74: Student-t log density of log HT, scale by height method"""
         if s.height != 't': return super().height_ll(lHp, B)
@@ -357,13 +359,19 @@ def z_quantiles(g, p, q):
     n_ = torch.arange(cdf.shape[0]); lo, hi = cdf[n_, i - 1], cdf[n_, i]
     return edges[i - 1] + (q_[:, None] - lo) / (hi - lo).clamp(min=1e-12) * step
 
-def make_model(vocab, age=True, q='gauss', flow=None, height='gauss'):
-    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), age=age, q=q, flow=flow, height=height)
-    m.vocab = vocab; m.cfg = dict(censor='known', growth='flex', noise=False, prior_ctx=False, age=age, q=q, height=height, **({'flow': {**FLOW_DEFAULT, **(flow or {})}} if q == 'flow' else {})); return m
+def arch_of(arch):
+    """D82: the architecture to record, None for the default (so default models, checkpoints and fingerprints are those of before D82)"""
+    ar = {**ARCH_DEFAULT, **(arch or {})}
+    return None if ar == ARCH_DEFAULT else ar
+
+def make_model(vocab, age=True, q='gauss', flow=None, height='gauss', arch=None):
+    m = NIMIWAE70(len(vocab['spgrpcd']), len(vocab['epa_l3']), len(vocab['major_spgrpcd']), len(vocab['fortypcd']) + 1, len(vocab['spcd']), age=age, q=q, flow=flow, height=height, arch=arch)
+    m.vocab = vocab; m.cfg = dict(censor='known', growth='flex', noise=False, prior_ctx=False, age=age, q=q, height=height, **({'flow': {**FLOW_DEFAULT, **(flow or {})}} if q == 'flow' else {}),
+                                  **({'arch': arch_of(arch)} if arch_of(arch) else {})); return m
 
 def model_from_cfg(vocab, cfg):
     """rebuild a saved model's architecture; checkpoints from before D73 have no 'q' and are Gaussian"""
-    return make_model(vocab, age=cfg['age'], q=cfg.get('q', 'gauss'), flow=cfg.get('flow'), height=cfg.get('height', 'gauss'))
+    return make_model(vocab, age=cfg['age'], q=cfg.get('q', 'gauss'), flow=cfg.get('flow'), height=cfg.get('height', 'gauss'), arch=cfg.get('arch'))
 
 class ScheduleFreeAdamW:
     """Schedule-Free AdamW (Defazio et al. 2024, arXiv 2405.15682). Three sequences: z takes the Adam step, x is the weighted average of z and the model to evaluate,
@@ -414,7 +422,7 @@ def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
 def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None, d74=False,
-          state_path=None, d76=False, sapling=False):
+          state_path=None, d76=False, sapling=False, arch=None):
     """state_path: after every completed epoch (and its hook) the full training state is saved there; if the file exists, training resumes after its
     epoch. It holds the parameters, the optimizer (and scheduler) state, the batch-order and noise RNG states and the history, plus a fingerprint of the
     setup; a different setup refuses to resume."""
@@ -431,7 +439,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
     if d76:                                                                                  # both arms: the crew-miss rate, fixed from the fit plots before any subsample
         vocab['miss_eps'] = calibrate_miss(B, log=log); apply_miss(B, vocab['miss_eps'])
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
-    model = make_model(vocab, age=age, q=q, flow=flow, height='t' if d74 else 'gauss').to(device)
+    model = make_model(vocab, age=age, q=q, flow=flow, height='t' if d74 else 'gauss', arch=arch).to(device)   # D82: arch None = the default network
     phi = model.enc_params(); pid = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in pid]
     nb_ep = (n + bs - 1) // bs
     if opt_name == 'sf':                                                                     # warmup = the 5 % of steps OneCycleLR uses
@@ -454,6 +462,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         log(f'resumed after epoch {start} of {epochs} from {state_path}')
     for ep in range(start, epochs):
         t0, tot, nb = time.time(), 0.0, 0
+        if cuda: torch.cuda.reset_peak_memory_stats(device)                                 # D82: gpu_mem_gb = this epoch's training peak, not the scoring hook's
         for ix in torch.split(torch.tensor(rng.permutation(n)), bs):
             b = to_dev(sub(B, ix), device); o = model.joint(b, k, dreg=True)
             loss_t = -(torch.logsumexp(o['lw'], 0) - math.log(k)).mean()
@@ -472,7 +481,8 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
             with torch.no_grad():
                 w = torch.softmax(o['lw'], 0); z0 = o['z'][..., 0]; al = torch.exp(b['af_mu'][None] + b['af_shift'][None] + b['af_sd'][None] * b['af_sdf'][None] * z0)   # age at the prior's slot, coupled prior
                 pm = (w * z0).sum(0); e0 = dict(z0_mean=pm.mean().item(), z0_abs=pm.abs().mean().item(), z0_sd=((w * z0 ** 2).sum(0) - pm ** 2).clamp(min=0).sqrt().median().item(), age_med=al.median().item(), age_max=al.max().item())
-        hist.append(dict(epoch=ep, loss=tot / nb, ess_last_batch=ess, sd_disc=torch.exp(model.lsdisc).item(), **e0))
+        hist.append(dict(epoch=ep, loss=tot / nb, ess_last_batch=ess, sd_disc=torch.exp(model.lsdisc).item(), **e0, seconds=round(time.time() - t0, 1), steps=nb,
+                         **({'gpu_mem_gb': round(torch.cuda.max_memory_allocated(device) / 1e9, 2)} if cuda else {})))   # D82: cost per epoch
         log(json.dumps(hist[-1]) + f' {time.time() - t0:.0f}s')
         if on_epoch:                                                                         # hist entry first: the hook may add held-out numbers to it
             with (opt.averaged() if opt_name == 'sf' else contextlib.nullcontext()): on_epoch(ep + 1, model, hist[-1])

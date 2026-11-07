@@ -318,6 +318,13 @@ A.apply_coupling(B20, z20); off20 = B20['af_shift'].clone()
 A.apply_coupling(B20, z20 | dict(sapling=dict(delta=-0.2, lo=math.log(0.02), hi=math.log(0.15), m=-3.0)))
 want20 = torch.tensor([-0.2 * (math.log(0.02) + 3.0), -0.2 * (math.log(0.15) + 3.0), 0.0, 0.0])
 check('D78 sapling coupling: off by default, clamped formula on eligible saplings only', float(off20.abs().max()) == 0.0 and float((B20['af_shift'] - want20).abs().max()) < 1e-6)
+# 21. D82 architecture setting: the default records nothing and builds the same network; other sizes build, run, round-trip and are recorded
+v21 = dict(spgrpcd=[0, 1, 2], epa_l3=[0, 1, 2], major_spgrpcd=[0, 1, 2], fortypcd=[0, 1], spcd=[0, 1, 2])            # the sizes of model(): 3, 3, 3, 3, 3
+torch.manual_seed(5); m21a = A.make_model(v21); torch.manual_seed(5); m21b = A.make_model(v21, arch=dict(layers=2, d=64))
+check('D82: an explicit default arch is the default network and records nothing', 'arch' not in m21b.cfg and all(torch.equal(x, y) for x, y in zip(m21a.state_dict().values(), m21b.state_dict().values())))
+torch.manual_seed(5); m21c = A.make_model(v21, arch=dict(layers=3, d=32)); m21d = A.model_from_cfg(v21, m21c.cfg); m21d.load_state_dict(m21c.state_dict(), strict=True)
+with torch.no_grad(): torch.manual_seed(2); lw21 = m21c.joint(batch(), 4)['lw']; torch.manual_seed(2); lw21b = m21d.joint(batch(), 4)['lw']
+check('D82: a non-default arch is recorded, rebuilt from its cfg and scores identically', m21c.cfg.get('arch') == dict(layers=3, d=32) and len(m21c.qtr.layers) == 3 and m21c.qin.out_features == 32 and torch.equal(lw21, lw21b))
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()
