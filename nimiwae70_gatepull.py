@@ -42,8 +42,9 @@ def report(run):
     for f in sorted(glob.glob(f'{run}/gatepull_e*.json')):
         g = json.load(open(f)); p = g['pooled']['subplot']
         rows.append(dict(file=os.path.basename(f), tag=g.get('tag', ''), frame=g.get('frame', 'pre-d78'), epoch=g['epoch'], eps_scale=g.get('eps_scale', 1.0), frac=g['frac'],
-                         folds=','.join(sorted(g['folds'])), trees=p['n'], below_2=p['below_-2'], share_below_2=round(100 * p['share_below_-2'], 3), share_below_3=round(100 * p['share_below_-3'], 3)))
-    print(f'{run}: subplot-level late large debuts, shares in %'); print(pd.DataFrame(rows).to_string(index=False) if rows else '  no gatepull files')
+                         folds=','.join(sorted(g['folds'])), trees=p['n'], trees_by_fold='/'.join(str(g['folds'][k]['subplot']['n']) for k in sorted(g['folds'])), below_2=p['below_-2'], share_below_2=round(100 * p['share_below_-2'], 3), share_below_3=round(100 * p['share_below_-3'], 3)))
+    print(f'{run}: subplot-level late large debuts, shares in % (the population depends on the data only: trees_by_fold must agree across frames)')
+    print(pd.DataFrame(rows).to_string(index=False) if rows else '  no gatepull files')
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--data', required=True); ap.add_argument('--run', required=True); ap.add_argument('--epoch', type=int, default=36)
@@ -74,7 +75,9 @@ def main():
     out = f'{a.run}/gatepull_e{a.epoch}' + ('' if a.eps_scale == 1.0 else f'_eps{a.eps_scale:g}') + (f'_{a.tag}' if a.tag else '') + '.json'
     if a.tag: R['pass'] = None                                                            # a tagged run is a reading, not the D76 bar
     json.dump(R, open(out, 'w'), indent=1); print(json.dumps(R['pooled'], indent=1))
-    print('D76 primary (subplot share below -2 <= 0.10 %):', 'PASS' if R['pass'] else 'FAIL') if R['pass'] is not None else print(f'sensitivity eps x{a.eps_scale:g} (reported, not a bar) -> {out}')
+    if a.tag: print(f'tagged reading "{a.tag}" on a {frame} frame (not the D76 bar) -> {out}')
+    elif R['pass'] is not None: print('D76 primary (subplot share below -2 <= 0.10 %):', 'PASS' if R['pass'] else 'FAIL')
+    else: print(f'sensitivity eps x{a.eps_scale:g} (reported, not a bar) -> {out}')
 
 
 if __name__ == '__main__':
