@@ -62,7 +62,7 @@ if [ -n "$DUMP" ]; then
       || { echo "the dump FAILED: see $r/gatepull_e36_d78dump.log"; exit 1; }
   fi
   python -I nimiwae70_gatepull.py --analyse-dump "$r/gatepull_e36_d78dump_dump.parquet" || { echo "the analysis FAILED"; exit 1; }
-  python -I nimiwae70_gatepull.py --report "$r"
+  python -I nimiwae70_gatepull.py --report "$r" || { echo "the report FAILED"; exit 1; }
   echo "done: copy $r/gatepull_e36_d78dump.json, $r/gatepull_e36_d78dump_dump.parquet and $r/gatepull_e36_d78dump_dump_analysis.json back"
   exit 0
 fi
@@ -79,7 +79,7 @@ if [ -n "$XCHECK" ]; then
   done
   rc=0; for p in ${pids[@]+"${pids[@]}"}; do wait "$p" || rc=1; done
   [ "$rc" -eq 0 ] || { echo "a gatepull FAILED: see out/cv7*flow/gatepull_e36_d78.log; rerun XCHECK=d78"; exit 1; }
-  for r in out/cv76flow out/cv74flow; do python -I nimiwae70_gatepull.py --report "$r"; done
+  for r in out/cv76flow out/cv74flow; do python -I nimiwae70_gatepull.py --report "$r" || { echo "the report FAILED"; exit 1; }; done
   echo "done: copy out/cv76flow/gatepull_e36_d78.json and out/cv74flow/gatepull_e36_d78.json back"
   exit 0
 fi

@@ -118,7 +118,9 @@ def report(run):
     import glob
     rows = []
     for f in sorted(glob.glob(f'{run}/gatepull_e*.json')):
-        g = json.load(open(f)); p = g['pooled']['subplot']
+        g = json.load(open(f))
+        if 'pooled' not in g or 'folds' not in g: continue                               # e.g. an --analyse-dump summary in the same folder: not a result
+        p = g['pooled']['subplot']
         rows.append(dict(file=os.path.basename(f), tag=g.get('tag', ''), frame=g.get('frame', 'pre-d78'), epoch=g['epoch'], eps_scale=g.get('eps_scale', 1.0), frac=g['frac'],
                          folds=','.join(sorted(g['folds'])), trees=p['n'], trees_by_fold='/'.join(str(g['folds'][k]['subplot']['n']) for k in sorted(g['folds'])), below_2=p['below_-2'], share_below_2=round(100 * p['share_below_-2'], 3), share_below_3=round(100 * p['share_below_-3'], 3)))
     print(f'{run}: subplot-level late large debuts, shares in % (the population depends on the data only: trees_by_fold must agree across frames)')
