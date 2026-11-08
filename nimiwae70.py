@@ -162,10 +162,11 @@ def z_age(z0, B):
 
 def apply_tail(B, sl):
     """D85: the lower-side width factor per tree. sl is one value for every tree (the D85 test) or, am. 4, {'N': .., 'P': ..} per direct model:
-    trees whose prior came from the planted model take 'P', all others (natural-model priors and trees without a prior) 'N'"""
+    trees whose prior came from the planted model take 'P', natural-model priors 'N', and trees without a prior keep 1 (their default prior is not
+    what the widths were calibrated on)"""
     if isinstance(sl, dict):
-        P = B['af_P'] if 'af_P' in B else torch.zeros_like(B['af_mu'])
-        B['age_sl'] = torch.where(P > 0, torch.full_like(B['af_mu'], float(sl['P'])), torch.full_like(B['af_mu'], float(sl['N'])))
+        P = B['af_P'] if 'af_P' in B else torch.zeros_like(B['af_mu']); H = B['af_has'] if 'af_has' in B else torch.ones_like(B['af_mu'])
+        B['age_sl'] = torch.where(H > 0, torch.where(P > 0, torch.full_like(B['af_mu'], float(sl['P'])), torch.full_like(B['af_mu'], float(sl['N']))), torch.ones_like(B['af_mu']))
     else: B['age_sl'] = torch.full_like(B['af_mu'], float(sl))
 
 TAIL_MIN = 200                                                                                  # D85: anchors below the prior median a width needs
@@ -173,9 +174,10 @@ TAIL_MIN = 200                                                                  
 def calibrate_tail(B, log=print):
     """D85 (am. 4: per direct model): sigma_L from the anchors in B (fit plots), against the coupled prior at the prior's slot: the half-normal fit
     sqrt(mean z^2) of the anchors below the prior median, clipped to [0.5, 1]; total age at la from each anchor as calibrate_coupling. One width per
-    direct model, 'N' (natural-model priors and trees without a prior) and 'P' (planted-model priors, B['af_P']); a model with fewer than TAIL_MIN
+    direct model, 'N' (natural-model priors) and 'P' (planted-model priors, B['af_P']), anchors of trees with a prior only; a model with fewer than TAIL_MIN
     anchors below its median takes the pooled width (logged). The upper side is reported, not applied. Returns {'N': .., 'P': ..}."""
     t = B['cov'][..., ITYR] * 20.0; li = B['la'][:, None]; ti, pj = torch.nonzero(B['anc_m'] > 0, as_tuple=True)
+    keep = B['af_has'][ti] > 0 if 'af_has' in B else torch.ones_like(ti, dtype=torch.bool); ti, pj = ti[keep], pj[keep]   # a tree without a prior sits on the default, not a measurement
     tot = torch.exp(B['anc_y'][ti, pj]) + B['l0'][ti] - (t[ti, pj] - t.gather(1, li)[ti, 0]); ok = tot > 0.5; ti, tot = ti[ok], tot[ok]
     z = ((torch.log(tot) - B['af_mu'][ti] - B['af_shift'][ti]) / (B['af_sd'][ti] * B['af_sdf'][ti])).double()
     P = (B['af_P'][ti] > 0) if 'af_P' in B else torch.zeros_like(z, dtype=torch.bool)

@@ -379,9 +379,13 @@ Pthin = torch.zeros(N23, dtype=torch.bool); Pthin[:300] = True                  
 sl23b = A.calibrate_tail(tail_batch(zt, Pthin), log=lambda *_: None)
 pooled23 = A.calibrate_tail(tail_batch(zt, torch.zeros(N23, dtype=torch.bool)), log=lambda *_: None)['N']   # every anchor in one model = the pooled width, same arithmetic
 check('D85 am. 4: a model with too few anchors takes the pooled width', sl23b['P'] == pooled23 and sl23b['N'] != sl23b['P'], f'{sl23b}, pooled {pooled23:.4f}')
-B23 = {k: v.clone() for k, v in B22.items()}; B23['af_P'] = (torch.arange(B23['af_mu'].shape[0]) % 2 == 0).float(); A.apply_tail(B23, dict(N=0.9, P=0.6))
-B23f = {k: v.clone() for k, v in B22.items()}; A.apply_tail(B23f, 0.8)
-check('D85 am. 4: apply_tail routes P to planted-model priors, N to the rest; a single value applies to all', torch.equal(B23['age_sl'], torch.where(B23['af_P'] > 0, 0.6, 0.9).float()) and bool((B23f['age_sl'] == 0.8).all()))
+Bnp = tail_batch(zt, P23); Bnp['af_has'] = torch.ones(N23); Bnp['af_has'][1::3] = 0; Bnp['af_mu'][1::3] = A.AF_MU0; Bnp['af_sd'][1::3] = A.AF_SD0   # no-prior trees on the default
+Bkp = tail_batch(zt, P23); Bkp['anc_m'][1::3] = 0                                            # the same trees without their anchors
+check('D85: anchors of trees without a prior never enter sigma_L', A.calibrate_tail(Bnp, log=lambda *_: None) == A.calibrate_tail(Bkp, log=lambda *_: None))
+B23 = {k: v.clone() for k, v in B22.items()}; n23 = B23['af_mu'].shape[0]; B23['af_P'] = (torch.arange(n23) % 2 == 0).float(); B23['af_has'] = (torch.arange(n23) % 3 != 2).float()
+A.apply_tail(B23, dict(N=0.9, P=0.6)); B23f = {k: v.clone() for k, v in B23.items()}; A.apply_tail(B23f, 0.8)
+want23 = torch.where(B23['af_has'] > 0, torch.where(B23['af_P'] > 0, 0.6, 0.9), 1.0).float()
+check('D85 am. 4: apply_tail routes P to planted-model priors, N to natural ones, 1 without a prior; a single value applies to all', bool((B23['af_has'] == 0).any()) and torch.equal(B23['age_sl'], want23) and bool((B23f['age_sl'] == 0.8).all()))
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()
