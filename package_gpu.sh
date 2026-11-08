@@ -26,6 +26,9 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 #   PROBE=d82      the capacity / data probe (DECISIONS D82) on fold 0, age on: base, deep (4 + 4 layers), wide (width 128), all trees, 24 epochs,
 #                  then the rule (out/d82_compare.json). The base configuration is D74 + flow, plus D76 when D76=1 (set it from D76's verdict).
 #                  Build this bundle from the frame the next CV uses (d78). Resumable; finished arms are skipped.
+#   PROBE=d86      capacity round 2 (DECISIONS D86) on fold 0, age on, every fit tree: alltrees (default network, the reference), deep (4 + 4 layers),
+#                  wide (width 128), deepwide (both); Q=flow D74 D76 D85 (sigma_L per direct model), PyTorch, 48 epochs (checkpoints 24 / 36 / 48);
+#                  then fold-0 gate pulls at 48 per arm (tag d86) and the rule (out/d86_compare.json). Build this bundle from d78. Resumable per epoch.
 #   XCHECK=d78     no training: rescore out/cv76flow and out/cv74flow (copied here, finished) on THIS bundle's frame, which must be d78, with the
 #                  same checkpoints: how much the new frame alone (l0 table, planted prior) moves the D76 gate-pull check. Tagged d78 (the D76
 #                  verdict's untagged files are never touched), then both runs' gatepull files side by side. Build this bundle from d78.
@@ -46,6 +49,7 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 set -uo pipefail
 D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; D76=${D76:-0}; BK=${BACKEND:-torch}; G1R=${G1RESCORE:-}; GRR=${GRIDRESCORE:-}; POST=${POST:-}; PROBE=${PROBE:-}; XCHECK=${XCHECK:-}; DUMP=${DUMP:-}; TEST=${TEST:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
 [ -n "$PROBE" ] && { Q=flow; D74=1; }                                     # D82: the probe's base is always D74 + flow (D76 from the env)
+[ "$PROBE" = d86 ] && { D76=1; BK=torch; }                                # D86: D76 + D85 always, PyTorch only (the JAX trainer refuses D85)
 case "$Q" in gauss|flow) ;; *) echo "Q must be gauss or flow, not $Q"; exit 1;; esac
 case "$D74$D76" in 00) O=out/cv72;; 10) O=out/cv74;; 11) O=out/cv76;; *) echo "D74 / D76 must be 0 or 1, and D76 needs D74=1 (got D74=$D74 D76=$D76)"; exit 1;; esac
 [ "$Q" = flow ] && O=${O}flow
@@ -98,8 +102,25 @@ if [ -n "$XCHECK" ]; then
   echo "done: copy out/cv76flow/gatepull_e36_d78.json and out/cv74flow/gatepull_e36_d78.json back"
   exit 0
 fi
+if [ "$PROBE" = d86 ]; then
+  python -I -c "import sys, pyarrow.parquet as pq; sys.exit(0 if 'l0' in pq.read_schema('data/seq.parquet').names else 1)" || { echo "this bundle's data is not a d78 frame: build it from d78"; exit 1; }
+  echo "D86 capacity round 2 on fold 0: Q=flow D74=1 D76=1 D85=1, every fit tree, 48 epochs; 4 arms, $P at a time, $G GPU(s)"
+  printf '%s\n' "alltrees" "deep --layers 4" "wide --width 128" "deepwide --layers 4 --width 128" | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c \
+    'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out out/d86_$0 --fold 0 --age 1 --q flow --d74 1 --d76 1 --d85 1 --trees 0 --ckpts 24,36,48 --device '"$D"' --threads '"$T"' "$@"' \
+    || { echo "an arm FAILED: see out/d86_*/f0_age1/run.log; rerun PROBE=d86 (finished arms are skipped, others resume)"; exit 1; }
+  pids=(); i=0
+  for arm in alltrees deep wide deepwide; do
+    r=out/d86_$arm; [ -f "$r/gatepull_e48_d86.json" ] && continue
+    CUDA_VISIBLE_DEVICES=$(( i % G )) python -I nimiwae70_gatepull.py --data data --run "$r" --epoch 48 --folds 0 --tag d86 --device "$D" --threads "$T" > "$r/gatepull_e48_d86.log" 2>&1 &
+    pids+=($!); i=$(( i + 1 ))
+  done
+  for p in ${pids[@]+"${pids[@]}"}; do wait "$p" || { echo "a gatepull FAILED: see out/d86_*/gatepull_e48_d86.log; rerun PROBE=d86"; exit 1; }; done
+  python -I nimiwae70_cv.py --out out --compare86 || { echo "the D86 comparison FAILED"; exit 1; }
+  echo "done: copy out/d86_* and out/d86_compare.json back"
+  exit 0
+fi
 if [ -n "$PROBE" ]; then
-  [ "$PROBE" = d82 ] || { echo "PROBE must be d82, not $PROBE"; exit 1; }
+  [ "$PROBE" = d82 ] || { echo "PROBE must be d82 or d86, not $PROBE"; exit 1; }
   echo "D82 probe on fold 0: Q=flow D74=1 D76=$D76, 24 epochs; 4 arms, $P at a time, $G GPU(s)"
   printf '%s\n' "base" "deep --layers 4" "wide --width 128" "alltrees --trees 0" | xargs -P "$P" -L 1 --process-slot-var=SLOT bash -c \
     'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_cv.py --data data --out out/d82_$0 --fold 0 --age 1 --q flow --d74 1 --d76 '"$D76"' --ckpts 12,24 --device '"$D"' --threads '"$T"' "$@"' \

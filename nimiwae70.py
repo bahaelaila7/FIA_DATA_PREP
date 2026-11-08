@@ -77,9 +77,10 @@ def build(seq, vocab=None):
         mu[o.index.to_numpy()] = o.m.to_numpy(); sd[o.index.to_numpy()] = o.s.to_numpy(); la[torch.tensor(o.index.to_numpy())] = torch.tensor(o.p.to_numpy(), dtype=la.dtype)
         B['af_has'] = torch.zeros(n); B['af_has'][torch.tensor(o.index.to_numpy())] = 1.0
         B['age_known_bias'] = torch.zeros(n); B['age_known_bias'][torch.tensor(o.index.to_numpy())] = torch.tensor((o.pm.astype(bool) & (o.d >= KNOWN_BIAS_DIA)).to_numpy(), dtype=torch.float32)   # D79 flag
+        B['af_P'] = torch.zeros(n); B['af_P'][torch.tensor(o.index.to_numpy())] = torch.tensor(o.pm.astype(bool).to_numpy(), dtype=torch.float32)   # D85 am. 4: the prior came from the planted model
     else:
         B['af_has'] = torch.zeros(n)
-        B['age_known_bias'] = torch.zeros(n)
+        B['age_known_bias'] = torch.zeros(n); B['af_P'] = torch.zeros(n)
     B['af_mu'], B['af_sd'], B['la'] = torch.tensor(mu), torch.tensor(sd), la
     d74_features(B, seq_cols=sq, ti=ti, po=po)
     if 'age_coupling' in vocab: apply_coupling(B, vocab['age_coupling'])
@@ -160,19 +161,34 @@ def z_age(z0, B):
     return torch.where(z0 < 0, sl * z0, z0)
 
 def apply_tail(B, sl):
-    """D85: the lower-side width factor for every tree"""
-    B['age_sl'] = torch.full_like(B['af_mu'], float(sl))
+    """D85: the lower-side width factor per tree. sl is one value for every tree (the D85 test) or, am. 4, {'N': .., 'P': ..} per direct model:
+    trees whose prior came from the planted model take 'P', all others (natural-model priors and trees without a prior) 'N'"""
+    if isinstance(sl, dict):
+        P = B['af_P'] if 'af_P' in B else torch.zeros_like(B['af_mu'])
+        B['age_sl'] = torch.where(P > 0, torch.full_like(B['af_mu'], float(sl['P'])), torch.full_like(B['af_mu'], float(sl['N'])))
+    else: B['age_sl'] = torch.full_like(B['af_mu'], float(sl))
+
+TAIL_MIN = 200                                                                                  # D85: anchors below the prior median a width needs
 
 def calibrate_tail(B, log=print):
-    """D85: sigma_L from the anchors in B (fit plots), against the coupled prior at the prior's slot: the half-normal fit sqrt(mean z^2) of the anchors
-    below the prior median, clipped to [0.5, 1]. Total age at la from each anchor as calibrate_coupling. The upper side is reported, not applied."""
+    """D85 (am. 4: per direct model): sigma_L from the anchors in B (fit plots), against the coupled prior at the prior's slot: the half-normal fit
+    sqrt(mean z^2) of the anchors below the prior median, clipped to [0.5, 1]; total age at la from each anchor as calibrate_coupling. One width per
+    direct model, 'N' (natural-model priors and trees without a prior) and 'P' (planted-model priors, B['af_P']); a model with fewer than TAIL_MIN
+    anchors below its median takes the pooled width (logged). The upper side is reported, not applied. Returns {'N': .., 'P': ..}."""
     t = B['cov'][..., ITYR] * 20.0; li = B['la'][:, None]; ti, pj = torch.nonzero(B['anc_m'] > 0, as_tuple=True)
     tot = torch.exp(B['anc_y'][ti, pj]) + B['l0'][ti] - (t[ti, pj] - t.gather(1, li)[ti, 0]); ok = tot > 0.5; ti, tot = ti[ok], tot[ok]
     z = ((torch.log(tot) - B['af_mu'][ti] - B['af_shift'][ti]) / (B['af_sd'][ti] * B['af_sdf'][ti])).double()
-    lo, hi = z[z < 0], z[z >= 0]; assert len(lo) >= 200, f'too few anchors below the prior median to calibrate the lower tail: {len(lo)}'
-    sl = float(min(1.0, max(0.5, torch.sqrt((lo ** 2).mean()))))
-    log(f'D85 lower tail calibrated on {len(z):,} anchor rows: sigma_L {sl:.3f} ({len(lo):,} below the prior median, {len(lo) / len(z):.3f}); upper side {float(torch.sqrt((hi ** 2).mean())):.3f} (not applied)')
-    return sl
+    P = (B['af_P'][ti] > 0) if 'af_P' in B else torch.zeros_like(z, dtype=torch.bool)
+    width = lambda zz: float(min(1.0, max(0.5, torch.sqrt((zz[zz < 0] ** 2).mean()))))
+    assert int((z < 0).sum()) >= TAIL_MIN, f'too few anchors below the prior median to calibrate the lower tail: {int((z < 0).sum())}'
+    pooled, out = width(z), {}
+    for k, sel in (('N', ~P), ('P', P)):
+        zk = z[sel]; nlo = int((zk < 0).sum())
+        out[k] = width(zk) if nlo >= TAIL_MIN else pooled
+        log(f'D85 lower tail, {k} model: {len(zk):,} anchor rows, {nlo:,} below the prior median' + (f': sigma_L {out[k]:.3f}' if nlo >= TAIL_MIN else f' (< {TAIL_MIN}): the pooled sigma_L {pooled:.3f}')
+            + (f'; upper side {float(torch.sqrt((zk[zk >= 0] ** 2).mean())):.3f} (not applied)' if int((zk >= 0).sum()) else ''))
+    log(f'D85 lower tail: sigma_L N {out["N"]:.3f}, P {out["P"]:.3f} (pooled {pooled:.3f}, {len(z):,} anchor rows)')
+    return out
 
 def apply_corr_miss(B, eps, rho):
     """D85: correlated misses at the D76 slots (pre-debut, subplot level, cutoff mode): the static factor goes, the cutoff term builds 1 - eps_t per draw"""

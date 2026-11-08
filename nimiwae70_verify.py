@@ -366,13 +366,22 @@ Br['lD'] = torch.zeros(N22, T22); Br['mD'] = torch.zeros(N22, T22); Br['lD'][:, 
 two = torch.rand(N22, generator=g22) < 0.4                                                  # rate 0.1: tally-size at slots 1 and 0; rate 0.15: only at slot 1
 Br['lrate'] = torch.log(torch.where(two, torch.tensor(0.099), torch.tensor(0.15))); Br['has_rate'] = torch.ones(N22); Br['softwood'] = torch.zeros(N22)
 check('D85: calibrate_rho recovers a planted repeated-miss share (40 %)', abs(A.calibrate_rho(Br, log=lambda *_: None) - float(two.float().mean())) < 1e-6)
-# calibrate_tail recovers a planted lower-side width
-N23 = 4000; g23 = torch.Generator().manual_seed(4); zt = torch.randn(N23, generator=g23); zt = torch.where(zt < 0, 0.8 * zt, zt)
-Bt = dict(af_mu=torch.full((N23,), math.log(40.0)), af_shift=torch.zeros(N23), af_sd=torch.full((N23,), 0.3), af_sdf=torch.ones(N23), l0=torch.full((N23,), 2.0), la=torch.zeros(N23, dtype=torch.long))
-Bt['cov'] = torch.zeros(N23, M.T_MAX, M.NCOV); Bt['anc_m'] = torch.zeros(N23, M.T_MAX); Bt['anc_m'][:, 0] = 1; Bt['anc_y'] = torch.zeros(N23, M.T_MAX)
-Bt['anc_y'][:, 0] = torch.log(torch.exp(Bt['af_mu'] + 0.3 * zt) - 2.0)
-sl23 = A.calibrate_tail(Bt, log=lambda *_: None)
-check('D85: calibrate_tail recovers a planted lower-side width (0.8)', abs(sl23 - 0.8) < 0.03, f'sigma_L {sl23:.3f}')
+# calibrate_tail recovers planted lower-side widths per direct model (am. 4: N 0.85, P 0.70), and falls back to the pooled width for a thin model
+N23 = 6000; g23 = torch.Generator().manual_seed(4); zt = torch.randn(N23, generator=g23); P23 = torch.arange(N23) % 3 == 0
+zt = torch.where(zt < 0, torch.where(P23, 0.70, 0.85) * zt, zt)
+def tail_batch(zt, P):
+    n = len(zt); Bt = dict(af_mu=torch.full((n,), math.log(40.0)), af_shift=torch.zeros(n), af_sd=torch.full((n,), 0.3), af_sdf=torch.ones(n), l0=torch.full((n,), 2.0), la=torch.zeros(n, dtype=torch.long), af_P=P.float())
+    Bt['cov'] = torch.zeros(n, M.T_MAX, M.NCOV); Bt['anc_m'] = torch.zeros(n, M.T_MAX); Bt['anc_m'][:, 0] = 1; Bt['anc_y'] = torch.zeros(n, M.T_MAX)
+    Bt['anc_y'][:, 0] = torch.log(torch.exp(Bt['af_mu'] + 0.3 * zt) - 2.0); return Bt
+sl23 = A.calibrate_tail(tail_batch(zt, P23), log=lambda *_: None)
+check('D85 am. 4: calibrate_tail recovers planted widths per direct model (N 0.85, P 0.70)', abs(sl23['N'] - 0.85) < 0.03 and abs(sl23['P'] - 0.70) < 0.03, f'sigma_L {sl23}')
+Pthin = torch.zeros(N23, dtype=torch.bool); Pthin[:300] = True                               # ~150 P anchors below the median: < TAIL_MIN
+sl23b = A.calibrate_tail(tail_batch(zt, Pthin), log=lambda *_: None)
+pooled23 = A.calibrate_tail(tail_batch(zt, torch.zeros(N23, dtype=torch.bool)), log=lambda *_: None)['N']   # every anchor in one model = the pooled width, same arithmetic
+check('D85 am. 4: a model with too few anchors takes the pooled width', sl23b['P'] == pooled23 and sl23b['N'] != sl23b['P'], f'{sl23b}, pooled {pooled23:.4f}')
+B23 = {k: v.clone() for k, v in B22.items()}; B23['af_P'] = (torch.arange(B23['af_mu'].shape[0]) % 2 == 0).float(); A.apply_tail(B23, dict(N=0.9, P=0.6))
+B23f = {k: v.clone() for k, v in B22.items()}; A.apply_tail(B23f, 0.8)
+check('D85 am. 4: apply_tail routes P to planted-model priors, N to the rest; a single value applies to all', torch.equal(B23['age_sl'], torch.where(B23['af_P'] > 0, 0.6, 0.9).float()) and bool((B23f['age_sl'] == 0.8).all()))
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()
@@ -391,6 +400,8 @@ if len(sys.argv) > 1:
         fr_ = sf_[(sf_.slot_kind == 'real') & sf_.af_mu.notna()].sort_values(['_tid', '_pos']).groupby('_tid').first()
         want_kb = ((fr_.af_model == 'P') & (fr_.dia >= A.KNOWN_BIAS_DIA)).reindex(range(Bf['v'].shape[0]), fill_value=False).to_numpy()
         check('frame: age_known_bias is the planted-model prior at DIA >= 15 in (D79)', (Bf['age_known_bias'].numpy() > 0).tolist() == want_kb.tolist(), f'{int(want_kb.sum())} flagged')
+        want_p = (fr_.af_model == 'P').reindex(range(Bf['v'].shape[0]), fill_value=False).to_numpy()
+        check('frame: af_P is the planted-model prior at the prior\'s slot (D85 am. 4)', (Bf['af_P'].numpy() > 0).tolist() == want_p.tolist(), f'{int(want_p.sum())} of {len(want_p):,} trees')
     if 'l0' in f_:                                                                       # D78 frames: the per-tree column of nimiwae_l0, unchanged by build
         want_l0 = f_.drop_duplicates(M.K_).set_index(M.K_).l0; got_l0 = pd.Series(Bf['l0'].numpy(), index=pd.MultiIndex.from_frame(sf_.drop_duplicates('_tid').sort_values('_tid')[M.K_]))
         check('frame: l0 is the frame\'s per-tree l0 (D78)', bool(np.allclose(got_l0.to_numpy(), want_l0.loc[got_l0.index].to_numpy(), atol=1e-5)), f'values {sorted(set(np.round(Bf["l0"].numpy(), 2).tolist()))[:8]}')

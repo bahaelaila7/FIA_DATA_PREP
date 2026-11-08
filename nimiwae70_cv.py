@@ -68,6 +68,7 @@ def run(a):
         if ep in ckpts:
             if 'age_coupling' in m.vocab and not os.path.exists(f'{d}/coupling.json'): json.dump(m.vocab['age_coupling'], open(f'{d}/coupling.json', 'w'), indent=1)
             if 'miss_eps' in m.vocab and not os.path.exists(f'{d}/miss.json'): json.dump(dict(eps=m.vocab['miss_eps']), open(f'{d}/miss.json', 'w'))   # D76: eps per fold (reported)
+            if ('miss_rho' in m.vocab or 'age_tail' in m.vocab) and not os.path.exists(f'{d}/d85.json'): json.dump({x: m.vocab[x] for x in ('miss_rho', 'age_tail') if x in m.vocab}, open(f'{d}/d85.json', 'w'))   # D85: rho, sigma_L N / P
             t0 = time.time(); o = dict(completion=S.completion(m, score_plots))
             if a.age and ep == max(ckpts): o['completion_grid'] = S.completion(m, score_plots, age='grid')   # D77: as the products integrate age (reported)
             rows = []
@@ -261,6 +262,59 @@ def compare82(a, epoch=24):
     json.dump(R, open(f'{a.out}/d82_compare.json', 'w'), indent=1, default=float); print(json.dumps({k: R[k] for k in ('rule', 'winners', 'chosen', 'note', 'gatepull_fold0')} | ({'alltrees_equal_steps': R['alltrees_equal_steps']} if 'alltrees_equal_steps' in R else {}), indent=1, default=float))
     return R
 
+D86_ARMS = ('alltrees', 'deep', 'wide', 'deepwide')
+D86_RULE = dict(bound=0.05, e1=0.002, size=1.01, g1=0.05, gap=0.05, prefer=0.05)   # pre-registered (D86): epoch 48, fold 0, against alltrees
+
+def compare86(a, epoch=48, prev=36):
+    """D86: capacity round 2. Each arm against alltrees at `epoch` on fold 0: D82's rule (monitor bound gain >= 0.05 nats / tree, E1 not worse by more
+    than 0.002, size MAE ratio <= 1.01, G1 not worse by more than 0.05 yr) and no overfitting (monitor bound at `epoch` >= at `prev`, fit - monitor gap
+    at most 0.05 above the reference's). Choice: the largest gain; a winner with fewer parameters within 0.05 nats of it is preferred. Reported: gains
+    24 -> 36 -> 48, seconds / steps / GPU memory, G5 per checkpoint, fold-0 gate pulls at `epoch` (tag d86), eps / rho / sigma_L (identical across arms)."""
+    R, e = {}, str(epoch)
+    for arm in D86_ARMS:
+        d = f'{a.out}/d86_{arm}/f0_age1'
+        if not os.path.exists(f'{d}/scores.json'): R[arm] = None; continue
+        sc, cu, hi = json.load(open(f'{d}/scores.json')), json.load(open(f'{d}/curve.json')), _hist(d); cb = {r['epoch']: r for r in cu}
+        ck = f'{d}/model_e{epoch}.pt'
+        npar = sum(v.numel() for v in torch.load(ck, weights_only=False, map_location='cpu')['state'].values()) if os.path.exists(ck) else None
+        r = dict(epochs_scored=sorted(sc, key=int), monitor_bound={k: cb[k]['monitor_bound'] for k in (24, 36, 48) if k in cb}, gap={k: cb[k]['gap'] for k in (24, 36, 48) if k in cb},
+                 E1={k: sc[k]['completion']['E1'] for k in sc}, E2={k: sc[k]['completion']['E2'] for k in sc}, E3={k: sc[k]['completion']['E3'] for k in sc},
+                 size={k: sc[k]['completion']['mae_lD'] for k in sc}, G1={k: sc[k]['G1']['mae_joint'] for k in sc}, G5={k: sc[k]['G5']['cover80'] for k in sc},
+                 params=npar, steps_per_epoch=hi[-1].get('steps') if hi else None,
+                 seconds_per_epoch=float(np.median([h['seconds'] for h in hi if 'seconds' in h])) if any('seconds' in h for h in hi) else None,
+                 gpu_mem_gb=max((h.get('gpu_mem_gb', 0) for h in hi), default=None), curve={k: cb[k]['monitor_bound'] for k in sorted(cb)})
+        mb = r['monitor_bound']; r['gain_24_36'] = mb[36] - mb[24] if 24 in mb and 36 in mb else None; r['gain_36_48'] = mb[48] - mb[36] if 36 in mb and 48 in mb else None
+        r['calibrated'] = {**(json.load(open(f'{d}/miss.json')) if os.path.exists(f'{d}/miss.json') else {}), **(json.load(open(f'{d}/d85.json')) if os.path.exists(f'{d}/d85.json') else {})}
+        gp = f'{a.out}/d86_{arm}/gatepull_e{epoch}_d86.json'
+        if os.path.exists(gp): g = json.load(open(gp))['pooled']['subplot']; r['gatepull_fold0'] = dict(n=g['n'], below_2=g['below_-2'], share_below_2=g['share_below_-2'])
+        R[arm] = r
+    b = R.get('alltrees')
+    if not b or epoch not in b['monitor_bound'] or e not in b['E1']: print(json.dumps(R, indent=1, default=float)); sys.exit(f'D86: alltrees has no epoch {epoch} yet: no comparison')
+    cal = [json.dumps(R[x]['calibrated'], sort_keys=True) for x in D86_ARMS if R[x]]
+    R['calibration_identical'] = len(set(cal)) == 1
+    wins = {}
+    for arm in D86_ARMS[1:]:
+        r = R[arm]
+        if not r or epoch not in r['monitor_bound'] or prev not in r['monitor_bound'] or e not in r['E1']: wins[arm] = None; continue
+        c = dict(bound_gain=r['monitor_bound'][epoch] - b['monitor_bound'][epoch], e1_worse=r['E1'][e] - b['E1'][e], size_ratio=r['size'][e] / b['size'][e], g1_worse=r['G1'][e] - b['G1'][e],
+                 still_rising=r['monitor_bound'][epoch] >= r['monitor_bound'][prev], gap_excess=r['gap'][epoch] - b['gap'][epoch])
+        c['wins'] = bool(c['bound_gain'] >= D86_RULE['bound'] and c['e1_worse'] <= D86_RULE['e1'] and c['size_ratio'] <= D86_RULE['size'] and c['g1_worse'] <= D86_RULE['g1']
+                         and c['still_rising'] and c['gap_excess'] <= D86_RULE['gap'])
+        wins[arm] = c
+    if any(v is None for v in wins.values()): print(json.dumps(R, indent=1, default=float)); sys.exit(f'D86: arms without epochs {prev} and {epoch} scored: {[k for k, v in wins.items() if v is None]}: no comparison')
+    ok = {k: v for k, v in wins.items() if v and v['wins']}; R['rule'] = wins
+    if ok:
+        best = max(ok.values(), key=lambda v: v['bound_gain'])['bound_gain']
+        near = [k for k in ok if ok[k]['bound_gain'] >= best - D86_RULE['prefer']]
+        R['chosen'] = min(near, key=lambda k: (R[k]['params'] if R[k]['params'] is not None else float('inf'), -ok[k]['bound_gain']))
+    else: R['chosen'] = 'alltrees'
+    R['winners'] = sorted(ok, key=lambda k: -ok[k]['bound_gain'])
+    R['readings'] = {k: dict(params=(R[k] or {}).get('params'), gain_24_36=(R[k] or {}).get('gain_24_36'), gain_36_48=(R[k] or {}).get('gain_36_48'), G5=(R[k] or {}).get('G5'),
+                             seconds_per_epoch=(R[k] or {}).get('seconds_per_epoch'), gpu_mem_gb=(R[k] or {}).get('gpu_mem_gb'), gatepull_fold0=(R[k] or {}).get('gatepull_fold0')) for k in D86_ARMS}
+    json.dump(R, open(f'{a.out}/d86_compare.json', 'w'), indent=1, default=float)
+    print(json.dumps({k: R[k] for k in ('rule', 'winners', 'chosen', 'calibration_identical', 'readings')}, indent=1, default=float))
+    return R
+
 def summary(a):
     """fold means per epoch of every score and the D70 bars; with --data also the G1 lookup baselines on the same folds and trees
     (nimiwae70_score.baselines), and per epoch the joint model's G1 MAE next to them"""
@@ -319,6 +373,6 @@ if __name__ == '__main__':
     ap.add_argument('--trees', type=int, default=400000); ap.add_argument('--ckpts', default='12,24,36'); ap.add_argument('--curve-every', type=int, default=2); ap.add_argument('--curve-plots', type=int, default=500); ap.add_argument('--score-frac', type=float, default=0.5); ap.add_argument('--planted-frac', type=float, default=0.25)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=8); ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--d74', type=int, default=0); ap.add_argument('--d76', type=int, default=0); ap.add_argument('--backend', choices=('torch', 'jax'), default='torch'); ap.add_argument('--compare', help='cv72 rescored with --rescore-g1: evaluate the D74 bars of --out against it'); ap.add_argument('--rescore-g1', help='a finished run without D74: score its age-on checkpoints on both G1 sets'); ap.add_argument('--q', choices=('gauss', 'flow'), default='gauss'); ap.add_argument('--flow-layers', type=int, default=6); ap.add_argument('--flow-hidden', type=int, default=64); ap.add_argument('--flow-bins', type=int, default=8)
-    ap.add_argument('--summary', action='store_true'); ap.add_argument('--d85', type=int, default=0); ap.add_argument('--layers', type=int, default=2); ap.add_argument('--width', type=int, default=64); ap.add_argument('--compare82', action='store_true', help='D82: compare out/d82_* (fold 0)')
+    ap.add_argument('--summary', action='store_true'); ap.add_argument('--d85', type=int, default=0); ap.add_argument('--layers', type=int, default=2); ap.add_argument('--width', type=int, default=64); ap.add_argument('--compare82', action='store_true', help='D82: compare out/d82_* (fold 0)'); ap.add_argument('--compare86', action='store_true', help='D86: compare out/d86_* (fold 0)')
     ap.add_argument('--rescore-grid', help='a finished run: D77 grid completion of its last age-on checkpoint (scores_grid.json)'); ap.add_argument('--d76-base', help='cv74flow: evaluate the D76 bars of --out (cv76flow) against it'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
-    selftest() if a.selftest else compare82(a) if a.compare82 else rescore_grid(a) if a.rescore_grid else compare_d76(a) if a.d76_base else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)
+    selftest() if a.selftest else compare82(a) if a.compare82 else compare86(a) if a.compare86 else rescore_grid(a) if a.rescore_grid else compare_d76(a) if a.d76_base else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)
