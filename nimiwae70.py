@@ -181,12 +181,18 @@ def apply_corr_miss(B, eps, rho):
     B['miss_eps_t'] = torch.full_like(B['af_mu'], float(eps)); B['miss_rho_t'] = torch.full_like(B['af_mu'], float(rho))
 
 def corr_keep(ps, lg, xt, B):
-    """D85: [K, n, T] keep factor 1 - eps_t at the eligible slots (1 elsewhere): eps_t = eps + (rho - eps) Q_t, Q_t = 1 - prod over earlier eligible slots of
-    (1 - q_s), q_s = p_s g_s sigma(x_s) the probability that the tree was present, past breast height and tally-size there (so missed, being unrecorded)"""
+    """D85 (am. 1): [K, n, T] keep factor 1 - eps_t at the eligible slots (1 elsewhere), eps_t = eps + (rho - eps) Q_t, where Q_t is the probability,
+    given the absences at the earlier eligible slots, that the tree was already missed at one of them. At slot s the tree is present, past breast height
+    and tally-size with q_s = p_s g_s sigma(x_s); given that it was unrecorded there, it was missed with m_s = q_s eps_s / (1 - q_s (1 - eps_s)) (Bayes:
+    a missed tree, against one not there yet); Q_{t+1} = 1 - (1 - Q_t)(1 - m_t). m_s -> 1 when the tree was surely there, -> 0 when it surely was not."""
     el = B['miss_elig'][None]; q = (ps.clamp(0.0, 1.0) * torch.exp(lg) * torch.sigmoid(xt) * el).clamp(max=1 - 1e-6)
-    l1q = torch.log1p(-q); cum = torch.cumsum(l1q, -1) - l1q                                   # exclusive: slots strictly before t
-    Q = -torch.expm1(cum); e = B['miss_eps_t'][None, :, None] + (B['miss_rho_t'] - B['miss_eps_t'])[None, :, None] * Q
-    return torch.where(el > 0, 1 - e, torch.ones_like(e))
+    eps, rho = B['miss_eps_t'][None], B['miss_rho_t'][None]; Q = torch.zeros_like(q[..., 0]); keep = []
+    for t in range(q.shape[-1]):                                                              # T_MAX slots: sequential, eps_t depends on the earlier misses
+        e = eps + (rho - eps) * Q; elt = el[..., t] > 0
+        keep.append(torch.where(elt, 1 - e, torch.ones_like(e)))
+        m = q[..., t] * e / (1 - q[..., t] * (1 - e)).clamp(min=1e-12)
+        Q = torch.where(elt, 1 - (1 - Q) * (1 - m), Q)
+    return torch.stack(keep, -1)
 
 def calibrate_rho(B, log=print):
     """D85: rho from the coded misses in B (fit plots): trees with the missed mode at the visit before a debut >= 5 in at subplot level; their sampled

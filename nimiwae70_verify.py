@@ -336,9 +336,11 @@ check('D85: sigma_L scales z0 below the prior median only', float((a_t[..., 3] -
 # corr_keep against its formula on one tree with three eligible slots
 ps_ = torch.full((1, 1, 4), 0.9); lg_ = torch.log(torch.tensor([[[0.5, 0.8, 0.9, 1.0]]])); xt_ = torch.tensor([[[0.0, 1.0, 2.0, 3.0]]])
 Bk = dict(miss_elig=torch.tensor([[1.0, 1.0, 1.0, 0.0]]), miss_eps_t=torch.tensor([0.02]), miss_rho_t=torch.tensor([0.36]))
-q_ = (0.9 * torch.tensor([0.5, 0.8, 0.9]) * torch.sigmoid(torch.tensor([0.0, 1.0, 2.0]))); Qw = torch.tensor([0.0, q_[0], 1 - (1 - q_[0]) * (1 - q_[1])])
-want_k = torch.cat([1 - (0.02 + 0.34 * Qw), torch.ones(1)])
-check('D85: the per-draw keep factor equals 1 - (eps + (rho - eps) Q_t), 1 off the eligible slots', float((A.corr_keep(ps_, lg_, xt_, Bk)[0, 0] - want_k).abs().max()) < 1e-6)
+q_ = (0.9 * torch.tensor([0.5, 0.8, 0.9]) * torch.sigmoid(torch.tensor([0.0, 1.0, 2.0]))); Qs, ks = 0.0, []       # D85 am. 1: Q from the posterior miss probability
+for qq in q_.tolist():
+    e_ = 0.02 + 0.34 * Qs; ks.append(1 - e_); m_ = qq * e_ / (1 - qq * (1 - e_)); Qs = 1 - (1 - Qs) * (1 - m_)
+want_k = torch.tensor(ks + [1.0])
+check('D85: the per-draw keep factor equals 1 - (eps + (rho - eps) Q_t), Q_t from the posterior miss probability, 1 off the eligible slots', float((A.corr_keep(ps_, lg_, xt_, Bk)[0, 0] - want_k).abs().max()) < 1e-6)
 # rho = eps reproduces D76 exactly (same weights)
 B22a = batch(); B22a['f'][:] = 2; B22a['llim'][:, :2] = math.log(4.95); B22a['lex'][:] = math.log(0.95); A.d74_features(B22a, sq17, ti17, po17)
 B22b = {k: v.clone() for k, v in B22a.items()}; A.apply_miss(B22a, 0.02); A.apply_corr_miss(B22b, 0.02, 0.02)
