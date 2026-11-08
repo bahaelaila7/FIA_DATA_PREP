@@ -35,6 +35,7 @@ def run(a):
     qc = dict(q=a.q, flow=dict(layers=a.flow_layers, hidden=a.flow_hidden, bins=a.flow_bins) if a.q == 'flow' else None, d74=bool(a.d74), backend=a.backend, d76=bool(a.d76))
     arch = A.arch_of(dict(layers=a.layers, d=a.width))
     if arch: qc['arch'] = arch                                                                # D82: recorded only off the default, so older run folders still match
+    if a.d85: qc['d85'] = True                                                                 # D85: the same rule
     if os.path.exists(f'{d}/q.json'): assert {'d74': False, 'backend': 'torch', 'd76': False, **json.load(open(f'{d}/q.json'))} == qc, f'{d} holds a run with another setup: {open(f"{d}/q.json").read()}'
     elif os.path.exists(f'{d}/run.log'): assert a.q == 'gauss' and not a.d74 and a.backend == 'torch' and not a.d76, f'{d} holds a run from before D73 (Gaussian q, no D74, PyTorch)'
     json.dump(qc, open(f'{d}/q.json', 'w'))
@@ -77,7 +78,7 @@ def run(a):
     trainer = A.train
     if a.backend == 'jax':                                                                    # D75: the same training in JAX; scoring stays in PyTorch
         from nimiwae_jax import train as JT; trainer = JT.train
-    t0 = time.time(); trainer(fit, epochs=max(ckpts), k=a.k, bs=a.bs, max_trees=a.trees, seed=a.seed, threads=a.threads, log=pr, age=bool(a.age), device=a.device, opt_name='sf', on_epoch=hook, q=qc['q'], flow=qc['flow'], d74=bool(a.d74), state_path=sp, d76=bool(a.d76), arch=arch)
+    t0 = time.time(); trainer(fit, epochs=max(ckpts), k=a.k, bs=a.bs, max_trees=a.trees, seed=a.seed, threads=a.threads, log=pr, age=bool(a.age), device=a.device, opt_name='sf', on_epoch=hook, q=qc['q'], flow=qc['flow'], d74=bool(a.d74), state_path=sp, d76=bool(a.d76), arch=arch, d85=bool(a.d85))
     json.dump(dict(seconds=time.time() - t0), open(f'{d}/done.json', 'w')); pr(f'done {time.time() - t0:.0f} s')
 
 def rescore(a):
@@ -318,6 +319,6 @@ if __name__ == '__main__':
     ap.add_argument('--trees', type=int, default=400000); ap.add_argument('--ckpts', default='12,24,36'); ap.add_argument('--curve-every', type=int, default=2); ap.add_argument('--curve-plots', type=int, default=500); ap.add_argument('--score-frac', type=float, default=0.5); ap.add_argument('--planted-frac', type=float, default=0.25)
     ap.add_argument('--k', type=int, default=32); ap.add_argument('--bs', type=int, default=512); ap.add_argument('--threads', type=int, default=8); ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--d74', type=int, default=0); ap.add_argument('--d76', type=int, default=0); ap.add_argument('--backend', choices=('torch', 'jax'), default='torch'); ap.add_argument('--compare', help='cv72 rescored with --rescore-g1: evaluate the D74 bars of --out against it'); ap.add_argument('--rescore-g1', help='a finished run without D74: score its age-on checkpoints on both G1 sets'); ap.add_argument('--q', choices=('gauss', 'flow'), default='gauss'); ap.add_argument('--flow-layers', type=int, default=6); ap.add_argument('--flow-hidden', type=int, default=64); ap.add_argument('--flow-bins', type=int, default=8)
-    ap.add_argument('--summary', action='store_true'); ap.add_argument('--layers', type=int, default=2); ap.add_argument('--width', type=int, default=64); ap.add_argument('--compare82', action='store_true', help='D82: compare out/d82_* (fold 0)')
+    ap.add_argument('--summary', action='store_true'); ap.add_argument('--d85', type=int, default=0); ap.add_argument('--layers', type=int, default=2); ap.add_argument('--width', type=int, default=64); ap.add_argument('--compare82', action='store_true', help='D82: compare out/d82_* (fold 0)')
     ap.add_argument('--rescore-grid', help='a finished run: D77 grid completion of its last age-on checkpoint (scores_grid.json)'); ap.add_argument('--d76-base', help='cv74flow: evaluate the D76 bars of --out (cv76flow) against it'); ap.add_argument('--rescore', help='old out/cv: rescore its saved age-off checkpoints'); ap.add_argument('--selftest', action='store_true'); a = ap.parse_args()
     selftest() if a.selftest else compare82(a) if a.compare82 else rescore_grid(a) if a.rescore_grid else compare_d76(a) if a.d76_base else compare(a) if a.compare else summary(a) if a.summary else rescore_g1(a) if a.rescore_g1 else rescore(a) if a.rescore else run(a)

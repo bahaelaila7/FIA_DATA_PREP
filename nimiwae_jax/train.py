@@ -86,12 +86,13 @@ def load_state(path, fingerprint, model, optimizer, rng):
 
 
 def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='sf', on_epoch=None,
-          q='gauss', flow=None, d74=False, state_path=None, d76=False, sapling=False, arch=None):
+          q='gauss', flow=None, d74=False, state_path=None, d76=False, sapling=False, arch=None, d85=False):
     """nimiwae70.train with this step. Returns (a PyTorch NIMIWAE70 with the averaged weights, the history). `device` is where the PyTorch model the
     hook scores lives; JAX trains on its default device. state_path: after every completed epoch (and its hook) the full training state is saved
     there, and an existing file resumes training after its epoch (the setup must match the saved fingerprint)."""
     assert opt_name == 'sf', 'the JAX path implements Schedule-Free AdamW only'
     assert A.arch_of(arch) is None, 'the JAX port covers the default network only (D82: the capacity probe runs on PyTorch)'
+    assert not d85, 'the JAX port covers up to D76 (D85 runs on PyTorch)'
     assert set(tr.split.unique()) <= {'train'}, 'validation and test plots never enter fitting'
     torch.manual_seed(seed); torch.set_num_threads(threads); rng = np.random.default_rng(seed)
     # the same build, D74 calibration and subsample as nimiwae70.train (PyTorch / NumPy preprocessing)

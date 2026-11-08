@@ -325,6 +325,52 @@ check('D82: an explicit default arch is the default network and records nothing'
 torch.manual_seed(5); m21c = A.make_model(v21, arch=dict(layers=3, d=32)); m21d = A.model_from_cfg(v21, m21c.cfg); m21d.load_state_dict(m21c.state_dict(), strict=True)
 with torch.no_grad(): torch.manual_seed(2); lw21 = m21c.joint(batch(), 4)['lw']; torch.manual_seed(2); lw21b = m21d.joint(batch(), 4)['lw']
 check('D82: a non-default arch is recorded, rebuilt from its cfg and scores identically', m21c.cfg.get('arch') == dict(layers=3, d=32) and len(m21c.qtr.layers) == 3 and m21c.qin.out_features == 32 and torch.equal(lw21, lw21b))
+# 22. D85: the lower tail (sigma_L below the prior median) and correlated misses (eps_t = eps + (rho - eps) Q_t)
+m22 = model(); B22 = batch(); z22 = torch.randn(4, 6, M.DZ)
+with torch.no_grad():
+    a_def = m22.ages(z22, B22); B22t = {k: v.clone() for k, v in B22.items()}; A.apply_tail(B22t, 0.8); a_t = m22.ages(z22, B22t)
+    mu22 = B22['af_mu'] + B22.get('af_shift', 0.0); sd22 = B22['af_sd'] * B22.get('af_sdf', 1.0); z0 = z22[..., 0]
+    want_t = torch.exp(mu22[None] + sd22[None] * torch.where(z0 < 0, 0.8 * z0, z0))
+check('D85: sigma_L = 1 (the default) leaves ages bit-identical', torch.equal(m22.ages(z22, {k: v for k, v in B22.items() if k != 'age_sl'}), a_def))
+check('D85: sigma_L scales z0 below the prior median only', float((a_t[..., 3] - (want_t + (B22['cov'][..., A.ITYR] * 20.0 - (B22['cov'][..., A.ITYR] * 20.0).gather(1, B22['la'][:, None]))[None][..., 3])).abs().max()) < 1e-4 and torch.equal(a_t[z0 >= 0], a_def[z0 >= 0]))
+# corr_keep against its formula on one tree with three eligible slots
+ps_ = torch.full((1, 1, 4), 0.9); lg_ = torch.log(torch.tensor([[[0.5, 0.8, 0.9, 1.0]]])); xt_ = torch.tensor([[[0.0, 1.0, 2.0, 3.0]]])
+Bk = dict(miss_elig=torch.tensor([[1.0, 1.0, 1.0, 0.0]]), miss_eps_t=torch.tensor([0.02]), miss_rho_t=torch.tensor([0.36]))
+q_ = (0.9 * torch.tensor([0.5, 0.8, 0.9]) * torch.sigmoid(torch.tensor([0.0, 1.0, 2.0]))); Qw = torch.tensor([0.0, q_[0], 1 - (1 - q_[0]) * (1 - q_[1])])
+want_k = torch.cat([1 - (0.02 + 0.34 * Qw), torch.ones(1)])
+check('D85: the per-draw keep factor equals 1 - (eps + (rho - eps) Q_t), 1 off the eligible slots', float((A.corr_keep(ps_, lg_, xt_, Bk)[0, 0] - want_k).abs().max()) < 1e-6)
+# rho = eps reproduces D76 exactly (same weights)
+B22a = batch(); B22a['f'][:] = 2; B22a['llim'][:, :2] = math.log(4.95); B22a['lex'][:] = math.log(0.95); A.d74_features(B22a, sq17, ti17, po17)
+B22b = {k: v.clone() for k, v in B22a.items()}; A.apply_miss(B22a, 0.02); A.apply_corr_miss(B22b, 0.02, 0.02)
+with torch.no_grad():
+    torch.manual_seed(41); l22a = m22.joint(B22a, 4)['lw']; torch.manual_seed(41); l22b = m22.joint(B22b, 4)['lw']
+    B22c = {k: v.clone() for k, v in B22b.items()}; A.apply_corr_miss(B22c, 0.02, 0.36); torch.manual_seed(41); l22c = m22.joint(B22c, 4)['lw']
+check('D85: rho = eps gives D76\'s weights exactly', float((l22a - l22b).abs().max()) < 1e-4, f'max |d| {float((l22a - l22b).abs().max()):.1e}')
+with torch.no_grad():                                                                      # a born (z0 = +3), tally-size (x = 6) tree: the term itself
+    zb = torch.zeros(1, 6, M.DZ); zb[..., 0] = 3.0; xtb = torch.full((1, 6, M.T_MAX), 6.0); psb = B22b['psamp'][None]
+    tb, tc = m22.cutoff_term(xtb, psb, zb, B22b), m22.cutoff_term(xtb, psb, zb, B22c)
+    el2 = (B22c['miss_elig'].cumsum(1) >= 2) & (B22c['miss_elig'] > 0)                    # the second and later eligible slots
+    lgb = F.logsigmoid(A.KAPPA_B * m22.bh_age(zb, B22c)); kc = A.corr_keep(psb, lgb, xtb, B22c)
+    want_c = torch.log1p(-(psb * kc * torch.exp(lgb) * torch.sigmoid(xtb)))
+check('D85: a correlated second miss raises P(no record) by its formula, first slots unchanged', bool(el2.any()) and bool((tc[0][el2] > tb[0][el2]).all())
+      and torch.allclose(tc[0][~el2 & (B22c['miss_elig'] > 0)], tb[0][~el2 & (B22c['miss_elig'] > 0)], atol=1e-6) and float((tc - want_c).abs()[0][B22c['miss_elig'] > 0].max()) < 1e-4)
+# calibrate_rho recovers a planted share of trees missed twice
+g22 = torch.Generator().manual_seed(3); N22 = 1000; T22 = M.T_MAX; Br = {}
+Br['v'] = torch.zeros(N22, T22); Br['v'][:, :3] = 1; Br['sampled'] = torch.ones(N22, T22); Br['f'] = torch.full((N22,), 2)
+Br['mode'] = torch.zeros(N22, T22, dtype=torch.long); Br['mode'][:, 1] = M.MODE['missed']
+Br['cov'] = torch.zeros(N22, T22, M.NCOV); Br['cov'][..., A.ITYR] = (torch.arange(T22) * 5.0 / 20.0)[None]
+Br['llim'] = torch.full((N22, T22), math.log(4.95)); Br['lex'] = torch.full((N22, T22), math.log(0.95))
+Br['lD'] = torch.zeros(N22, T22); Br['mD'] = torch.zeros(N22, T22); Br['lD'][:, 2] = math.log(6.0); Br['mD'][:, 2] = 1
+two = torch.rand(N22, generator=g22) < 0.4                                                  # rate 0.1: tally-size at slots 1 and 0; rate 0.15: only at slot 1
+Br['lrate'] = torch.log(torch.where(two, torch.tensor(0.099), torch.tensor(0.15))); Br['has_rate'] = torch.ones(N22); Br['softwood'] = torch.zeros(N22)
+check('D85: calibrate_rho recovers a planted repeated-miss share (40 %)', abs(A.calibrate_rho(Br, log=lambda *_: None) - float(two.float().mean())) < 1e-6)
+# calibrate_tail recovers a planted lower-side width
+N23 = 4000; g23 = torch.Generator().manual_seed(4); zt = torch.randn(N23, generator=g23); zt = torch.where(zt < 0, 0.8 * zt, zt)
+Bt = dict(af_mu=torch.full((N23,), math.log(40.0)), af_shift=torch.zeros(N23), af_sd=torch.full((N23,), 0.3), af_sdf=torch.ones(N23), l0=torch.full((N23,), 2.0), la=torch.zeros(N23, dtype=torch.long))
+Bt['cov'] = torch.zeros(N23, M.T_MAX, M.NCOV); Bt['anc_m'] = torch.zeros(N23, M.T_MAX); Bt['anc_m'][:, 0] = 1; Bt['anc_y'] = torch.zeros(N23, M.T_MAX)
+Bt['anc_y'][:, 0] = torch.log(torch.exp(Bt['af_mu'] + 0.3 * zt) - 2.0)
+sl23 = A.calibrate_tail(Bt, log=lambda *_: None)
+check('D85: calibrate_tail recovers a planted lower-side width (0.8)', abs(sl23 - 0.8) < 0.03, f'sigma_L {sl23:.3f}')
 # 14. on the real frame: the prior comes from the first visible live record, a hidden record never feeds it, and age steps match the dates
 if len(sys.argv) > 1:
     sq0 = pd.read_parquet(f'{sys.argv[1]}/seq.parquet'); pk = sq0[sq0.split == 'val'].plot_key.drop_duplicates().sample(100, random_state=1); f_ = sq0[sq0.plot_key.isin(pk)].copy()

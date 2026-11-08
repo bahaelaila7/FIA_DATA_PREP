@@ -2,7 +2,7 @@
 # Bundle what a GPU machine needs for the D70 cross-validation; it needs no database. Usage: bash package_gpu.sh DATA_DIR OUT.tar
 set -euo pipefail
 DATA=$1; OUT=$2; W=$(mktemp -d); mkdir -p "$W/nimiwae70/data"
-cp nimiwae56.py nimiwae_flow.py nimiwae70.py nimiwae70_score.py nimiwae70_cv.py nimiwae70_verify.py nimiwae70_flowcheck.py nimiwae70_gatepull.py "$W/nimiwae70/"
+cp nimiwae56.py nimiwae_flow.py nimiwae70.py nimiwae70_score.py nimiwae70_cv.py nimiwae70_verify.py nimiwae70_flowcheck.py nimiwae70_gatepull.py nimiwae70_d85test.py "$W/nimiwae70/"
 mkdir -p "$W/nimiwae70/nimiwae_jax" && cp nimiwae_jax/*.py "$W/nimiwae70/nimiwae_jax/"
 cp "$DATA/seq.parquet" "$DATA/site_refs.parquet" "$DATA/site_refs_d70.parquet" "$DATA/planted_refs.parquet" "$DATA/ht_refs.parquet" "$W/nimiwae70/data/"
 cat > "$W/nimiwae70/requirements.txt" <<R
@@ -32,6 +32,9 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 #   DUMP=d84       no training (DECISIONS D84): the residual gate pulls of out/cv76flow on THIS bundle's frame (d78): every pulled tree plus
 #                  controls with their empty-visit history (gatepull --dump, tagged d78dump), then the pre-registered prediction (--analyse-dump).
 #                  Its counts must equal XCHECK's (both are printed). One GPU process; it can share the GPU with a running probe.
+#   TEST=d85       no training (DECISIONS D85): out/cv76flow's checkpoints rescored on THIS bundle's frame (d78) with the lower tail and / or
+#                  correlated misses (variants base, tail, rho, both, in parallel), then the comparison and the pre-registered expectations
+#                  (out/d85test/summary.json). Resumable per variant and fold.
 #   GRIDRESCORE=DIR  no training: D77 grid completion of DIR's last age-on checkpoints (DIR/f*_age1/scores_grid.json; runs from now on score it themselves), then exit
 # Order for D74: G1RESCORE=out/cv72 bash run.sh cuda; D74=1 bash run.sh cuda; python -I nimiwae70_cv.py --out out/cv74 --compare out/cv72_g1
 # Order for D76: Q=flow D74=1 D76=1 bash run.sh cuda; then for R in out/cv76flow out/cv74flow: python -I nimiwae70_gatepull.py --data data --run $R --device cuda;
@@ -41,7 +44,7 @@ cat > "$W/nimiwae70/run.sh" <<'R'
 # Any run: python -I nimiwae70_cv.py --out DIR --summary --data data prints G1 against the lookup baselines (D77)
 # Runs P at a time (P=5), CPU threads shared out, runs spread over GPUs. Finished runs are skipped, so it can be restarted. Copy the out dir back.
 set -uo pipefail
-D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; D76=${D76:-0}; BK=${BACKEND:-torch}; G1R=${G1RESCORE:-}; GRR=${GRIDRESCORE:-}; POST=${POST:-}; PROBE=${PROBE:-}; XCHECK=${XCHECK:-}; DUMP=${DUMP:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
+D=${1:-cuda}; Q=${Q:-gauss}; D74=${D74:-0}; D76=${D76:-0}; BK=${BACKEND:-torch}; G1R=${G1RESCORE:-}; GRR=${GRIDRESCORE:-}; POST=${POST:-}; PROBE=${PROBE:-}; XCHECK=${XCHECK:-}; DUMP=${DUMP:-}; TEST=${TEST:-}; P=${P:-5}; FOLDS=${FOLDS:-0 1 2 3 4}; N=$(nproc); T=$(( N / P > 0 ? N / P : 1 )); G=$(nvidia-smi -L 2>/dev/null | wc -l); G=$(( G > 0 ? G : 1 ))
 [ -n "$PROBE" ] && { Q=flow; D74=1; }                                     # D82: the probe's base is always D74 + flow (D76 from the env)
 case "$Q" in gauss|flow) ;; *) echo "Q must be gauss or flow, not $Q"; exit 1;; esac
 case "$D74$D76" in 00) O=out/cv72;; 10) O=out/cv74;; 11) O=out/cv76;; *) echo "D74 / D76 must be 0 or 1, and D76 needs D74=1 (got D74=$D74 D76=$D76)"; exit 1;; esac
@@ -51,6 +54,18 @@ case "$BK" in torch) ;; jax) O=${O}_jax; export XLA_PYTHON_CLIENT_PREALLOCATE=fa
   *) echo "BACKEND must be torch or jax, not $BK"; exit 1;; esac
 python -I nimiwae70_verify.py data | tail -1 || exit 1
 python -I nimiwae70_cv.py --selftest || exit 1
+if [ -n "$TEST" ]; then
+  [ "$TEST" = d85 ] || { echo "TEST must be d85, not $TEST"; exit 1; }
+  python -I -c "import sys, pyarrow.parquet as pq; sys.exit(0 if 'l0' in pq.read_schema('data/seq.parquet').names else 1)" || { echo "this bundle's data is not a d78 frame: build it from d78"; exit 1; }
+  for f in 0 1 2 3 4; do [ -f "out/cv76flow/f${f}_age1/model_e36.pt" ] || { echo "missing out/cv76flow/f${f}_age1/model_e36.pt (copy the finished run here)"; exit 1; }; done
+  mkdir -p out/d85test
+  printf '%s\n' base tail rho both | xargs -P 4 -L 1 --process-slot-var=SLOT bash -c \
+    'CUDA_VISIBLE_DEVICES=$((SLOT % '"$G"')) python -I nimiwae70_d85test.py --data data --run out/cv76flow --variant $0 --out out/d85test --device '"$D"' --threads '"$T"' > out/d85test/$0.log 2>&1' \
+    || { echo "a variant FAILED: see out/d85test/*.log; rerun TEST=d85 (finished folds are kept)"; exit 1; }
+  python -I nimiwae70_d85test.py --summarise out/d85test || { echo "the summary FAILED"; exit 1; }
+  echo "done: copy out/d85test back"
+  exit 0
+fi
 if [ -n "$DUMP" ]; then
   [ "$DUMP" = d84 ] || { echo "DUMP must be d84, not $DUMP"; exit 1; }
   python -I -c "import sys, pyarrow.parquet as pq; sys.exit(0 if 'l0' in pq.read_schema('data/seq.parquet').names else 1)" || { echo "this bundle's data is not a d78 frame: build it from d78"; exit 1; }

@@ -1,6 +1,7 @@
 """D76's primary check: how often the age gate pulls a large late-debut tree implausibly young.
   python -I nimiwae70_gatepull.py --data data --run out/cv74flow --epoch 36 --device cuda          the baseline (cv74flow)
   python -I nimiwae70_gatepull.py --data data --run out/cv76flow --epoch 36 --device cuda          the D76 run
+D85: every z here is on the age scale (z_age = sigma_L z0 below the prior median; identical to the latent z0 when sigma_L = 1).
 Held trees of each fold, DIA >= 5 in at the prior's slot, whose visit just before their first visible record was sampled, unrecorded, in the
 cutoff mode (no missed code) and at subplot level: the share whose posterior median of the age latent z0 is below -2 (also -1, -3), on the product
 grid (nimiwae70.PRODUCT_GRID, wide enough that no posterior is clipped). Microplot-level debuts are reported alongside (not a bar).
@@ -147,10 +148,10 @@ def main():
         for lab, msk in (('subplot', sub), ('microplot', mic)):
             ix = torch.nonzero(msk).flatten(); torch.manual_seed(0)
             if a.dump and lab == 'subplot':                                                  # D84: the same posterior, three quantiles, the trees kept
-                q3 = zq(m, M.sub(B, ix), a.device); z = q3[1]; pul = (z < -2.0).numpy(); g_ = np.random.default_rng(f)
+                q3 = A.z_age(zq(m, M.sub(B, ix), a.device), M.sub(B, ix)); z = q3[1]; pul = (z < -2.0).numpy(); g_ = np.random.default_rng(f)   # D85: age scale
                 ctl = np.flatnonzero(~pul); ctl = np.sort(g_.choice(ctl, size=min(CONTROLS, len(ctl)), replace=False)); keep = np.sort(np.concatenate([np.flatnonzero(pul), ctl]))
                 dumps.append(tree_table(B, sq_, ix[keep], q3[:, keep], f))
-            else: z = z50(m, M.sub(B, ix), a.device)
+            else: z = A.z_age(z50(m, M.sub(B, ix), a.device)[None], M.sub(B, ix))[0]       # D85: on the age scale (= the latent when sigma_L = 1)
             o[lab] = dict(n=int(len(z)), **{f'below_{c:g}': int((z < c).sum()) for c in CUTS})
         o['trees'] = int(B['v'].shape[0]); o['seconds'] = round(time.time() - t0); R['folds'][str(f)] = o
         print(f'fold {f}: {json.dumps(o)}', flush=True)

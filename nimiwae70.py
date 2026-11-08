@@ -84,6 +84,8 @@ def build(seq, vocab=None):
     d74_features(B, seq_cols=sq, ti=ti, po=po)
     if 'age_coupling' in vocab: apply_coupling(B, vocab['age_coupling'])
     if 'miss_eps' in vocab: apply_miss(B, vocab['miss_eps'])
+    if 'miss_rho' in vocab: apply_corr_miss(B, vocab['miss_eps'], vocab['miss_rho'])            # D85: replaces the static factor by the per-draw one
+    if 'age_tail' in vocab: apply_tail(B, vocab['age_tail'])                                     # D85
     return B, vocab, sq
 
 def d74_features(B, seq_cols, ti, po):
@@ -110,6 +112,10 @@ def d74_features(B, seq_cols, ti, po):
         B['htcls'][ti[vis], po[vis]] = 1; B['mH'][ti[mdl], po[mdl]] = 0.0                      # modelled heights repeat the previous height: not observations
     B['af_shift'], B['af_sdf'] = torch.zeros(n), torch.ones(n)
     B['miss_keep'] = torch.ones(n, T)                                                           # D76: 1 - eps where a not-yet-listed tree can be missed
+    B['age_sl'] = torch.ones(n)                                                                  # D85: lower-side width factor of the age prior (1 = Gaussian)
+    sw = np.zeros(n, np.float32)
+    if 'sftwd_hrdwd' in seq_cols: sw[ti] = (seq_cols.sftwd_hrdwd.to_numpy(object) == 'S').astype(np.float32)
+    B['softwood'] = torch.tensor(sw)                                                             # D85: wood type (rho calibration fallback rates)
 
 def pre_debut_subplot(B):
     """[n, T] slots before the first visible record whose tally limit is above the existence level: where an unlisted tree on a sampled spot
@@ -146,6 +152,58 @@ def calibrate_miss(B, log=print):
     log(f'D76 crew-miss rate calibrated: G_MAX {gmax:.3f} in / yr (q{MISS_Q} of {len(r):,} growth pairs of {MISS_DIA[0]}-{MISS_DIA[1]} in trees); '
         f'{int(implausible.sum()):,} of {nu:,} uncoded subplot-level debuts need more: eps {eps:.4f}')
     return eps
+
+def z_age(z0, B):
+    """D85: the age-scale z of the latent z0, sigma_L z0 below the prior median (B['age_sl'] per tree, 1 when absent)"""
+    sl = B['age_sl'] if 'age_sl' in B else torch.ones_like(z0[0] if z0.dim() > 1 else z0)
+    while sl.dim() < z0.dim(): sl = sl[None]
+    return torch.where(z0 < 0, sl * z0, z0)
+
+def apply_tail(B, sl):
+    """D85: the lower-side width factor for every tree"""
+    B['age_sl'] = torch.full_like(B['af_mu'], float(sl))
+
+def calibrate_tail(B, log=print):
+    """D85: sigma_L from the anchors in B (fit plots), against the coupled prior at the prior's slot: the half-normal fit sqrt(mean z^2) of the anchors
+    below the prior median, clipped to [0.5, 1]. Total age at la from each anchor as calibrate_coupling. The upper side is reported, not applied."""
+    t = B['cov'][..., ITYR] * 20.0; li = B['la'][:, None]; ti, pj = torch.nonzero(B['anc_m'] > 0, as_tuple=True)
+    tot = torch.exp(B['anc_y'][ti, pj]) + B['l0'][ti] - (t[ti, pj] - t.gather(1, li)[ti, 0]); ok = tot > 0.5; ti, tot = ti[ok], tot[ok]
+    z = ((torch.log(tot) - B['af_mu'][ti] - B['af_shift'][ti]) / (B['af_sd'][ti] * B['af_sdf'][ti])).double()
+    lo, hi = z[z < 0], z[z >= 0]; assert len(lo) >= 200, f'too few anchors below the prior median to calibrate the lower tail: {len(lo)}'
+    sl = float(min(1.0, max(0.5, torch.sqrt((lo ** 2).mean()))))
+    log(f'D85 lower tail calibrated on {len(z):,} anchor rows: sigma_L {sl:.3f} ({len(lo):,} below the prior median, {len(lo) / len(z):.3f}); upper side {float(torch.sqrt((hi ** 2).mean())):.3f} (not applied)')
+    return sl
+
+def apply_corr_miss(B, eps, rho):
+    """D85: correlated misses at the D76 slots (pre-debut, subplot level, cutoff mode): the static factor goes, the cutoff term builds 1 - eps_t per draw"""
+    B['miss_keep'] = torch.ones_like(B['v'])
+    B['miss_elig'] = (pre_debut_subplot(B) & (B['mode'] == M.MODE['cutoff']) & (B['sampled'] > 0)).float()
+    B['miss_eps_t'] = torch.full_like(B['af_mu'], float(eps)); B['miss_rho_t'] = torch.full_like(B['af_mu'], float(rho))
+
+def corr_keep(ps, lg, xt, B):
+    """D85: [K, n, T] keep factor 1 - eps_t at the eligible slots (1 elsewhere): eps_t = eps + (rho - eps) Q_t, Q_t = 1 - prod over earlier eligible slots of
+    (1 - q_s), q_s = p_s g_s sigma(x_s) the probability that the tree was present, past breast height and tally-size there (so missed, being unrecorded)"""
+    el = B['miss_elig'][None]; q = (ps.clamp(0.0, 1.0) * torch.exp(lg) * torch.sigmoid(xt) * el).clamp(max=1 - 1e-6)
+    l1q = torch.log1p(-q); cum = torch.cumsum(l1q, -1) - l1q                                   # exclusive: slots strictly before t
+    Q = -torch.expm1(cum); e = B['miss_eps_t'][None, :, None] + (B['miss_rho_t'] - B['miss_eps_t'])[None, :, None] * Q
+    return torch.where(el > 0, 1 - e, torch.ones_like(e))
+
+def calibrate_rho(B, log=print):
+    """D85: rho from the coded misses in B (fit plots): trees with the missed mode at the visit before a debut >= 5 in at subplot level; their sampled
+    pre-debut subplot-level visits at which the diameter, backcast from the debut with the tree's observed rate (else its wood type's median), was at or
+    above the visit's limit are tally-size empty visits; rho = N(>= 2) / N(>= 1) (a tree missed at its first tally-size visit is recorded or missed again)"""
+    n, T = B['v'].shape; ii = torch.arange(n); f = B['f']; fp = (f - 1).clamp(min=0); t = B['cov'][..., ITYR] * 20.0; D = torch.exp(B['lD'])
+    coded = (f > 0) & (B['mode'][ii, fp] == M.MODE['missed']) & (B['mD'][ii, f] > 0) & (D[ii, f] >= 5.0) & (B['llim'][ii, fp] > B['lex'][ii, fp] + 1e-6)
+    rate = torch.exp(B['lrate']); has = B['has_rate'] > 0
+    med = {w: float(rate[coded & has & (B['softwood'] == w)].median()) if bool((coded & has & (B['softwood'] == w)).any()) else 0.2 for w in (0.0, 1.0)}
+    r = torch.where(has, rate, torch.where(B['softwood'] > 0, torch.tensor(med[1.0]), torch.tensor(med[0.0])))
+    ar = torch.arange(T)[None]; slot = (ar < f[:, None]) & (B['v'] > 0) & (B['sampled'] > 0) & (B['llim'] > B['lex'] + 1e-6)
+    back = D[ii, f][:, None] - r[:, None] * (t[ii, f][:, None] - t); lim = torch.exp(B['llim']) + M.HALF_UNIT
+    k = (slot & (back >= lim)).sum(1)[coded]; n1, n2 = int((k >= 1).sum()), int((k >= 2).sum())
+    assert n1 >= 500, f'too few coded misses with a tally-size empty visit to calibrate rho: {n1}'
+    rho = n2 / n1
+    log(f'D85 repeated-miss rate calibrated on {int(coded.sum()):,} coded misses: {n2:,} of {n1:,} with >= 1 tally-size empty visit had >= 2: rho {rho:.3f} (fallback rates {med})')
+    return rho
 
 def coupling_eligible(B):
     """trees the coupling applies to: a prior, an observed growth rate, DIA >= 5 in and a crown class at the prior's slot"""
@@ -266,7 +324,7 @@ class NIMIWAE70(M.NIMIWAE56):
     def ages(s, z, B):
         """a_t [K, n, T]: one birth date per tree. a_l > 0 at the prior's slot, the debut or the first visible record; other slots add elapsed years exactly, so a_t < 0 before birth."""
         mu = B['af_mu'] + B.get('af_shift', 0.0); sd = B['af_sd'] * B.get('af_sdf', 1.0)        # D74: the coupled prior (no shift when not calibrated)
-        al = torch.exp((mu[None] + sd[None] * z[..., 0]).clamp(max=7.0))                          # [K, n]; up to about 1100 yr
+        al = torch.exp((mu[None] + sd[None] * z_age(z[..., 0], B)).clamp(max=7.0))                # [K, n]; up to about 1100 yr; D85 lower tail
         t = B['cov'][..., ITYR] * 20.0                                                        # [n, T] years since 2000, from measurement dates
         return al[..., None] + (t - t.gather(1, B['la'][:, None]))[None]
     def bh_age(s, z, B):
@@ -277,9 +335,12 @@ class NIMIWAE70(M.NIMIWAE56):
         u = s.bh_age(z, B); l1 = lp1 + F.logsigmoid(KAPPA_B * u)
         return l1, torch.log(-torch.expm1(l1.clamp(max=-1e-6))), u > 0
     def cutoff_term(s, xt, ps, z, B):
-        """log(1 - p_s g_t sigma(x_t)): unrecorded at a sampled slot, gated by breast height (D72)"""
+        """log(1 - p_s g_t sigma(x_t)): unrecorded at a sampled slot, gated by breast height (D72). D85: with B['miss_rho_t'], p_s carries the per-draw
+        keep factor 1 - eps_t at the eligible slots, eps_t = eps + (rho - eps) Q_t (corr_keep)"""
+        lg = F.logsigmoid(KAPPA_B * s.bh_age(z, B)) if s.age else torch.zeros_like(xt)
+        if 'miss_rho_t' in B: ps = ps * corr_keep(ps, lg, xt, B)
         if not s.age: return super().cutoff_term(xt, ps, z, B)
-        lq = torch.log(ps.clamp(1e-6, 1.0)) + F.logsigmoid(KAPPA_B * s.bh_age(z, B))            # log(p_s g_t)
+        lq = torch.log(ps.clamp(1e-6, 1.0)) + lg                                                   # log(p_s g_t)
         return torch.logaddexp(torch.log((-torch.expm1(lq)).clamp(min=1e-12)), lq + F.logsigmoid(-xt))
 
 SCORE_GRID = dict(G=61, zmax=3.6)       # age_posterior: the grid the CV scored G1 / G5 on (kept for comparability across runs)
@@ -422,7 +483,7 @@ def to_dev(b, device):
     return {k: v.to(device, non_blocking=True) for k, v in b.items()}
 
 def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, log=print, age=True, device='cpu', opt_name='adamw', on_epoch=None, q='gauss', flow=None, d74=False,
-          state_path=None, d76=False, sapling=False, arch=None):
+          state_path=None, d76=False, sapling=False, arch=None, d85=False):
     """state_path: after every completed epoch (and its hook) the full training state is saved there; if the file exists, training resumes after its
     epoch. It holds the parameters, the optimizer (and scheduler) state, the batch-order and noise RNG states and the history, plus a fingerprint of the
     setup; a different setup refuses to resume."""
@@ -438,6 +499,10 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         assert float(B['anc_m'].sum()) == 0, 'anchors in the fitting rows without D74 age on'
     if d76:                                                                                  # both arms: the crew-miss rate, fixed from the fit plots before any subsample
         vocab['miss_eps'] = calibrate_miss(B, log=log); apply_miss(B, vocab['miss_eps'])
+    if d85:                                                                                  # D85, before any subsample: correlated misses (both arms), the lower tail (age on)
+        assert d76, 'D85 builds on D76 (eps)'
+        vocab['miss_rho'] = calibrate_rho(B, log=log); apply_corr_miss(B, vocab['miss_eps'], vocab['miss_rho'])
+        if age: assert d74, 'the D85 lower tail is calibrated on the D74 anchors'; vocab['age_tail'] = calibrate_tail(B, log=log); apply_tail(B, vocab['age_tail'])
     if max_trees and max_trees < n: B = sub(B, torch.tensor(rng.permutation(n)[:max_trees])); n = max_trees
     model = make_model(vocab, age=age, q=q, flow=flow, height='t' if d74 else 'gauss', arch=arch).to(device)   # D82: arch None = the default network
     phi = model.enc_params(); pid = {id(p) for p in phi}; theta = [p for p in model.parameters() if id(p) not in pid]
@@ -449,7 +514,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=epochs * nb_ep, pct_start=0.05, anneal_strategy='cos')
     log(f'train trees {n:,}; slots {int(B["v"].sum()):,}; prior on {int(B["af_has"].sum()):,} trees; K {k} (DReG); age {age}; q {q}{" " + json.dumps(model.cfg["flow"]) if q == "flow" else ""}; device {device}; optimizer {opt_name}')
     hist, start = [], 0
-    fp = dict(backend='torch', n=n, epochs=epochs, k=k, bs=bs, seed=seed, lr=lr, age=age, q=q, cfg=model.cfg, d74=d74, opt=opt_name, coupling=vocab.get('age_coupling'), miss_eps=vocab.get('miss_eps'))
+    fp = dict(backend='torch', n=n, epochs=epochs, k=k, bs=bs, seed=seed, lr=lr, age=age, q=q, cfg=model.cfg, d74=d74, opt=opt_name, coupling=vocab.get('age_coupling'), miss_eps=vocab.get('miss_eps'), **{x: vocab[x] for x in ('miss_rho', 'age_tail') if x in vocab})   # D85 only when on: older setups keep their fingerprints
     cuda = str(device).startswith('cuda')
     if state_path and os.path.exists(state_path):                                            # resume after the last completed epoch
         ck = torch.load(state_path, weights_only=False, map_location=device)
@@ -479,7 +544,7 @@ def train(tr, epochs=12, k=32, bs=512, max_trees=0, seed=0, threads=7, lr=1e-3, 
         e0 = {}
         if age:
             with torch.no_grad():
-                w = torch.softmax(o['lw'], 0); z0 = o['z'][..., 0]; al = torch.exp(b['af_mu'][None] + b['af_shift'][None] + b['af_sd'][None] * b['af_sdf'][None] * z0)   # age at the prior's slot, coupled prior
+                w = torch.softmax(o['lw'], 0); z0 = o['z'][..., 0]; al = torch.exp(b['af_mu'][None] + b['af_shift'][None] + b['af_sd'][None] * b['af_sdf'][None] * z_age(z0, b))   # age at the prior's slot, coupled prior
                 pm = (w * z0).sum(0); e0 = dict(z0_mean=pm.mean().item(), z0_abs=pm.abs().mean().item(), z0_sd=((w * z0 ** 2).sum(0) - pm ** 2).clamp(min=0).sqrt().median().item(), age_med=al.median().item(), age_max=al.max().item())
         hist.append(dict(epoch=ep, loss=tot / nb, ess_last_batch=ess, sd_disc=torch.exp(model.lsdisc).item(), **e0, seconds=round(time.time() - t0, 1), steps=nb,
                          **({'gpu_mem_gb': round(torch.cuda.max_memory_allocated(device) / 1e9, 2)} if cuda else {})))   # D82: cost per epoch
